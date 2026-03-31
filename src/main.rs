@@ -1,0 +1,263 @@
+mod config;
+mod crypto;
+mod gossip;
+mod node;
+mod state;
+mod subscribe;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use rand::Rng;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use config::{Config, Service, ServiceGroup};
+use state::SharedState;
+
+#[derive(Parser)]
+#[command(name = "stouter", about = "Light-weight service discovery and tunneling")]
+struct Cli {
+    #[arg(short, long, global = true, default_value = "stouter.json")]
+    config: String,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the node daemon
+    Node {
+        #[command(subcommand)]
+        action: Option<NodeAction>,
+    },
+    /// Run the subscribe daemon
+    Subscribe,
+    /// Show the status of the running daemon on this host
+    Status,
+    /// Manage services
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeAction {
+    /// Add this host to the cluster
+    Add,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Add a service on this node
+    Add {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        port: u16,
+    },
+    /// List all services
+    List,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize structured logging from RUST_LOG, defaulting to "info".
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        // -----------------------------------------------------------------
+        // node  (no sub-command)
+        // -----------------------------------------------------------------
+        Commands::Node { action: None } => {
+            let cfg = Config::load(&cli.config)?;
+            let state = SharedState::new(cfg, cli.config.clone());
+            node::run_node(state).await?;
+        }
+
+        // -----------------------------------------------------------------
+        // node add
+        // -----------------------------------------------------------------
+        Commands::Node {
+            action: Some(NodeAction::Add),
+        } => {
+            let mut cfg = Config::load(&cli.config).unwrap_or_default();
+
+            // Generate a random 32-byte local secret and hex-encode it.
+            let mut secret_bytes = [0u8; 32];
+            rand::thread_rng().fill(&mut secret_bytes);
+            cfg.local_secret = hex::encode(secret_bytes);
+
+            cfg.node_id = config::get_hostname();
+
+            cfg.save(&cli.config)?;
+
+            println!(
+                "Node initialized. node_id={}, localSecret saved to {}",
+                cfg.node_id, cli.config
+            );
+
+            // Announce our presence to any already-known peers.
+            if !cfg.known_nodes.is_empty() {
+                let state = SharedState::new(cfg.clone(), cli.config.clone());
+                gossip::broadcast_message(
+                    &state,
+                    gossip::messages::GossipMessage::NodeJoin {
+                        id: cfg.node_id.clone(),
+                        addr: cfg.bind.clone(),
+                    },
+                )
+                .await;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // status
+        // -----------------------------------------------------------------
+        Commands::Status => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let bind = &cfg.bind;
+
+            match tokio::net::TcpStream::connect(bind).await {
+                Err(_) => {
+                    println!("No daemon running on {bind}");
+                }
+                Ok(mut stream) => {
+                    stream.write_all(&[gossip::CONN_STATUS]).await?;
+
+                    let mut len_buf = [0u8; 4];
+                    stream.read_exact(&mut len_buf).await?;
+                    let len = u32::from_be_bytes(len_buf) as usize;
+
+                    let mut body = vec![0u8; len];
+                    stream.read_exact(&mut body).await?;
+
+                    let resp: gossip::StatusResponse = serde_json::from_slice(&body)?;
+
+                    println!("Daemon:  running ({} mode)", resp.mode);
+                    println!("Node ID: {}", resp.node_id);
+                    println!("Bind:    {}", resp.bind);
+                    println!("Config version: {}", resp.dynamic_config.version);
+
+                    println!("\nServices:");
+                    let mut any = false;
+                    for group in &resp.dynamic_config.service_groups {
+                        println!("  [{}]", group.name);
+                        for svc in &group.services {
+                            println!(
+                                "    {:<20} node={:<20} port={}",
+                                svc.name, svc.node_id, svc.node_port
+                            );
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        println!("  (none)");
+                    }
+
+                    println!("\nKnown nodes:");
+                    if resp.known_nodes.is_empty() {
+                        println!("  (none)");
+                    }
+                    for node in &resp.known_nodes {
+                        println!("  {:<20} {}", node.id, node.addr);
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // subscribe
+        // -----------------------------------------------------------------
+        Commands::Subscribe => {
+            let cfg = Config::load(&cli.config)?;
+            let state = SharedState::new(cfg, cli.config.clone());
+            subscribe::run_subscribe(state).await?;
+        }
+
+        // -----------------------------------------------------------------
+        // service add
+        // -----------------------------------------------------------------
+        Commands::Service {
+            action:
+                ServiceAction::Add {
+                    group: group_name,
+                    name,
+                    port,
+                },
+        } => {
+            let mut cfg = Config::load(&cli.config).unwrap_or_default();
+
+            let service = Service {
+                name: name.clone(),
+                node_id: cfg.node_id.clone(),
+                node_port: port,
+            };
+
+            // Find or create the target service group.
+            if let Some(g) = cfg
+                .dynamic_config
+                .service_groups
+                .iter_mut()
+                .find(|g| g.name == group_name)
+            {
+                g.services.push(service);
+            } else {
+                cfg.dynamic_config.service_groups.push(ServiceGroup {
+                    name: group_name.clone(),
+                    services: vec![service],
+                });
+            }
+
+            cfg.dynamic_config.version += 1;
+            cfg.save(&cli.config)?;
+
+            let version = cfg.dynamic_config.version;
+            let state = SharedState::new(cfg.clone(), cli.config.clone());
+            gossip::broadcast_message(
+                &state,
+                gossip::messages::GossipMessage::ConfigUpdate {
+                    config: cfg.dynamic_config.clone(),
+                },
+            )
+            .await;
+
+            println!(
+                "Service '{}' added to group '{}' (version {})",
+                name, group_name, version
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // service list
+        // -----------------------------------------------------------------
+        Commands::Service {
+            action: ServiceAction::List,
+        } => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let mut found = false;
+            for group in &cfg.dynamic_config.service_groups {
+                for svc in &group.services {
+                    println!(
+                        "{}/{} -> node={} port={}",
+                        group.name, svc.name, svc.node_id, svc.node_port
+                    );
+                    found = true;
+                }
+            }
+            if !found {
+                println!("No services configured");
+            }
+        }
+    }
+
+    Ok(())
+}
