@@ -283,6 +283,14 @@ async fn persist_state(state: &Arc<SharedState>) {
     }
 }
 
+/// Returns `true` if `id` looks like a valid node identifier (hostname).
+///
+/// Rejects values that look like socket addresses (`host:port`) or raw IP
+/// addresses with ports — these are addresses, not identities.
+fn is_valid_node_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains(':')
+}
+
 /// Merge an incoming Sync payload into local state.
 async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConfig, nodes: Vec<NodeInfo>) {
     let updated = {
@@ -308,8 +316,8 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
         let mut kn = state.known_nodes.write().await;
         let mut changed = false;
         for node in nodes {
-            // Skip entries with no identity — these are malformed.
-            if node.id.is_empty() {
+            if !is_valid_node_id(&node.id) {
+                debug!("ignoring node with invalid id: {:?}", node.id);
                 continue;
             }
             if let Some(existing) = kn.iter_mut().find(|n| n.id == node.id) {
@@ -364,6 +372,10 @@ async fn apply_message(state: &Arc<SharedState>, msg: GossipMessage) {
             }
         }
         GossipMessage::NodeJoin { id, addr } => {
+            if !is_valid_node_id(&id) {
+                debug!("ignoring NodeJoin with invalid id: {:?}", id);
+                return;
+            }
             let changed = {
                 let mut kn = state.known_nodes.write().await;
                 if let Some(existing) = kn.iter_mut().find(|n| n.id == id) {
