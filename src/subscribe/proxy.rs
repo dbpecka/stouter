@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -7,12 +8,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tracing::info;
 
+use crate::config::NodeInfo;
 use crate::gossip::CONN_TUNNEL;
+use crate::state::SharedState;
 
 /// Authentication request sent to a node daemon to open a tunnel.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TunnelRequest {
+    /// Target node ID. Needed for relay dispatch; redundant for direct connections.
+    node_id: String,
     service_name: String,
     timestamp_ms: u64,
     /// HMAC-SHA256(cluster_secret, "{service_name}:{timestamp_ms}") in hex.
@@ -23,11 +28,12 @@ struct TunnelRequest {
 ///
 /// Binds on `127.0.0.1:0`, sends the assigned port back through `port_tx`,
 /// then accepts connections and forwards each one through an authenticated
-/// tunnel to the node identified by `node_addr`.
+/// tunnel to the node. If the node has a relay set, connections go through
+/// the relay instead.
 pub async fn run_proxy(
     service: crate::config::Service,
-    node_addr: String,
-    cluster_secret: String,
+    node: NodeInfo,
+    state: Arc<SharedState>,
     port_tx: oneshot::Sender<u16>,
 ) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -44,48 +50,42 @@ pub async fn run_proxy(
 
     loop {
         let (client, _) = listener.accept().await.context("proxy accept")?;
-        let node_addr = node_addr.clone();
+        let node = node.clone();
         let service_name = service.name.clone();
-        let cluster_secret = cluster_secret.clone();
+        let state = state.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(client, node_addr, service_name, cluster_secret).await
+                handle_connection(client, &node, service_name, &state).await
             {
-                tracing::debug!("proxy connection error: {e}");
+                tracing::warn!("proxy connection error: {e}");
             }
         });
     }
 }
 
 /// Forward a single client connection through an authenticated tunnel to the
-/// remote node.
+/// remote node. Routes through a relay, or uses a reverse connection from the
+/// local pool for outbound-only nodes.
 async fn handle_connection(
     mut client: TcpStream,
-    node_addr: String,
+    node: &NodeInfo,
     service_name: String,
-    cluster_secret: String,
+    state: &Arc<SharedState>,
 ) -> Result<()> {
-    let mut node_stream = TcpStream::connect(&node_addr)
-        .await
-        .with_context(|| format!("connect to node {node_addr}"))?;
+    let cluster_secret = &state.config.cluster_secret;
 
-    // Identify this connection as a tunnel connection.
-    node_stream
-        .write_all(&[CONN_TUNNEL])
-        .await
-        .context("write CONN_TUNNEL byte")?;
-
-    // Build and send the tunnel request.
+    // Build the tunnel request.
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time before Unix epoch")?
         .as_millis() as u64;
 
     let token_data = format!("{service_name}:{timestamp_ms}");
-    let token = crate::crypto::sign(&cluster_secret, &token_data);
+    let token = crate::crypto::sign(cluster_secret, &token_data);
 
     let req = TunnelRequest {
+        node_id: node.id.clone(),
         service_name,
         timestamp_ms,
         token,
@@ -93,6 +93,36 @@ async fn handle_connection(
 
     let req_bytes = serde_json::to_vec(&req).context("serialize TunnelRequest")?;
     let len = req_bytes.len() as u32;
+
+    // Get a stream to the node. For outbound-only nodes with no relay, use
+    // a reverse connection from our local pool. Otherwise connect to the
+    // relay or node address directly.
+    let mut node_stream = if let Some(stream) = try_take_reverse(&node.id, state).await {
+        stream
+    } else {
+        let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
+        if connect_addr.is_empty() {
+            bail!(
+                "node {} is not reachable: no address, no relay, and no reverse connections",
+                node.id
+            );
+        }
+        let mut stream = TcpStream::connect(connect_addr)
+            .await
+            .with_context(|| format!("connect to {connect_addr}"))?;
+
+        // Identify this connection as a tunnel connection (only needed for
+        // outbound TCP connections; reverse connections already expect a
+        // tunnel frame directly).
+        stream
+            .write_all(&[CONN_TUNNEL])
+            .await
+            .context("write CONN_TUNNEL byte")?;
+
+        stream
+    };
+
+    // Send the tunnel request frame.
     node_stream
         .write_all(&len.to_be_bytes())
         .await
@@ -132,4 +162,15 @@ async fn handle_connection(
         .context("copy_bidirectional")?;
 
     Ok(())
+}
+
+/// Try to pop an idle reverse connection for `node_id` from the pool.
+async fn try_take_reverse(node_id: &str, state: &Arc<SharedState>) -> Option<TcpStream> {
+    let mut pool = state.reverse_pool.write().await;
+    let conns = pool.get_mut(node_id)?;
+    if conns.is_empty() {
+        None
+    } else {
+        Some(conns.swap_remove(conns.len() - 1))
+    }
 }

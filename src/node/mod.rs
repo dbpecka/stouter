@@ -1,4 +1,6 @@
-mod tunnel;
+pub mod relay;
+mod reverse;
+pub mod tunnel;
 
 use std::sync::Arc;
 
@@ -12,19 +14,34 @@ use crate::state::SharedState;
 
 /// Run the node daemon.
 ///
-/// Binds to `state.config.bind`, launches the gossip sync loop, and accepts
-/// incoming connections.  The first byte of each connection determines whether
-/// it is a gossip or tunnel connection.
+/// If `outbound_only` is set, the node skips binding a listener and instead
+/// maintains reverse connections to reachable peers for tunnel relay.
+/// Otherwise, binds to `state.config.bind` and accepts incoming connections.
 pub async fn run_node(state: Arc<SharedState>) -> Result<()> {
+    tokio::spawn(gossip::run_sync_loop(state.clone()));
+    tokio::spawn(gossip::run_member_log(state.clone()));
+    tokio::spawn(gossip::run_config_poll_loop(state.clone()));
+
+    if state.config.outbound_only {
+        info!(
+            "Node running in outbound-only mode (NAT'd), node_id={}",
+            state.config.node_id
+        );
+        // No listener — maintain reverse connections to peers instead.
+        reverse::run_reverse_pool_loop(state).await;
+        Ok(())
+    } else {
+        run_listener(state).await
+    }
+}
+
+/// Bind the TCP listener and accept connections.
+async fn run_listener(state: Arc<SharedState>) -> Result<()> {
     let listener = TcpListener::bind(&state.config.bind)
         .await
         .with_context(|| format!("bind to {}", state.config.bind))?;
 
     info!("Node listening on {}", state.config.bind);
-
-    tokio::spawn(gossip::run_sync_loop(state.clone()));
-    tokio::spawn(gossip::run_member_log(state.clone()));
-    tokio::spawn(gossip::run_config_poll_loop(state.clone()));
 
     loop {
         let (mut stream, peer_addr) = listener.accept().await.context("accept connection")?;
@@ -46,6 +63,11 @@ pub async fn run_node(state: Arc<SharedState>) -> Result<()> {
                 gossip::CONN_TUNNEL => {
                     if let Err(e) = tunnel::handle_tunnel(stream, state).await {
                         error!("{e}");
+                    }
+                }
+                gossip::CONN_REVERSE => {
+                    if let Err(e) = relay::handle_reverse_registration(stream, state).await {
+                        debug!("reverse registration from {peer_addr} failed: {e}");
                     }
                 }
                 gossip::CONN_STATUS => {

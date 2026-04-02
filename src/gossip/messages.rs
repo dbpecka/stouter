@@ -32,3 +32,98 @@ pub enum GossipMessage {
     /// Announce that a node has left the cluster.
     NodeLeave { id: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DynamicConfig, NodeInfo, Service, ServiceGroup};
+
+    #[test]
+    fn node_join_serde_round_trip() {
+        let msg = GossipMessage::NodeJoin {
+            id: "n1".into(),
+            addr: "1.2.3.4:8080".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"nodeJoin""#));
+
+        let restored: GossipMessage = serde_json::from_str(&json).unwrap();
+        match restored {
+            GossipMessage::NodeJoin { id, addr } => {
+                assert_eq!(id, "n1");
+                assert_eq!(addr, "1.2.3.4:8080");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_leave_serde_round_trip() {
+        let msg = GossipMessage::NodeLeave { id: "n1".into() };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"nodeLeave""#));
+
+        let restored: GossipMessage = serde_json::from_str(&json).unwrap();
+        match restored {
+            GossipMessage::NodeLeave { id } => assert_eq!(id, "n1"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn config_update_serde_round_trip() {
+        let msg = GossipMessage::ConfigUpdate {
+            config: DynamicConfig {
+                version: 42,
+                service_groups: vec![ServiceGroup {
+                    name: "web".into(),
+                    services: vec![Service {
+                        name: "api".into(),
+                        node_id: "host1".into(),
+                        node_port: 3000,
+                        domains: Vec::new(),
+                    }],
+                }],
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let restored: GossipMessage = serde_json::from_str(&json).unwrap();
+        match restored {
+            GossipMessage::ConfigUpdate { config } => {
+                assert_eq!(config.version, 42);
+                assert_eq!(config.service_groups[0].services[0].name, "api");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn sync_serde_round_trip() {
+        let msg = GossipMessage::Sync {
+            config: DynamicConfig { version: 1, service_groups: vec![] },
+            nodes: vec![NodeInfo { id: "n1".into(), addr: "10.0.0.1:8080".into(), relay: None }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let restored: GossipMessage = serde_json::from_str(&json).unwrap();
+        match restored {
+            GossipMessage::Sync { config, nodes } => {
+                assert_eq!(config.version, 1);
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].id, "n1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn signed_message_serde_round_trip() {
+        let sm = SignedMessage {
+            payload: r#"{"type":"nodeLeave","id":"x"}"#.into(),
+            signature: "abc123def456".into(),
+        };
+        let json = serde_json::to_string(&sm).unwrap();
+        let restored: SignedMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.payload, sm.payload);
+        assert_eq!(restored.signature, sm.signature);
+    }
+}

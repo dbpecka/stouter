@@ -19,6 +19,8 @@ pub const CONN_GOSSIP: u8 = b'G';
 pub const CONN_TUNNEL: u8 = b'T';
 /// Connection-type byte for status queries.
 pub const CONN_STATUS: u8 = b'S';
+/// Connection-type byte for reverse connections from NAT'd nodes.
+pub const CONN_REVERSE: u8 = b'R';
 
 /// Maximum allowed gossip message size: 1 MiB.
 const MAX_MSG_BYTES: u32 = 1024 * 1024;
@@ -152,6 +154,18 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
     }
 }
 
+/// Collect all unique peer addresses to contact: bootstrap peers + known member addrs.
+async fn peer_addrs(state: &Arc<SharedState>) -> Vec<String> {
+    let mut addrs: Vec<String> = state.bootstrap_peers.clone();
+    let members = state.known_nodes.read().await;
+    for n in members.iter() {
+        if !n.addr.is_empty() && !addrs.contains(&n.addr) {
+            addrs.push(n.addr.clone());
+        }
+    }
+    addrs
+}
+
 /// Background task: periodically push a Sync message to every known peer and
 /// merge their reply.
 pub async fn run_sync_loop(state: Arc<SharedState>) {
@@ -159,17 +173,13 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
     loop {
         interval.tick().await;
 
-        let peers: Vec<String> = state
-            .known_nodes
-            .read()
-            .await
-            .iter()
-            .map(|n| n.addr.clone())
-            .collect();
+        let peers = peer_addrs(&state).await;
 
         for addr in peers {
-            if let Err(e) = sync_with_peer(&state, &addr).await {
-                debug!("sync with {addr} failed: {e}");
+            match time::timeout(Duration::from_secs(10), sync_with_peer(&state, &addr)).await {
+                Ok(Err(e)) => debug!("sync with {addr} failed: {e}"),
+                Err(_) => debug!("sync with {addr} timed out"),
+                Ok(Ok(())) => {}
             }
         }
     }
@@ -204,13 +214,7 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
 /// Send `msg` to every known peer node.  Connection errors are logged at
 /// `debug` level because peers may be temporarily unreachable.
 pub async fn broadcast_message(state: &Arc<SharedState>, msg: GossipMessage) {
-    let peers: Vec<String> = state
-        .known_nodes
-        .read()
-        .await
-        .iter()
-        .map(|n| n.addr.clone())
-        .collect();
+    let peers = peer_addrs(state).await;
 
     let secret = state.config.cluster_secret.clone();
     let payload = match serde_json::to_string(&msg) {
@@ -222,8 +226,10 @@ pub async fn broadcast_message(state: &Arc<SharedState>, msg: GossipMessage) {
     };
 
     for addr in peers {
-        if let Err(e) = send_to_peer(&addr, &payload, &secret).await {
-            debug!("broadcast to {addr} failed: {e}");
+        match time::timeout(Duration::from_secs(5), send_to_peer(&addr, &payload, &secret)).await {
+            Ok(Err(e)) => debug!("broadcast to {addr} failed: {e}"),
+            Err(_) => debug!("broadcast to {addr} timed out"),
+            Ok(Ok(())) => {}
         }
     }
 }
@@ -257,13 +263,23 @@ async fn print_dynamic_config(state: &Arc<SharedState>) {
     }
 }
 
-/// Persist the current dynamic config to disk, logging any error.
-async fn persist_dynamic_config(state: &Arc<SharedState>) {
-    let dc = state.dynamic_config.read().await.clone();
-    let mut cfg = (*state.config).clone();
-    cfg.dynamic_config = dc;
+/// Persist dynamic config to disk.
+///
+/// Loads the current config file first so that external changes to static
+/// fields (e.g. `cluster_secret`, `bind`) are preserved.  The `known_nodes`
+/// list in the config file is left untouched — it contains bootstrap peer
+/// addresses, not the gossip-discovered member list.
+async fn persist_state(state: &Arc<SharedState>) {
+    let mut cfg = match crate::config::Config::load(&state.config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to load config for persist: {e}");
+            return;
+        }
+    };
+    cfg.dynamic_config = state.dynamic_config.read().await.clone();
     if let Err(e) = cfg.save(&state.config_path) {
-        error!("failed to persist dynamic config to {}: {e}", state.config_path);
+        error!("failed to persist state to {}: {e}", state.config_path);
     }
 }
 
@@ -285,15 +301,43 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
 
     if updated {
         print_dynamic_config(state).await;
-        persist_dynamic_config(state).await;
+        persist_state(state).await;
     }
 
-    let mut kn = state.known_nodes.write().await;
-    for node in nodes {
-        if !kn.iter().any(|n| n.id == node.id) {
-            info!("discovered new node: {} @ {}", node.id, node.addr);
-            kn.push(node);
+    let nodes_changed = {
+        let mut kn = state.known_nodes.write().await;
+        let mut changed = false;
+        for node in nodes {
+            // Skip entries with no identity — these are malformed.
+            if node.id.is_empty() {
+                continue;
+            }
+            if let Some(existing) = kn.iter_mut().find(|n| n.id == node.id) {
+                if existing.addr != node.addr {
+                    info!("node {} address updated: {} -> {}", node.id, existing.addr, node.addr);
+                    existing.addr = node.addr;
+                    changed = true;
+                }
+                // Update relay info if the peer has newer relay data.
+                if existing.relay != node.relay {
+                    info!(
+                        "node {} relay updated: {:?} -> {:?}",
+                        node.id, existing.relay, node.relay
+                    );
+                    existing.relay = node.relay;
+                    changed = true;
+                }
+            } else {
+                info!("discovered new node: {} @ {}", node.id, node.addr);
+                kn.push(node);
+                changed = true;
+            }
         }
+        changed
+    };
+
+    if nodes_changed {
+        persist_state(state).await;
     }
 }
 
@@ -316,14 +360,28 @@ async fn apply_message(state: &Arc<SharedState>, msg: GossipMessage) {
             };
             if updated {
                 print_dynamic_config(state).await;
-                persist_dynamic_config(state).await;
+                persist_state(state).await;
             }
         }
         GossipMessage::NodeJoin { id, addr } => {
-            let mut kn = state.known_nodes.write().await;
-            if !kn.iter().any(|n| n.id == id) {
-                info!("node joined: {id} @ {addr}");
-                kn.push(NodeInfo { id, addr });
+            let changed = {
+                let mut kn = state.known_nodes.write().await;
+                if let Some(existing) = kn.iter_mut().find(|n| n.id == id) {
+                    if existing.addr != addr {
+                        info!("node {id} address updated: {} -> {addr}", existing.addr);
+                        existing.addr = addr;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    info!("node joined: {id} @ {addr}");
+                    kn.push(NodeInfo { id, addr, relay: None });
+                    true
+                }
+            };
+            if changed {
+                persist_state(state).await;
             }
         }
         GossipMessage::NodeLeave { id } => {
@@ -362,13 +420,25 @@ async fn build_sync_msg(state: &Arc<SharedState>) -> GossipMessage {
     let config = state.dynamic_config.read().await.clone();
     let mut nodes = state.known_nodes.read().await.clone();
 
-    if !state.config.node_id.is_empty()
-        && !nodes.iter().any(|n| n.id == state.config.node_id)
-    {
-        nodes.push(NodeInfo {
-            id: state.config.node_id.clone(),
-            addr: state.config.bind.clone(),
-        });
+    if !state.config.node_id.is_empty() {
+        let self_addr = if state.config.outbound_only {
+            // NAT'd nodes have no directly reachable address.
+            // The relay field will be populated by relay nodes.
+            String::new()
+        } else {
+            state.config.peer_addr().to_owned()
+        };
+
+        if let Some(existing) = nodes.iter_mut().find(|n| n.id == state.config.node_id) {
+            // Always ensure our own entry has the current address.
+            existing.addr = self_addr;
+        } else {
+            nodes.push(NodeInfo {
+                id: state.config.node_id.clone(),
+                addr: self_addr,
+                relay: None,
+            });
+        }
     }
 
     GossipMessage::Sync { config, nodes }

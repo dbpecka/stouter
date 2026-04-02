@@ -19,18 +19,13 @@ struct Cli {
     #[arg(short, long, global = true, default_value = "stouter.json")]
     config: String,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the node daemon
-    Node {
-        #[command(subcommand)]
-        action: Option<NodeAction>,
-    },
-    /// Run the subscribe daemon
-    Subscribe,
+    /// Add this host to the cluster
+    Init,
     /// Show the status of the running daemon on this host
     Status,
     /// Manage services
@@ -38,12 +33,6 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
-}
-
-#[derive(Subcommand)]
-enum NodeAction {
-    /// Add this host to the cluster
-    Add,
 }
 
 #[derive(Subcommand)]
@@ -75,20 +64,21 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // -----------------------------------------------------------------
-        // node  (no sub-command)
+        // no sub-command → run daemon based on config mode
         // -----------------------------------------------------------------
-        Commands::Node { action: None } => {
+        None => {
             let cfg = Config::load(&cli.config)?;
-            let state = SharedState::new(cfg, cli.config.clone());
-            node::run_node(state).await?;
+            let state = SharedState::new(cfg.clone(), cli.config.clone());
+            match cfg.mode {
+                config::Mode::Node => node::run_node(state).await?,
+                config::Mode::Subscribe => subscribe::run_subscribe(state).await?,
+            }
         }
 
         // -----------------------------------------------------------------
-        // node add
+        // init
         // -----------------------------------------------------------------
-        Commands::Node {
-            action: Some(NodeAction::Add),
-        } => {
+        Some(Commands::Init) => {
             let mut cfg = Config::load(&cli.config).unwrap_or_default();
 
             // Generate a random 32-byte local secret and hex-encode it.
@@ -112,7 +102,7 @@ async fn main() -> Result<()> {
                     &state,
                     gossip::messages::GossipMessage::NodeJoin {
                         id: cfg.node_id.clone(),
-                        addr: cfg.bind.clone(),
+                        addr: cfg.peer_addr().to_owned(),
                     },
                 )
                 .await;
@@ -122,7 +112,7 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         // status
         // -----------------------------------------------------------------
-        Commands::Status => {
+        Some(Commands::Status) => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             let bind = &cfg.bind;
 
@@ -175,31 +165,23 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
-        // subscribe
-        // -----------------------------------------------------------------
-        Commands::Subscribe => {
-            let cfg = Config::load(&cli.config)?;
-            let state = SharedState::new(cfg, cli.config.clone());
-            subscribe::run_subscribe(state).await?;
-        }
-
-        // -----------------------------------------------------------------
         // service add
         // -----------------------------------------------------------------
-        Commands::Service {
+        Some(Commands::Service {
             action:
                 ServiceAction::Add {
                     group: group_name,
                     name,
                     port,
                 },
-        } => {
+        }) => {
             let mut cfg = Config::load(&cli.config).unwrap_or_default();
 
             let service = Service {
                 name: name.clone(),
                 node_id: cfg.node_id.clone(),
                 node_port: port,
+                domains: Vec::new(),
             };
 
             // Find or create the target service group.
@@ -209,7 +191,11 @@ async fn main() -> Result<()> {
                 .iter_mut()
                 .find(|g| g.name == group_name)
             {
-                g.services.push(service);
+                if let Some(existing) = g.services.iter_mut().find(|s| s.name == name && s.node_id == cfg.node_id) {
+                    existing.node_port = port;
+                } else {
+                    g.services.push(service);
+                }
             } else {
                 cfg.dynamic_config.service_groups.push(ServiceGroup {
                     name: group_name.clone(),
@@ -239,9 +225,9 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         // service list
         // -----------------------------------------------------------------
-        Commands::Service {
+        Some(Commands::Service {
             action: ServiceAction::List,
-        } => {
+        }) => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             let mut found = false;
             for group in &cfg.dynamic_config.service_groups {

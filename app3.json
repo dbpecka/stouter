@@ -1,0 +1,30 @@
+{
+  "clusterSecret": "lajsd22asldkASdj310dgjvds",
+  "mode": "subscribe",
+  "bind": "0.0.0.0:60001",
+  "nodeId": "app3",
+  "localSecret": "lasdasssksdlncunsuvsadon",
+  "knownNodes": ["dfast:60001", "min1:60001", "app3.gce.peckanetworks.net:60001"],
+  "dynamicConfig": {
+    "version": 2,
+    "serviceGroups": [
+      {
+        "name": "equipflo",
+        "services": [
+          {
+            "name": "equipflo-test-web",
+            "nodeId": "min1",
+            "nodePort": 3200,
+			"domains" : ["test.equipflo.pecka.io"]
+          },
+          {
+            "name": "equipflo-test-api",
+            "nodeId": "min1",
+            "nodePort": 8200,
+			"domains": ["test.api.equipflo.pecka.io"]
+          }
+        ]
+      }
+    ]
+  }
+}

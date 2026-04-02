@@ -17,11 +17,13 @@ const MAX_SKEW_MS: u64 = 30_000;
 /// Framing request sent by a subscribe-side proxy to initiate a tunnel.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TunnelRequest {
-    service_name: String,
-    timestamp_ms: u64,
+pub struct TunnelRequest {
+    /// Target node ID. Needed for relay dispatch; redundant for direct connections.
+    pub node_id: String,
+    pub service_name: String,
+    pub timestamp_ms: u64,
     /// HMAC-SHA256(cluster_secret, "{service_name}:{timestamp_ms}") in hex.
-    token: String,
+    pub token: String,
 }
 
 /// Write a tunnel error response: `0x01` status byte, 4-byte big-endian message
@@ -99,14 +101,24 @@ pub async fn handle_tunnel(mut client: TcpStream, state: Arc<SharedState>) -> Re
         bail!("{msg}");
     }
 
+    // --- Check if this tunnel targets us or needs relaying ---
+    let our_node_id = &state.config.node_id;
+    if !req.node_id.is_empty() && req.node_id != *our_node_id {
+        // This tunnel is for a different node — relay via reverse pool.
+        // Reconstruct the raw frame (length prefix + body) for forwarding.
+        let mut tunnel_frame = Vec::with_capacity(4 + frame.len());
+        tunnel_frame.extend_from_slice(&len_buf);
+        tunnel_frame.extend_from_slice(&frame);
+        return super::relay::relay_tunnel(client, &req.node_id, &tunnel_frame, &state).await;
+    }
+
     // --- Locate service on this node ---
-    let node_id = &state.config.node_id;
     let dc = state.dynamic_config.read().await;
     let service = dc
         .service_groups
         .iter()
         .flat_map(|g| g.services.iter())
-        .find(|s| s.node_id == *node_id && s.name == req.service_name)
+        .find(|s| s.node_id == *our_node_id && s.name == req.service_name)
         .cloned();
     drop(dc);
 

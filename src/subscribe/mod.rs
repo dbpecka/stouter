@@ -13,12 +13,20 @@ use tokio::sync::RwLock;
 use tokio::time;
 use tracing::{debug, info};
 
-use crate::config::Service;
+use crate::config::{NodeInfo, Service};
 use crate::gossip;
 use crate::state::SharedState;
 
+/// Port and metadata for a locally proxied service.
+pub(crate) struct ServiceInfo {
+    pub port: u16,
+    pub domains: Vec<String>,
+}
+
 /// A running local proxy for a single service.
 struct ProxyHandle {
+    /// The bare service name, used as the key in `service_ports`.
+    service_name: String,
     #[allow(dead_code)]
     local_port: u16,
     abort: tokio::task::AbortHandle,
@@ -33,7 +41,7 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
     tokio::spawn(gossip::run_member_log(state.clone()));
     tokio::spawn(gossip::run_config_poll_loop(state.clone()));
 
-    let service_ports: Arc<RwLock<HashMap<String, u16>>> =
+    let service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
     let dns_ports = service_ports.clone();
@@ -71,6 +79,16 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
                 gossip::CONN_GOSSIP => {
                     gossip::handle_gossip_connection(stream, state).await;
                 }
+                gossip::CONN_TUNNEL => {
+                    if let Err(e) = crate::node::tunnel::handle_tunnel(stream, state).await {
+                        tracing::error!("tunnel from {peer_addr}: {e}");
+                    }
+                }
+                gossip::CONN_REVERSE => {
+                    if let Err(e) = crate::node::relay::handle_reverse_registration(stream, state).await {
+                        debug!("reverse registration from {peer_addr} failed: {e}");
+                    }
+                }
                 gossip::CONN_STATUS => {
                     gossip::handle_status_connection(stream, state).await;
                 }
@@ -90,7 +108,7 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
 /// new services, and aborts proxies for services that have disappeared.
 async fn manage_proxies(
     state: Arc<SharedState>,
-    service_ports: Arc<RwLock<HashMap<String, u16>>>,
+    service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>>,
 ) {
     let mut proxies: HashMap<String, ProxyHandle> = HashMap::new();
     let mut interval = time::interval(Duration::from_secs(2));
@@ -101,14 +119,14 @@ async fn manage_proxies(
         // Snapshot current desired state.
         let dc = state.dynamic_config.read().await.clone();
         let nodes = state.known_nodes.read().await.clone();
-        let cluster_secret = state.config.cluster_secret.clone();
 
-        // Build a map: service_name -> (Service, node_addr).
-        let mut desired: HashMap<String, (Service, String)> = HashMap::new();
+        // Build a map: "group/service" -> (Service, NodeInfo).
+        let mut desired: HashMap<String, (Service, NodeInfo)> = HashMap::new();
         for group in &dc.service_groups {
             for svc in &group.services {
                 if let Some(node) = nodes.iter().find(|n| n.id == svc.node_id) {
-                    desired.insert(svc.name.clone(), (svc.clone(), node.addr.clone()));
+                    let key = format!("{}/{}", group.name, svc.name);
+                    desired.insert(key, (svc.clone(), node.clone()));
                 }
             }
         }
@@ -120,39 +138,54 @@ async fn manage_proxies(
             .cloned()
             .collect();
 
-        for name in removed {
-            if let Some(handle) = proxies.remove(&name) {
+        for key in removed {
+            if let Some(handle) = proxies.remove(&key) {
                 handle.abort.abort();
-                service_ports.write().await.remove(&name);
-                info!("Stopped proxy for {name}");
+                service_ports.write().await.remove(&handle.service_name);
+                info!("Stopped proxy for {key}");
             }
         }
 
         // Start proxies for newly desired services.
-        for (name, (svc, node_addr)) in desired {
-            if proxies.contains_key(&name) {
+        for (key, (svc, node)) in desired {
+            if proxies.contains_key(&key) {
                 continue;
             }
 
+            // DNS/API can only serve one port per bare service name. If another
+            // proxy already owns this name, skip to avoid inconsistency.
+            {
+                let ports = service_ports.read().await;
+                if ports.contains_key(&svc.name) {
+                    tracing::warn!(
+                        "service name '{}' already proxied, skipping {key}",
+                        svc.name
+                    );
+                    continue;
+                }
+            }
+
+            let svc_name = svc.name.clone();
+            let svc_domains = svc.domains.clone();
             let (port_tx, port_rx) = tokio::sync::oneshot::channel();
             let join_handle = tokio::spawn(proxy::run_proxy(
                 svc,
-                node_addr,
-                cluster_secret.clone(),
+                node,
+                state.clone(),
                 port_tx,
             ));
             let abort = join_handle.abort_handle();
 
             match port_rx.await {
                 Ok(local_port) => {
-                    service_ports.write().await.insert(name.clone(), local_port);
-                    proxies.insert(name.clone(), ProxyHandle { local_port, abort });
-                    info!("Started proxy for {name} on 127.0.0.1:{local_port}");
+                    service_ports.write().await.insert(svc_name.clone(), ServiceInfo { port: local_port, domains: svc_domains });
+                    proxies.insert(key.clone(), ProxyHandle { service_name: svc_name, local_port, abort });
+                    info!("Started proxy for {key} on 127.0.0.1:{local_port}");
                 }
                 Err(_) => {
                     // run_proxy exited before sending the port (bind failure etc.).
                     abort.abort();
-                    tracing::warn!("Proxy for {name} failed to start");
+                    tracing::warn!("Proxy for {key} failed to start");
                 }
             }
         }

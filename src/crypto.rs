@@ -23,3 +23,43 @@ pub fn verify(secret: &str, data: &str, signature: &str) -> bool {
     mac.update(data.as_bytes());
     mac.verify_slice(&sig_bytes).is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_produces_64_char_hex() {
+        let sig = sign("secret", "hello");
+        assert_eq!(sig.len(), 64);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sign_is_deterministic() {
+        assert_eq!(sign("key", "data"), sign("key", "data"));
+    }
+
+    #[test]
+    fn verify_accepts_valid_signature() {
+        let sig = sign("secret", "payload");
+        assert!(verify("secret", "payload", &sig));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret() {
+        let sig = sign("secret", "payload");
+        assert!(!verify("other", "payload", &sig));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_data() {
+        let sig = sign("secret", "payload");
+        assert!(!verify("secret", "tampered", &sig));
+    }
+
+    #[test]
+    fn verify_rejects_invalid_hex() {
+        assert!(!verify("secret", "data", "not-valid-hex!!"));
+    }
+}
