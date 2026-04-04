@@ -80,9 +80,9 @@ pub struct Config {
     /// When true, the node only makes outbound connections (behind NAT).
     #[serde(default)]
     pub outbound_only: bool,
-    /// Number of idle reverse connections to maintain per relay peer (default 4).
+    /// Number of idle reverse connections to maintain per relay peer (default 64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse_pool_size: Option<u8>,
+    pub reverse_pool_size: Option<u16>,
     /// Peer addresses in `"host:port"` form.
     pub known_nodes: Vec<String>,
     pub dynamic_config: DynamicConfig,
@@ -129,17 +129,15 @@ impl Config {
 
     /// Number of idle reverse connections to maintain per relay peer.
     pub fn pool_size(&self) -> usize {
-        self.reverse_pool_size.unwrap_or(4) as usize
+        self.reverse_pool_size.unwrap_or(64) as usize
     }
 }
 
-/// Retrieve the system hostname, falling back to `"unknown"` on error.
+/// Retrieve the system hostname via syscall, falling back to `"unknown"` on error.
 pub fn get_hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
+    hostname::get()
         .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_owned())
+        .and_then(|name| name.into_string().ok())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from("unknown"))
 }

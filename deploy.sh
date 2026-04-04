@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+debug() { echo "  [DEBUG] $*"; }
+
 usage() {
   echo "Usage: ./deploy.sh [-c config_file] [-r] user@host"
   echo "  -c  config file to upload"
@@ -23,6 +25,10 @@ REMOTE_HOST="${1:?$(usage)}"
 REMOTE_DIR="/srv/stouter"
 CONTAINER_NAME="stouter"
 
+debug "REMOTE_HOST=$REMOTE_HOST"
+debug "CONFIG_FILE=${CONFIG_FILE:-<none>}"
+debug "RESTART_ONLY=$RESTART_ONLY"
+
 # Prompt for sudo password once and cache it for subsequent commands
 read -rsp "[sudo] password for $REMOTE_HOST: " SUDO_PASS
 echo
@@ -30,35 +36,54 @@ SUDO="echo '$SUDO_PASS' | sudo -S"
 
 if [[ "$RESTART_ONLY" == false ]]; then
   echo "==> Syncing source to $REMOTE_HOST:$REMOTE_DIR/build/"
+  debug "Creating remote directory $REMOTE_DIR/build/"
   ssh "$REMOTE_HOST" "$SUDO mkdir -p $REMOTE_DIR/build && $SUDO chown \$(id -u):\$(id -g) $REMOTE_DIR/build" 2>/dev/null
-  rsync -az --delete \
-    --exclude target/ \
-    --exclude .git/ \
-    --exclude .idea/ \
-    --exclude '*.json' \
-    ./ "$REMOTE_HOST:$REMOTE_DIR/build/"
+  debug "Cleaning remote build directory"
+  ssh "$REMOTE_HOST" "$SUDO rm -rf $REMOTE_DIR/build/*" 2>/dev/null
+  debug "Running scp (excluding target/, .git/, .idea/, *.json)"
+  scp -r $(find . -maxdepth 1 \
+    ! -name '.' \
+    ! -name 'target' \
+    ! -name '.git' \
+    ! -name '.idea' \
+    ! -name '*.json' \
+    -print) "$REMOTE_HOST:$REMOTE_DIR/build/"
+  debug "SCP complete"
 fi
 
 if [[ -n "$CONFIG_FILE" ]]; then
   echo "==> Uploading config: $CONFIG_FILE"
-  ssh "$REMOTE_HOST" "$SUDO rm -rf $REMOTE_DIR/build/stouter.json $REMOTE_DIR/stouter.json" 2>/dev/null
+  debug "Removing old config files on remote"
+  ssh "$REMOTE_HOST" "$SUDO rm -rf $REMOTE_DIR/build/stouter.json $REMOTE_DIR/stouter.json"
+  debug "SCP $CONFIG_FILE -> $REMOTE_HOST:$REMOTE_DIR/build/stouter.json"
   scp "$CONFIG_FILE" "$REMOTE_HOST:$REMOTE_DIR/build/stouter.json"
   echo "==> Deploying stouter.json"
+  debug "Copying config to $REMOTE_DIR/stouter.json"
   ssh "$REMOTE_HOST" "$SUDO cp $REMOTE_DIR/build/stouter.json $REMOTE_DIR/stouter.json" 2>/dev/null
+else
+  debug "No config file specified, skipping config upload"
 fi
 
 if [[ "$RESTART_ONLY" == false ]]; then
   echo "==> Building Docker image on remote"
+  debug "Running: docker build -t stouter:latest in $REMOTE_DIR/build"
   ssh "$REMOTE_HOST" "cd $REMOTE_DIR/build && $SUDO docker build -t stouter:latest ." 2>&1 | grep -v '^\[sudo\]'
+  debug "Docker build complete"
+else
+  debug "Restart-only mode, skipping build"
 fi
 
 echo "==> Verifying config exists"
 ssh "$REMOTE_HOST" "test -f $REMOTE_DIR/stouter.json" 2>/dev/null || { echo "Error: no config file at $REMOTE_DIR/stouter.json — use -c to provide one"; exit 1; }
 
 echo "==> Restarting container"
+debug "Stopping and removing existing container: $CONTAINER_NAME"
 ssh "$REMOTE_HOST" "
   $SUDO docker stop $CONTAINER_NAME 2>/dev/null || true
   $SUDO docker rm $CONTAINER_NAME 2>/dev/null || true
+" 2>/dev/null
+debug "Starting new container: $CONTAINER_NAME (--network host, config=$REMOTE_DIR/stouter.json)"
+ssh "$REMOTE_HOST" "
   $SUDO docker run -d \
     --name $CONTAINER_NAME \
     --restart unless-stopped \
@@ -69,4 +94,7 @@ ssh "$REMOTE_HOST" "
 " 2>/dev/null
 
 echo "==> Deployed. Checking status..."
-ssh "$REMOTE_HOST" "$SUDO docker ps --filter name=$CONTAINER_NAME --format '{{.Status}}'" 2>/dev/null
+CONTAINER_STATUS=$(ssh "$REMOTE_HOST" "$SUDO docker ps --filter name=$CONTAINER_NAME --format '{{.Status}}'" 2>/dev/null)
+echo "$CONTAINER_STATUS"
+debug "Container status: ${CONTAINER_STATUS:-<not running>}"
+debug "Deploy finished at $(date '+%Y-%m-%d %H:%M:%S')"

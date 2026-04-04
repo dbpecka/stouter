@@ -19,3 +19,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rand = "0.8"
+hostname = "0.3"
+socket2 = "0.5"
+axum = "0.8"
+arc-swap = "1"
+
+[dev-dependencies]
+tower = "0.5"

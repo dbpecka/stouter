@@ -1,5 +1,4 @@
 mod api;
-mod dns;
 mod proxy;
 
 use std::collections::HashMap;
@@ -7,11 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio::time;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::config::{NodeInfo, Service};
 use crate::gossip;
@@ -34,8 +31,8 @@ struct ProxyHandle {
 
 /// Run the subscribe daemon.
 ///
-/// Starts the gossip sync loop, DNS server, local proxy manager, and a TCP
-/// listener that accepts inbound gossip connections.
+/// Starts the gossip sync loop, REST API, local proxy manager, and a TCP
+/// listener that accepts inbound connections.
 pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
     tokio::spawn(gossip::run_sync_loop(state.clone()));
     tokio::spawn(gossip::run_member_log(state.clone()));
@@ -43,13 +40,6 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
 
     let service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>> =
         Arc::new(RwLock::new(HashMap::new()));
-
-    let dns_ports = service_ports.clone();
-    tokio::spawn(async move {
-        if let Err(e) = dns::run_dns(dns_ports, 5380).await {
-            tracing::error!("DNS server exited: {e}");
-        }
-    });
 
     let api_ports = service_ports.clone();
     tokio::spawn(async move {
@@ -65,38 +55,13 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
     info!("Subscribe daemon listening on {}", state.config.bind);
 
     tokio::spawn(manage_proxies(state.clone(), service_ports));
+    tokio::spawn(fill_tunnel_pool(state.clone()));
 
     loop {
-        let (mut stream, peer_addr) = listener.accept().await.context("accept connection")?;
+        let (stream, _) = listener.accept().await.context("accept connection")?;
+        stream.set_nodelay(true).ok();
         let state = state.clone();
-        tokio::spawn(async move {
-            let mut type_buf = [0u8; 1];
-            if let Err(e) = stream.read_exact(&mut type_buf).await {
-                debug!("failed to read connection type from {peer_addr}: {e}");
-                return;
-            }
-            match type_buf[0] {
-                gossip::CONN_GOSSIP => {
-                    gossip::handle_gossip_connection(stream, state).await;
-                }
-                gossip::CONN_TUNNEL => {
-                    if let Err(e) = crate::node::tunnel::handle_tunnel(stream, state).await {
-                        tracing::error!("tunnel from {peer_addr}: {e}");
-                    }
-                }
-                gossip::CONN_REVERSE => {
-                    if let Err(e) = crate::node::relay::handle_reverse_registration(stream, state).await {
-                        debug!("reverse registration from {peer_addr} failed: {e}");
-                    }
-                }
-                gossip::CONN_STATUS => {
-                    gossip::handle_status_connection(stream, state).await;
-                }
-                byte => {
-                    debug!("unknown connection type 0x{byte:02x} from {peer_addr}");
-                }
-            }
-        });
+        tokio::spawn(gossip::dispatch_connection(stream, state));
     }
 }
 
@@ -111,20 +76,20 @@ async fn manage_proxies(
     service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>>,
 ) {
     let mut proxies: HashMap<String, ProxyHandle> = HashMap::new();
-    let mut interval = time::interval(Duration::from_secs(2));
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
 
     loop {
         interval.tick().await;
 
         // Snapshot current desired state.
         let dc = state.dynamic_config.read().await.clone();
-        let nodes = state.known_nodes.read().await.clone();
+        let nodes = state.known_nodes.load_full();
 
         // Build a map: "group/service" -> (Service, NodeInfo).
         let mut desired: HashMap<String, (Service, NodeInfo)> = HashMap::new();
         for group in &dc.service_groups {
             for svc in &group.services {
-                if let Some(node) = nodes.iter().find(|n| n.id == svc.node_id) {
+                if let Some(node) = nodes.get(&svc.node_id) {
                     let key = format!("{}/{}", group.name, svc.name);
                     desired.insert(key, (svc.clone(), node.clone()));
                 }
@@ -152,7 +117,7 @@ async fn manage_proxies(
                 continue;
             }
 
-            // DNS/API can only serve one port per bare service name. If another
+            // The API can only serve one port per bare service name. If another
             // proxy already owns this name, skip to avoid inconsistency.
             {
                 let ports = service_ports.read().await;
@@ -183,11 +148,53 @@ async fn manage_proxies(
                     info!("Started proxy for {key} on 127.0.0.1:{local_port}");
                 }
                 Err(_) => {
-                    // run_proxy exited before sending the port (bind failure etc.).
                     abort.abort();
                     tracing::warn!("Proxy for {key} failed to start");
                 }
             }
         }
+    }
+}
+
+/// Background task that maintains warm TCP connections to known nodes.
+///
+/// These pre-established connections eliminate TCP handshake latency on
+/// the proxy hot path.
+async fn fill_tunnel_pool(state: Arc<SharedState>) {
+    /// Target number of warm connections per node address.
+    const POOL_TARGET: usize = 8;
+
+    loop {
+        let addrs: Vec<String> = {
+            let nodes = state.known_nodes.load();
+            nodes
+                .values()
+                .filter_map(|node| {
+                    let addr = node.relay.as_deref().unwrap_or(&node.addr);
+                    if addr.is_empty() || state.tunnel_pool.count(addr) >= POOL_TARGET {
+                        None
+                    } else {
+                        Some(addr.to_string())
+                    }
+                })
+                .collect()
+        };
+
+        if addrs.is_empty() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        for addr in &addrs {
+            match tokio::net::TcpStream::connect(addr.as_str()).await {
+                Ok(stream) => {
+                    crate::io::configure_stream(&stream);
+                    state.tunnel_pool.push(addr.clone(), stream);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

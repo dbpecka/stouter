@@ -5,9 +5,8 @@ pub mod tunnel;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use crate::gossip;
 use crate::state::SharedState;
@@ -27,7 +26,6 @@ pub async fn run_node(state: Arc<SharedState>) -> Result<()> {
             "Node running in outbound-only mode (NAT'd), node_id={}",
             state.config.node_id
         );
-        // No listener — maintain reverse connections to peers instead.
         reverse::run_reverse_pool_loop(state).await;
         Ok(())
     } else {
@@ -44,39 +42,11 @@ async fn run_listener(state: Arc<SharedState>) -> Result<()> {
     info!("Node listening on {}", state.config.bind);
 
     loop {
-        let (mut stream, peer_addr) = listener.accept().await.context("accept connection")?;
+        let (stream, peer_addr) = listener.accept().await.context("accept connection")?;
+        stream.set_nodelay(true).ok();
         debug!("accepted connection from {peer_addr}");
 
         let state = state.clone();
-
-        tokio::spawn(async move {
-            let mut type_buf = [0u8; 1];
-            if let Err(e) = stream.read_exact(&mut type_buf).await {
-                debug!("failed to read connection type from {peer_addr}: {e}");
-                return;
-            }
-
-            match type_buf[0] {
-                gossip::CONN_GOSSIP => {
-                    gossip::handle_gossip_connection(stream, state).await;
-                }
-                gossip::CONN_TUNNEL => {
-                    if let Err(e) = tunnel::handle_tunnel(stream, state).await {
-                        error!("{e}");
-                    }
-                }
-                gossip::CONN_REVERSE => {
-                    if let Err(e) = relay::handle_reverse_registration(stream, state).await {
-                        debug!("reverse registration from {peer_addr} failed: {e}");
-                    }
-                }
-                gossip::CONN_STATUS => {
-                    gossip::handle_status_connection(stream, state).await;
-                }
-                byte => {
-                    debug!("Unknown connection type: 0x{byte:02x} from {peer_addr}");
-                }
-            }
-        });
+        tokio::spawn(gossip::dispatch_connection(stream, state));
     }
 }

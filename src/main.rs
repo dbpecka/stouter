@@ -1,6 +1,7 @@
 mod config;
 mod crypto;
 mod gossip;
+mod io;
 mod node;
 mod state;
 mod subscribe;
@@ -8,9 +9,9 @@ mod subscribe;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use config::{Config, Service, ServiceGroup};
+use gossip::messages::Message;
 use state::SharedState;
 
 #[derive(Parser)]
@@ -100,7 +101,7 @@ async fn main() -> Result<()> {
                 let state = SharedState::new(cfg.clone(), cli.config.clone());
                 gossip::broadcast_message(
                     &state,
-                    gossip::messages::GossipMessage::NodeJoin {
+                    Message::NodeJoin {
                         id: cfg.node_id.clone(),
                         addr: cfg.peer_addr().to_owned(),
                     },
@@ -121,44 +122,55 @@ async fn main() -> Result<()> {
                     println!("No daemon running on {bind}");
                 }
                 Ok(mut stream) => {
-                    stream.write_all(&[gossip::CONN_STATUS]).await?;
+                    gossip::send_message(
+                        &mut stream,
+                        &Message::StatusRequest,
+                        &cfg.cluster_secret,
+                    )
+                    .await?;
 
-                    let mut len_buf = [0u8; 4];
-                    stream.read_exact(&mut len_buf).await?;
-                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let msg = gossip::recv_message(&mut stream, &cfg.cluster_secret).await?;
 
-                    let mut body = vec![0u8; len];
-                    stream.read_exact(&mut body).await?;
+                    match msg {
+                        Message::StatusResponse {
+                            mode,
+                            node_id,
+                            bind,
+                            dynamic_config,
+                            known_nodes,
+                        } => {
+                            println!("Daemon:  running ({mode} mode)");
+                            println!("Node ID: {node_id}");
+                            println!("Bind:    {bind}");
+                            println!("Config version: {}", dynamic_config.version);
 
-                    let resp: gossip::StatusResponse = serde_json::from_slice(&body)?;
+                            println!("\nServices:");
+                            let mut any = false;
+                            for group in &dynamic_config.service_groups {
+                                println!("  [{}]", group.name);
+                                for svc in &group.services {
+                                    println!(
+                                        "    {:<20} node={:<20} port={}",
+                                        svc.name, svc.node_id, svc.node_port
+                                    );
+                                    any = true;
+                                }
+                            }
+                            if !any {
+                                println!("  (none)");
+                            }
 
-                    println!("Daemon:  running ({} mode)", resp.mode);
-                    println!("Node ID: {}", resp.node_id);
-                    println!("Bind:    {}", resp.bind);
-                    println!("Config version: {}", resp.dynamic_config.version);
-
-                    println!("\nServices:");
-                    let mut any = false;
-                    for group in &resp.dynamic_config.service_groups {
-                        println!("  [{}]", group.name);
-                        for svc in &group.services {
-                            println!(
-                                "    {:<20} node={:<20} port={}",
-                                svc.name, svc.node_id, svc.node_port
-                            );
-                            any = true;
+                            println!("\nKnown nodes:");
+                            if known_nodes.is_empty() {
+                                println!("  (none)");
+                            }
+                            for node in &known_nodes {
+                                println!("  {:<20} {}", node.id, node.addr);
+                            }
                         }
-                    }
-                    if !any {
-                        println!("  (none)");
-                    }
-
-                    println!("\nKnown nodes:");
-                    if resp.known_nodes.is_empty() {
-                        println!("  (none)");
-                    }
-                    for node in &resp.known_nodes {
-                        println!("  {:<20} {}", node.id, node.addr);
+                        _ => {
+                            println!("Unexpected response from daemon");
+                        }
                     }
                 }
             }
@@ -210,7 +222,7 @@ async fn main() -> Result<()> {
             let state = SharedState::new(cfg.clone(), cli.config.clone());
             gossip::broadcast_message(
                 &state,
-                gossip::messages::GossipMessage::ConfigUpdate {
+                Message::ConfigUpdate {
                     config: cfg.dynamic_config.clone(),
                 },
             )

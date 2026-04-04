@@ -11,18 +11,9 @@ use tracing::{debug, error, info};
 
 use crate::config::NodeInfo;
 use crate::state::SharedState;
-use messages::{GossipMessage, SignedMessage};
+use messages::{Message, SignedMessage};
 
-/// Connection-type byte sent as the first octet of every TCP connection.
-pub const CONN_GOSSIP: u8 = b'G';
-/// Connection-type byte for tunnel connections.
-pub const CONN_TUNNEL: u8 = b'T';
-/// Connection-type byte for status queries.
-pub const CONN_STATUS: u8 = b'S';
-/// Connection-type byte for reverse connections from NAT'd nodes.
-pub const CONN_REVERSE: u8 = b'R';
-
-/// Maximum allowed gossip message size: 1 MiB.
+/// Maximum allowed message size: 1 MiB.
 const MAX_MSG_BYTES: u32 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -33,10 +24,10 @@ const MAX_MSG_BYTES: u32 = 1024 * 1024;
 /// 4-byte big-endian length prefix.
 pub async fn send_message(
     stream: &mut TcpStream,
-    msg: &GossipMessage,
+    msg: &Message,
     secret: &str,
 ) -> Result<()> {
-    let payload = serde_json::to_string(msg).context("serialize GossipMessage")?;
+    let payload = serde_json::to_string(msg).context("serialize Message")?;
     let signature = crate::crypto::sign(secret, &payload);
     let signed = SignedMessage { payload, signature };
     let frame = serde_json::to_vec(&signed).context("serialize SignedMessage")?;
@@ -50,9 +41,9 @@ pub async fn send_message(
     Ok(())
 }
 
-/// Read a length-prefixed gossip message from `stream`, verify its HMAC
-/// signature, and return the inner [`GossipMessage`].
-pub async fn recv_message(stream: &mut TcpStream, secret: &str) -> Result<GossipMessage> {
+/// Read a length-prefixed message from `stream`, verify its HMAC
+/// signature, and return the inner [`Message`].
+pub async fn recv_message(stream: &mut TcpStream, secret: &str) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -61,7 +52,7 @@ pub async fn recv_message(stream: &mut TcpStream, secret: &str) -> Result<Gossip
     let len = u32::from_be_bytes(len_buf);
 
     if len > MAX_MSG_BYTES {
-        bail!("gossip message too large: {len} bytes");
+        bail!("message too large: {len} bytes");
     }
 
     let mut frame = vec![0u8; len as usize];
@@ -74,41 +65,124 @@ pub async fn recv_message(stream: &mut TcpStream, secret: &str) -> Result<Gossip
         serde_json::from_slice(&frame).context("deserialize SignedMessage")?;
 
     if !crate::crypto::verify(secret, &signed.payload, &signed.signature) {
-        bail!("gossip message signature verification failed");
+        bail!("message signature verification failed");
     }
 
-    let msg: GossipMessage =
-        serde_json::from_str(&signed.payload).context("deserialize GossipMessage")?;
+    let msg: Message =
+        serde_json::from_str(&signed.payload).context("deserialize Message")?;
     Ok(msg)
 }
 
 // ---------------------------------------------------------------------------
-// Connection handler
+// Connection dispatch
 // ---------------------------------------------------------------------------
 
-/// Handle an inbound gossip TCP connection.
-///
-/// Reads the first message; if it is a [`GossipMessage::Sync`] the state is
-/// merged and a Sync reply is sent back so the peer can also update itself.
-/// All other message types update local state without a reply.
-pub async fn handle_gossip_connection(mut stream: TcpStream, state: Arc<SharedState>) {
+/// Handle an inbound TCP connection by reading the first message and
+/// dispatching to the appropriate handler based on its variant.
+pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>) {
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let secret = state.config.cluster_secret.clone();
+
     match recv_message(&mut stream, &secret).await {
         Err(e) => {
-            debug!("failed to receive gossip message: {e}");
+            debug!("failed to receive message from {peer_addr}: {e}");
         }
-        Ok(GossipMessage::Sync { config, nodes }) => {
+        Ok(msg) => match msg {
+            Message::Sync { .. }
+            | Message::ConfigUpdate { .. }
+            | Message::NodeJoin { .. }
+            | Message::NodeLeave { .. } => {
+                handle_gossip_message(stream, msg, state).await;
+            }
+            Message::TunnelRequest {
+                node_id,
+                service_name,
+                timestamp_ms,
+            } => {
+                if let Err(e) = crate::node::tunnel::handle_tunnel(
+                    stream,
+                    node_id,
+                    service_name,
+                    timestamp_ms,
+                    state,
+                )
+                .await
+                {
+                    error!("tunnel from {peer_addr}: {e}");
+                }
+            }
+            Message::ReverseRegistration {
+                node_id,
+                timestamp_ms,
+            } => {
+                if let Err(e) = crate::node::relay::handle_reverse_registration(
+                    stream, node_id, timestamp_ms, state,
+                )
+                .await
+                {
+                    debug!("reverse registration from {peer_addr} failed: {e}");
+                }
+            }
+            Message::StatusRequest => {
+                handle_status_request(stream, state).await;
+            }
+            Message::StatusResponse { .. } => {
+                debug!("unexpected StatusResponse from {peer_addr}");
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gossip message handling
+// ---------------------------------------------------------------------------
+
+/// Handle an already-parsed gossip message (Sync, ConfigUpdate, NodeJoin, NodeLeave).
+///
+/// If the message is a [`Message::Sync`], the state is merged and a Sync
+/// reply is sent back so the peer can also update itself.
+async fn handle_gossip_message(mut stream: TcpStream, msg: Message, state: Arc<SharedState>) {
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    match msg {
+        Message::Sync { config, mut nodes } => {
+            if !peer_addr.is_empty() {
+                fix_unroutable_addrs(&mut nodes, &peer_addr);
+            }
             merge_sync(&state, config, nodes).await;
 
             // Reply with our current state.
             let reply = build_sync_msg(&state).await;
-            if let Err(e) = send_message(&mut stream, &reply, &secret).await {
+            let secret = &state.config.cluster_secret;
+            if let Err(e) = send_message(&mut stream, &reply, secret).await {
                 debug!("failed to send sync reply: {e}");
             }
         }
-        Ok(msg) => {
-            apply_message(&state, msg).await;
+        other => {
+            apply_message(&state, other).await;
         }
+    }
+}
+
+/// Handle a status request by replying with the daemon's current state.
+async fn handle_status_request(mut stream: TcpStream, state: Arc<SharedState>) {
+    let response = Message::StatusResponse {
+        mode: format!("{:?}", state.config.mode).to_lowercase(),
+        node_id: state.config.node_id.clone(),
+        bind: state.config.bind.clone(),
+        dynamic_config: state.dynamic_config.read().await.clone(),
+        known_nodes: state.known_nodes.load().values().cloned().collect(),
+    };
+
+    let secret = &state.config.cluster_secret;
+    if let Err(e) = send_message(&mut stream, &response, secret).await {
+        debug!("status: failed to send response: {e}");
     }
 }
 
@@ -118,7 +192,7 @@ pub async fn handle_gossip_connection(mut stream: TcpStream, state: Arc<SharedSt
 
 /// Background task: periodically read the config file and, if `dynamic_config`
 /// has a higher version than what is in memory, update local state and
-/// broadcast a [`GossipMessage::ConfigUpdate`] to all peers.
+/// broadcast a [`Message::ConfigUpdate`] to all peers.
 pub async fn run_config_poll_loop(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(10));
     loop {
@@ -142,10 +216,11 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 let mut dc = state.dynamic_config.write().await;
                 *dc = new_cfg.dynamic_config.clone();
             }
+            state.rebuild_service_index().await;
             print_dynamic_config(&state).await;
             broadcast_message(
                 &state,
-                GossipMessage::ConfigUpdate {
+                Message::ConfigUpdate {
                     config: new_cfg.dynamic_config,
                 },
             )
@@ -157,10 +232,10 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
 /// Collect all unique peer addresses to contact: bootstrap peers + known member addrs.
 async fn peer_addrs(state: &Arc<SharedState>) -> Vec<String> {
     let mut addrs: Vec<String> = state.bootstrap_peers.clone();
-    let members = state.known_nodes.read().await;
-    for n in members.iter() {
-        if !n.addr.is_empty() && !addrs.contains(&n.addr) {
-            addrs.push(n.addr.clone());
+    let members = state.known_nodes.load();
+    for node in members.values() {
+        if !node.addr.is_empty() && !addrs.contains(&node.addr) {
+            addrs.push(node.addr.clone());
         }
     }
     addrs
@@ -191,20 +266,35 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
         .await
         .with_context(|| format!("connect to {addr}"))?;
 
-    stream
-        .write_all(&[CONN_GOSSIP])
-        .await
-        .context("write connection type")?;
+    stream.set_nodelay(true).ok();
 
     let secret = &state.config.cluster_secret;
     let our_sync = build_sync_msg(state).await;
     send_message(&mut stream, &our_sync, secret).await?;
 
     let reply = recv_message(&mut stream, secret).await?;
-    if let GossipMessage::Sync { config, nodes } = reply {
+    if let Message::Sync { config, mut nodes } = reply {
+        fix_unroutable_addrs(&mut nodes, addr);
         merge_sync(state, config, nodes).await;
     }
     Ok(())
+}
+
+/// Replace `0.0.0.0` addresses in `nodes` with the actual peer address we
+/// connected to, preserving the port from the original address.
+fn fix_unroutable_addrs(nodes: &mut [NodeInfo], connected_addr: &str) {
+    for node in nodes.iter_mut() {
+        if let Some(port) = node.addr.strip_prefix("0.0.0.0:") {
+            if let Some(host) = connected_addr.rsplit_once(':').map(|(h, _)| h) {
+                let new_addr = format!("{host}:{port}");
+                debug!(
+                    "replacing unroutable address {} with {} for node {}",
+                    node.addr, new_addr, node.id
+                );
+                node.addr = new_addr;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,20 +303,13 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
 
 /// Send `msg` to every known peer node.  Connection errors are logged at
 /// `debug` level because peers may be temporarily unreachable.
-pub async fn broadcast_message(state: &Arc<SharedState>, msg: GossipMessage) {
+pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     let peers = peer_addrs(state).await;
 
     let secret = state.config.cluster_secret.clone();
-    let payload = match serde_json::to_string(&msg) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("failed to serialize broadcast message: {e}");
-            return;
-        }
-    };
 
     for addr in peers {
-        match time::timeout(Duration::from_secs(5), send_to_peer(&addr, &payload, &secret)).await {
+        match time::timeout(Duration::from_secs(5), send_to_peer(&addr, &msg, &secret)).await {
             Ok(Err(e)) => debug!("broadcast to {addr} failed: {e}"),
             Err(_) => debug!("broadcast to {addr} timed out"),
             Ok(Ok(())) => {}
@@ -234,20 +317,14 @@ pub async fn broadcast_message(state: &Arc<SharedState>, msg: GossipMessage) {
     }
 }
 
-/// Open a connection to `addr` and send one pre-serialized gossip payload.
-async fn send_to_peer(addr: &str, payload: &str, secret: &str) -> Result<()> {
+/// Open a connection to `addr` and send one message.
+async fn send_to_peer(addr: &str, msg: &Message, secret: &str) -> Result<()> {
     let mut stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect to {addr}"))?;
 
-    stream
-        .write_all(&[CONN_GOSSIP])
-        .await
-        .context("write connection type")?;
-
-    let msg: GossipMessage =
-        serde_json::from_str(payload).context("deserialize for re-send")?;
-    send_message(&mut stream, &msg, secret).await
+    stream.set_nodelay(true).ok();
+    send_message(&mut stream, msg, secret).await
 }
 
 // ---------------------------------------------------------------------------
@@ -308,26 +385,28 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
     };
 
     if updated {
+        state.rebuild_service_index().await;
         print_dynamic_config(state).await;
         persist_state(state).await;
     }
 
-    let nodes_changed = {
-        let mut kn = state.known_nodes.write().await;
+    let nodes_changed = state.update_known_nodes(|kn| {
         let mut changed = false;
         for node in nodes {
             if !is_valid_node_id(&node.id) {
                 debug!("ignoring node with invalid id: {:?}", node.id);
                 continue;
             }
-            if let Some(existing) = kn.iter_mut().find(|n| n.id == node.id) {
+            if let Some(existing) = kn.get_mut(&node.id) {
+                let has_addr = !node.addr.is_empty();
                 if existing.addr != node.addr {
                     info!("node {} address updated: {} -> {}", node.id, existing.addr, node.addr);
                     existing.addr = node.addr;
                     changed = true;
                 }
-                // Update relay info if the peer has newer relay data.
-                if existing.relay != node.relay {
+                if existing.relay != node.relay
+                    && (node.relay.is_some() || has_addr)
+                {
                     info!(
                         "node {} relay updated: {:?} -> {:?}",
                         node.id, existing.relay, node.relay
@@ -337,12 +416,12 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
                 }
             } else {
                 info!("discovered new node: {} @ {}", node.id, node.addr);
-                kn.push(node);
+                kn.insert(node.id.clone(), node);
                 changed = true;
             }
         }
         changed
-    };
+    }).await;
 
     if nodes_changed {
         persist_state(state).await;
@@ -350,9 +429,9 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
 }
 
 /// Apply a non-Sync gossip message to local state.
-async fn apply_message(state: &Arc<SharedState>, msg: GossipMessage) {
+async fn apply_message(state: &Arc<SharedState>, msg: Message) {
     match msg {
-        GossipMessage::ConfigUpdate { config } => {
+        Message::ConfigUpdate { config } => {
             let updated = {
                 let mut dc = state.dynamic_config.write().await;
                 if config.version > dc.version {
@@ -367,18 +446,18 @@ async fn apply_message(state: &Arc<SharedState>, msg: GossipMessage) {
                 }
             };
             if updated {
+                state.rebuild_service_index().await;
                 print_dynamic_config(state).await;
                 persist_state(state).await;
             }
         }
-        GossipMessage::NodeJoin { id, addr } => {
+        Message::NodeJoin { id, addr } => {
             if !is_valid_node_id(&id) {
                 debug!("ignoring NodeJoin with invalid id: {:?}", id);
                 return;
             }
-            let changed = {
-                let mut kn = state.known_nodes.write().await;
-                if let Some(existing) = kn.iter_mut().find(|n| n.id == id) {
+            let changed = state.update_known_nodes(|kn| {
+                if let Some(existing) = kn.get_mut(&id) {
                     if existing.addr != addr {
                         info!("node {id} address updated: {} -> {addr}", existing.addr);
                         existing.addr = addr;
@@ -388,24 +467,25 @@ async fn apply_message(state: &Arc<SharedState>, msg: GossipMessage) {
                     }
                 } else {
                     info!("node joined: {id} @ {addr}");
-                    kn.push(NodeInfo { id, addr, relay: None });
+                    kn.insert(id.clone(), NodeInfo { id, addr, relay: None });
                     true
                 }
-            };
+            }).await;
             if changed {
                 persist_state(state).await;
             }
         }
-        GossipMessage::NodeLeave { id } => {
-            let mut kn = state.known_nodes.write().await;
-            if let Some(pos) = kn.iter().position(|n| n.id == id) {
-                info!("node left: {id}");
-                kn.swap_remove(pos);
-            }
+        Message::NodeLeave { id } => {
+            state.update_known_nodes(|kn| {
+                if kn.remove(&id).is_some() {
+                    info!("node left: {id}");
+                }
+            }).await;
         }
-        GossipMessage::Sync { config, nodes } => {
+        Message::Sync { config, nodes } => {
             merge_sync(state, config, nodes).await;
         }
+        _ => {}
     }
 }
 
@@ -415,9 +495,9 @@ pub async fn run_member_log(state: Arc<SharedState>) {
     interval.tick().await; // skip the immediate first tick
     loop {
         interval.tick().await;
-        let nodes = state.known_nodes.read().await.clone();
+        let nodes = state.known_nodes.load();
         info!("{} member node(s) in cluster", nodes.len());
-        for node in &nodes {
+        for node in nodes.values() {
             info!("  {} @ {}", node.id, node.addr);
         }
     }
@@ -428,21 +508,18 @@ pub async fn run_member_log(state: Arc<SharedState>) {
 /// Always includes a `NodeInfo` for the sender itself so receivers can
 /// populate the `hostname → address` mapping that `manage_proxies` requires
 /// to match services (which store `node_id = hostname`) to connectable peers.
-async fn build_sync_msg(state: &Arc<SharedState>) -> GossipMessage {
+async fn build_sync_msg(state: &Arc<SharedState>) -> Message {
     let config = state.dynamic_config.read().await.clone();
-    let mut nodes = state.known_nodes.read().await.clone();
+    let mut nodes: Vec<NodeInfo> = state.known_nodes.load().values().cloned().collect();
 
     if !state.config.node_id.is_empty() {
         let self_addr = if state.config.outbound_only {
-            // NAT'd nodes have no directly reachable address.
-            // The relay field will be populated by relay nodes.
             String::new()
         } else {
             state.config.peer_addr().to_owned()
         };
 
         if let Some(existing) = nodes.iter_mut().find(|n| n.id == state.config.node_id) {
-            // Always ensure our own entry has the current address.
             existing.addr = self_addr;
         } else {
             nodes.push(NodeInfo {
@@ -453,48 +530,5 @@ async fn build_sync_msg(state: &Arc<SharedState>) -> GossipMessage {
         }
     }
 
-    GossipMessage::Sync { config, nodes }
-}
-
-// ---------------------------------------------------------------------------
-// Status handler
-// ---------------------------------------------------------------------------
-
-/// Response payload sent in reply to a [`CONN_STATUS`] connection.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusResponse {
-    pub mode: String,
-    pub node_id: String,
-    pub bind: String,
-    pub dynamic_config: crate::config::DynamicConfig,
-    pub known_nodes: Vec<NodeInfo>,
-}
-
-/// Handle an inbound status TCP connection.
-///
-/// Serialises the daemon's current state and writes it as a 4-byte
-/// big-endian length-prefixed JSON frame, then closes the connection.
-pub async fn handle_status_connection(mut stream: TcpStream, state: Arc<SharedState>) {
-    use tokio::io::AsyncWriteExt;
-
-    let response = StatusResponse {
-        mode: format!("{:?}", state.config.mode).to_lowercase(),
-        node_id: state.config.node_id.clone(),
-        bind: state.config.bind.clone(),
-        dynamic_config: state.dynamic_config.read().await.clone(),
-        known_nodes: state.known_nodes.read().await.clone(),
-    };
-
-    let json = match serde_json::to_vec(&response) {
-        Ok(b) => b,
-        Err(e) => {
-            debug!("status: failed to serialize response: {e}");
-            return;
-        }
-    };
-
-    let len = json.len() as u32;
-    let _ = stream.write_all(&len.to_be_bytes()).await;
-    let _ = stream.write_all(&json).await;
+    Message::Sync { config, nodes }
 }
