@@ -2,8 +2,8 @@
 
 ## Tier 1 — Biggest wins for high-connection HTTP
 
-### Stream multiplexing (yamux/h2) over tunnels
-Currently 1 TCP connection = 1 proxied connection. Multiplexing allows hundreds of logical streams over a single tunnel connection, amortizing TCP+auth handshake cost. This is the single biggest lever for high-connection HTTP workloads.
+### ~~Stream multiplexing (yamux/h2) over tunnels~~ (DONE)
+Implemented via yamux. Subscriber maintains persistent multiplexed sessions to each node. Each tunnel request opens a new yamux stream on the existing session, amortizing TCP+auth handshake cost. Falls back to legacy single-connection path when no mux session is available.
 
 ### TLS (rustls + mTLS)
 Adds confidentiality (currently plaintext) and replaces HMAC auth with mutual TLS. Session resumption and 0-RTT on warm connections keeps latency low. Eliminates per-message HMAC sign/verify overhead on the hot path.

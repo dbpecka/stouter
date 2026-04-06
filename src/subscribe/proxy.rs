@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::info;
 
 use crate::config::NodeInfo;
@@ -42,7 +43,7 @@ pub async fn run_proxy(
     let node_id = node.id.clone();
 
     loop {
-        let (mut client, _) = listener.accept().await.context("proxy accept")?;
+        let (client, _) = listener.accept().await.context("proxy accept")?;
         client.set_nodelay(true).ok();
         let service_name = service.name.clone();
         let state = state.clone();
@@ -57,23 +58,58 @@ pub async fn run_proxy(
                 tracing::warn!("proxy connection error: node {node_id} no longer known");
                 return;
             };
-            if let Err(e) = handle_connection(&mut client, &node, service_name, &state).await {
+            if let Err(e) = handle_connection(client, &node, service_name, &state).await {
                 tracing::warn!("proxy connection error: {e}");
             }
         });
     }
 }
 
+/// Send a tunnel request on a stream, read the status byte, and bail on error.
+async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &Message,
+    secret: &str,
+) -> Result<()> {
+    gossip::send_message(stream, msg, secret)
+        .await
+        .context("send tunnel request")?;
+
+    let mut status = [0u8; 1];
+    stream
+        .read_exact(&mut status)
+        .await
+        .context("read tunnel status byte")?;
+
+    if status[0] != 0x00 {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .context("read tunnel error length")?;
+        let err_len = u32::from_be_bytes(len_buf) as usize;
+        let mut err_bytes = vec![0u8; err_len];
+        stream
+            .read_exact(&mut err_bytes)
+            .await
+            .context("read tunnel error message")?;
+        let msg = String::from_utf8_lossy(&err_bytes);
+        bail!("node rejected tunnel: {msg}");
+    }
+
+    Ok(())
+}
+
 /// Forward a single client connection through an authenticated tunnel to the
 /// remote node.
 ///
 /// Connection acquisition priority:
-/// 1. Reverse pool (instant check — free path to NAT'd nodes)
-/// 2. Tunnel pool (pre-established warm connection to node/relay)
+/// 1. Mux pool (open stream on existing yamux session)
+/// 2. Reverse pool (instant check — free path to NAT'd nodes)
 /// 3. Reverse pool with wait (for NAT-only nodes with no address)
 /// 4. Cold TCP connect as last resort
 async fn handle_connection(
-    client: &mut TcpStream,
+    client: TcpStream,
     node: &NodeInfo,
     service_name: String,
     state: &Arc<SharedState>,
@@ -91,6 +127,19 @@ async fn handle_connection(
 
     let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
 
+    // --- Try mux pool first (multiplexed yamux stream) ---
+    if !connect_addr.is_empty() {
+        if let Some(yamux_stream) = state.mux_pool.open_stream(connect_addr).await {
+            let mut compat = yamux_stream.compat();
+            send_and_check_tunnel(&mut compat, &msg, &state.config.cluster_secret).await?;
+            crate::io::proxy_bidirectional(client, compat)
+                .await
+                .context("mux proxy_bidirectional")?;
+            return Ok(());
+        }
+    }
+
+    // --- Fallback: legacy single-connection path ---
     let mut node_stream = if let Some(stream) = state.reverse_pool.try_take(&node.id) {
         stream
     } else if let Some(stream) = state.tunnel_pool.try_take(connect_addr) {
@@ -115,36 +164,9 @@ async fn handle_connection(
         stream
     };
 
-    // Send the tunnel request via the unified message protocol.
-    gossip::send_message(&mut node_stream, &msg, &state.config.cluster_secret)
-        .await
-        .context("send tunnel request")?;
+    send_and_check_tunnel(&mut node_stream, &msg, &state.config.cluster_secret).await?;
 
-    // Read status byte.
-    let mut status = [0u8; 1];
-    node_stream
-        .read_exact(&mut status)
-        .await
-        .context("read tunnel status byte")?;
-
-    if status[0] != 0x00 {
-        let mut len_buf = [0u8; 4];
-        node_stream
-            .read_exact(&mut len_buf)
-            .await
-            .context("read tunnel error length")?;
-        let err_len = u32::from_be_bytes(len_buf) as usize;
-        let mut err_bytes = vec![0u8; err_len];
-        node_stream
-            .read_exact(&mut err_bytes)
-            .await
-            .context("read tunnel error message")?;
-        let msg = String::from_utf8_lossy(&err_bytes);
-        bail!("node rejected tunnel: {msg}");
-    }
-
-    // Transparent bidirectional proxy.
-    crate::io::proxy_bidirectional(client, &mut node_stream)
+    crate::io::proxy_bidirectional(client, node_stream)
         .await
         .context("proxy_bidirectional")?;
 

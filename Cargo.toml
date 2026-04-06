@@ -23,6 +23,9 @@ hostname = "0.3"
 socket2 = "0.5"
 axum = "0.8"
 arc-swap = "1"
+yamux = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
 
 [dev-dependencies]
 tower = "0.5"

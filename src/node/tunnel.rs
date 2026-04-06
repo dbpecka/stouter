@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::state::SharedState;
@@ -12,7 +12,7 @@ const MAX_SKEW_MS: u64 = 30_000;
 
 /// Write a tunnel error response: `0x01` status byte, 4-byte big-endian message
 /// length, then the UTF-8 message bytes.
-async fn send_tunnel_error(stream: &mut TcpStream, msg: &str) {
+pub(crate) async fn send_tunnel_error<W: AsyncWrite + Unpin>(stream: &mut W, msg: &str) {
     let _ = stream.write_all(&[0x01]).await;
     let b = msg.as_bytes();
     let _ = stream
@@ -61,36 +61,14 @@ pub async fn handle_tunnel(
         .await;
     }
 
-    // --- Locate service on this node ---
-    let service = {
-        let idx = state.service_index.load();
-        idx.get(&(our_node_id.clone(), service_name.clone()))
-            .cloned()
-    };
-
-    let service = match service {
-        Some(s) => s,
-        None => {
-            let msg = format!(
-                "service '{}' not found on this node",
-                service_name
-            );
-            send_tunnel_error(&mut client, &msg).await;
-            bail!("{msg}");
-        }
-    };
-
-    // --- Connect to local service ---
-    let local_addr = format!("127.0.0.1:{}", service.node_port);
-    let mut backend = match TcpStream::connect(&local_addr).await {
+    // --- Locate service and connect ---
+    let backend = match connect_local_service(&service_name, &state).await {
         Ok(s) => s,
-        Err(e) => {
-            let msg = format!("failed to connect to local service at {local_addr}: {e}");
+        Err(msg) => {
             send_tunnel_error(&mut client, &msg).await;
             bail!("{msg}");
         }
     };
-    backend.set_nodelay(true).ok();
 
     // --- Success: signal readiness and start transparent proxy ---
     client
@@ -98,9 +76,39 @@ pub async fn handle_tunnel(
         .await
         .context("write tunnel success byte")?;
 
-    crate::io::proxy_bidirectional(&mut client, &mut backend)
+    crate::io::proxy_bidirectional(client, backend)
         .await
         .context("proxy_bidirectional")?;
 
     Ok(())
+}
+
+/// Look up a service on this node and connect to its local port.
+/// Returns the connected `TcpStream` or an error message string.
+pub(crate) async fn connect_local_service(
+    service_name: &str,
+    state: &SharedState,
+) -> std::result::Result<TcpStream, String> {
+    let our_node_id = &state.config.node_id;
+    let service = {
+        let idx = state.service_index.load();
+        idx.get(&(our_node_id.clone(), service_name.to_string()))
+            .cloned()
+    };
+
+    let service = match service {
+        Some(s) => s,
+        None => {
+            return Err(format!("service '{}' not found on this node", service_name));
+        }
+    };
+
+    let local_addr = format!("127.0.0.1:{}", service.node_port);
+    match TcpStream::connect(&local_addr).await {
+        Ok(s) => {
+            s.set_nodelay(true).ok();
+            Ok(s)
+        }
+        Err(e) => Err(format!("failed to connect to local service at {local_addr}: {e}")),
+    }
 }

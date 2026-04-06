@@ -2,6 +2,7 @@ mod config;
 mod crypto;
 mod gossip;
 mod io;
+mod mux;
 mod node;
 mod state;
 mod subscribe;

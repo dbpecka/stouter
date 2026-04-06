@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Buffer size for bidirectional proxy (64 KiB).
@@ -23,20 +23,21 @@ pub fn configure_stream(stream: &TcpStream) {
     let _ = sock.set_tcp_keepalive(&keepalive);
 }
 
-/// Bidirectional TCP proxy with 64 KiB buffers and 5-minute idle timeout.
+/// Bidirectional proxy with 64 KiB buffers and 5-minute idle timeout.
 ///
 /// Copies data between `a` and `b` in both directions concurrently using
-/// buffers 8× larger than tokio's default, reducing read syscalls for
+/// buffers 8x larger than tokio's default, reducing read syscalls for
 /// typical HTTP payloads.
 ///
 /// Each direction independently times out if no data is read for 5 minutes.
 /// When either direction completes (EOF or idle timeout), both are torn down.
-pub async fn proxy_bidirectional(
-    a: &mut TcpStream,
-    b: &mut TcpStream,
-) -> io::Result<()> {
-    let (mut ar, mut aw) = a.split();
-    let (mut br, mut bw) = b.split();
+pub async fn proxy_bidirectional<A, B>(a: A, b: B) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
 
     let a_to_b = async {
         let mut buf = vec![0u8; BUF_SIZE];

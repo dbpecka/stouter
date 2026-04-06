@@ -120,6 +120,9 @@ pub struct SharedState {
     /// Pool of pre-established tunnel connections to nodes, keyed by connect address.
     /// Eliminates TCP handshake latency on the proxy hot path.
     pub tunnel_pool: Arc<StreamPool>,
+    /// Pool of yamux multiplexed sessions to nodes, keyed by connect address.
+    /// Allows opening many logical streams over a single TCP connection.
+    pub mux_pool: Arc<crate::mux::MuxPool>,
 }
 
 impl SharedState {
@@ -143,6 +146,7 @@ impl SharedState {
             config_path,
             reverse_pool: Arc::new(StreamPool::new()),
             tunnel_pool: Arc::new(StreamPool::new()),
+            mux_pool: Arc::new(crate::mux::MuxPool::new()),
         })
     }
 

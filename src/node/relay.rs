@@ -158,7 +158,7 @@ pub async fn relay_tunnel(
     }
 
     // Bridge the subscriber and reverse connection streams.
-    crate::io::proxy_bidirectional(&mut subscriber, &mut reverse_stream)
+    crate::io::proxy_bidirectional(subscriber, reverse_stream)
         .await
         .context("relay proxy_bidirectional")?;
 

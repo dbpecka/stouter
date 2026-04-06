@@ -22,8 +22,8 @@ const MAX_MSG_BYTES: u32 = 1024 * 1024;
 
 /// Serialize `msg`, sign it with `secret`, and write it to `stream` using a
 /// 4-byte big-endian length prefix.
-pub async fn send_message(
-    stream: &mut TcpStream,
+pub async fn send_message<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
     msg: &Message,
     secret: &str,
 ) -> Result<()> {
@@ -43,7 +43,7 @@ pub async fn send_message(
 
 /// Read a length-prefixed message from `stream`, verify its HMAC
 /// signature, and return the inner [`Message`].
-pub async fn recv_message(stream: &mut TcpStream, secret: &str) -> Result<Message> {
+pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -131,6 +131,9 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
             }
             Message::StatusResponse { .. } => {
                 debug!("unexpected StatusResponse from {peer_addr}");
+            }
+            Message::MuxTunnel {} => {
+                crate::mux::handle_mux_session(stream, state).await;
             }
         },
     }

@@ -57,6 +57,7 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
 
     tokio::spawn(manage_proxies(state.clone(), service_ports));
     tokio::spawn(fill_tunnel_pool(state.clone()));
+    tokio::spawn(maintain_mux_sessions(state.clone()));
 
     loop {
         let (stream, _) = listener.accept().await.context("accept connection")?;
@@ -197,5 +198,43 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Background task that maintains yamux multiplexed sessions to known nodes.
+///
+/// Checks every 5 seconds for nodes without an active mux session and
+/// establishes one. Dead sessions are lazily removed by the MuxPool when
+/// `open_stream()` fails.
+async fn maintain_mux_sessions(state: Arc<SharedState>) {
+    loop {
+        let addrs: Vec<String> = {
+            let nodes = state.known_nodes.load();
+            nodes
+                .values()
+                .filter_map(|node| {
+                    let addr = node.relay.as_deref().unwrap_or(&node.addr);
+                    if addr.is_empty() || state.mux_pool.contains(addr) {
+                        None
+                    } else {
+                        Some(addr.to_string())
+                    }
+                })
+                .collect()
+        };
+
+        for addr in &addrs {
+            match crate::mux::establish_mux_session(addr, &state.config.cluster_secret).await {
+                Ok(handle) => {
+                    info!("mux session established to {addr}");
+                    state.mux_pool.insert(addr.clone(), handle);
+                }
+                Err(e) => {
+                    tracing::debug!("failed to establish mux to {addr}: {e}");
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

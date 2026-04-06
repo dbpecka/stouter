@@ -53,6 +53,8 @@ pub enum Message {
         dynamic_config: DynamicConfig,
         known_nodes: Vec<NodeInfo>,
     },
+    /// Upgrade this TCP connection to a yamux multiplexed tunnel session.
+    MuxTunnel {},
 }
 
 #[cfg(test)]
