@@ -42,8 +42,9 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
         Arc::new(RwLock::new(HashMap::new()));
 
     let api_ports = service_ports.clone();
+    let api_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = api::run_api(api_ports, 5381).await {
+        if let Err(e) = api::run_api(api_ports, api_state, 5381).await {
             tracing::error!("REST API server exited: {e}");
         }
     });

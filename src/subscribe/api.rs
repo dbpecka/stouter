@@ -12,19 +12,37 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use super::ServiceInfo;
+use crate::state::SharedState;
 
-type AppState = Arc<RwLock<HashMap<String, ServiceInfo>>>;
+type ServicePorts = Arc<RwLock<HashMap<String, ServiceInfo>>>;
+
+#[derive(Clone)]
+struct AppState {
+    service_ports: ServicePorts,
+    shared: Arc<SharedState>,
+}
 
 /// Run a minimal REST API on `127.0.0.1:{port}`.
 ///
 /// Endpoints:
-///   GET /services         — list all tunneled services and their local ports
-///   GET /services/{name}  — look up a single service by name
-pub async fn run_api(service_ports: AppState, port: u16) -> Result<()> {
+///   GET /__health          — health check reporting gossip and proxy status
+///   GET /services          — list all tunneled services and their local ports
+///   GET /services/{name}   — look up a single service by name
+pub async fn run_api(
+    service_ports: ServicePorts,
+    shared: Arc<SharedState>,
+    port: u16,
+) -> Result<()> {
+    let state = AppState {
+        service_ports,
+        shared,
+    };
+
     let app = Router::new()
+        .route("/__health", get(health_check))
         .route("/services", get(list_services))
         .route("/services/{name}", get(get_service))
-        .with_state(service_ports);
+        .with_state(state);
 
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
@@ -39,8 +57,64 @@ pub async fn run_api(service_ports: AppState, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn list_services(State(ports): State<AppState>) -> Json<Vec<serde_json::Value>> {
-    let ports = ports.read().await;
+async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let nodes = state.shared.known_nodes.load();
+    let node_count = nodes.len();
+
+    let connected_nodes: Vec<serde_json::Value> = nodes
+        .values()
+        .map(|node| {
+            let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
+            serde_json::json!({
+                "id": node.id,
+                "addr": node.addr,
+                "relay": node.relay,
+                "tunnel_pool": state.shared.tunnel_pool.count(connect_addr),
+                "reverse_pool": state.shared.reverse_pool.count(&node.id),
+            })
+        })
+        .collect();
+
+    let services = state.service_ports.read().await;
+    let proxy_count = services.len();
+
+    let proxied_services: Vec<serde_json::Value> = services
+        .iter()
+        .map(|(name, info)| {
+            serde_json::json!({
+                "name": name,
+                "port": info.port,
+                "address": format!("127.0.0.1:{}", info.port),
+            })
+        })
+        .collect();
+
+    let healthy = node_count > 0;
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if healthy { "healthy" } else { "degraded" },
+            "node_id": state.shared.config.node_id,
+            "nodes": {
+                "count": node_count,
+                "peers": connected_nodes,
+            },
+            "proxies": {
+                "count": proxy_count,
+                "services": proxied_services,
+            },
+        })),
+    )
+}
+
+async fn list_services(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
+    let ports = state.service_ports.read().await;
     let services: Vec<serde_json::Value> = ports
         .iter()
         .map(|(name, info)| {
@@ -56,7 +130,7 @@ async fn list_services(State(ports): State<AppState>) -> Json<Vec<serde_json::Va
 }
 
 async fn get_service(
-    State(ports): State<AppState>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     if name.is_empty() {
@@ -66,7 +140,7 @@ async fn get_service(
         );
     }
 
-    let ports = ports.read().await;
+    let ports = state.service_ports.read().await;
     match ports.get(&name) {
         Some(info) => (
             StatusCode::OK,
@@ -91,6 +165,8 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    use crate::config::Config;
+
     fn make_app(entries: &[(&str, u16, &[&str])]) -> Router {
         let map: HashMap<String, ServiceInfo> = entries
             .iter()
@@ -104,8 +180,14 @@ mod tests {
                 )
             })
             .collect();
-        let state: AppState = Arc::new(RwLock::new(map));
+        let service_ports: ServicePorts = Arc::new(RwLock::new(map));
+        let shared = SharedState::new(Config::default(), String::new());
+        let state = AppState {
+            service_ports,
+            shared,
+        };
         Router::new()
+            .route("/__health", get(health_check))
             .route("/services", get(list_services))
             .route("/services/{name}", get(get_service))
             .with_state(state)
@@ -195,5 +277,57 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let domains = body["domains"].as_array().unwrap();
         assert!(domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn health_check_degraded_no_nodes() {
+        let (status, body) = do_request(make_app(&[]), "GET", "/__health").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["nodes"]["count"], 0);
+        assert_eq!(body["proxies"]["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_proxies() {
+        let (status, body) =
+            do_request(make_app(&[("web", 8080, &[])]), "GET", "/__health").await;
+        // Still degraded because no gossip nodes, but proxies are reported
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["proxies"]["count"], 1);
+        assert_eq!(body["proxies"]["services"][0]["name"], "web");
+    }
+
+    #[tokio::test]
+    async fn health_check_healthy_with_nodes() {
+        use crate::config::NodeInfo;
+
+        let service_ports: ServicePorts = Arc::new(RwLock::new(HashMap::new()));
+        let shared = SharedState::new(Config::default(), String::new());
+        shared
+            .update_known_nodes(|nodes| {
+                nodes.insert(
+                    "peer1".into(),
+                    NodeInfo {
+                        id: "peer1".into(),
+                        addr: "10.0.0.1:8080".into(),
+                        relay: None,
+                    },
+                );
+            })
+            .await;
+        let state = AppState {
+            service_ports,
+            shared,
+        };
+        let app = Router::new()
+            .route("/__health", get(health_check))
+            .with_state(state);
+
+        let (status, body) = do_request(app, "GET", "/__health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["nodes"]["count"], 1);
+        assert_eq!(body["nodes"]["peers"][0]["id"], "peer1");
     }
 }
