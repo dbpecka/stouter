@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,14 +18,13 @@ use crate::state::SharedState;
 /// direct or relay address (NAT-only).
 const REVERSE_POOL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run a local TCP proxy for a single service.
+/// Run a local TCP proxy for a service, routing across all available nodes.
 ///
 /// Binds on `127.0.0.1:0`, sends the assigned port back through `port_tx`,
 /// then accepts connections and forwards each one through an authenticated
-/// tunnel to the node.
+/// tunnel to a node hosting the service. Nodes are selected via round-robin.
 pub async fn run_proxy(
-    service: crate::config::Service,
-    node: NodeInfo,
+    service_name: String,
     state: Arc<SharedState>,
     port_tx: oneshot::Sender<u16>,
 ) -> Result<()> {
@@ -35,34 +35,47 @@ pub async fn run_proxy(
     let local_port = listener.local_addr()?.port();
     let _ = port_tx.send(local_port);
 
-    info!(
-        "Proxy for {} on 127.0.0.1:{}",
-        service.name, local_port
-    );
+    info!("Proxy for {} on 127.0.0.1:{}", service_name, local_port);
 
-    let node_id = node.id.clone();
+    let counter = Arc::new(AtomicUsize::new(0));
 
     loop {
         let (client, _) = listener.accept().await.context("proxy accept")?;
         client.set_nodelay(true).ok();
-        let service_name = service.name.clone();
+        let service_name = service_name.clone();
         let state = state.clone();
-        let node_id = node_id.clone();
+        let counter = counter.clone();
 
         tokio::spawn(async move {
-            let current_node = {
-                let kn = state.known_nodes.load();
-                kn.get(&node_id).cloned()
-            };
-            let Some(node) = current_node else {
-                tracing::warn!("proxy connection error: node {node_id} no longer known");
+            let nodes = find_service_nodes(&service_name, &state);
+            if nodes.is_empty() {
+                tracing::warn!("no nodes available for service {service_name}");
                 return;
-            };
-            if let Err(e) = handle_connection(client, &node, service_name, &state).await {
+            }
+
+            let idx = counter.fetch_add(1, Ordering::Relaxed) % nodes.len();
+            let node = &nodes[idx];
+
+            if let Err(e) = handle_connection(client, node, service_name, &state).await {
                 tracing::warn!("proxy connection error: {e}");
             }
         });
     }
+}
+
+/// Find all reachable nodes hosting a given service.
+///
+/// Scans the service index for entries matching `service_name` and resolves
+/// each node_id to its current `NodeInfo` from the gossip-discovered member
+/// list.
+fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<NodeInfo> {
+    let idx = state.service_index.load();
+    let kn = state.known_nodes.load();
+
+    idx.iter()
+        .filter(|((_, svc), _)| svc == service_name)
+        .filter_map(|((node_id, _), _)| kn.get(node_id).cloned())
+        .collect()
 }
 
 /// Send a tunnel request on a stream, read the status byte, and bail on error.

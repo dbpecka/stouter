@@ -1,7 +1,7 @@
 mod api;
 mod proxy;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +10,6 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::config::{NodeInfo, Service};
 use crate::gossip;
 use crate::state::SharedState;
 
@@ -82,9 +81,10 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
 /// Background task that reconciles running proxies with the current set of
 /// known services.
 ///
-/// Every 2 seconds it computes the desired set of (service, node_addr) pairs
-/// from `state.dynamic_config` and `state.known_nodes`, starts proxies for
-/// new services, and aborts proxies for services that have disappeared.
+/// Every 2 seconds it computes the desired set of services from
+/// `state.dynamic_config` and `state.known_nodes`, starts proxies for new
+/// services, and aborts proxies for services that have disappeared. Each
+/// proxy handles all nodes for its service via round-robin routing.
 async fn manage_proxies(
     state: Arc<SharedState>,
     service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>>,
@@ -102,13 +102,15 @@ async fn manage_proxies(
         let dc = state.dynamic_config.read().await.clone();
         let nodes = state.known_nodes.load_full();
 
-        // Build a map: "group/service" -> (Service, NodeInfo).
-        let mut desired: HashMap<String, (Service, NodeInfo)> = HashMap::new();
+        // Build the desired set: "group/service" keys where at least one
+        // node is reachable. Track (service_name, domains) for proxy setup.
+        let mut desired: HashMap<String, (String, Vec<String>)> = HashMap::new();
+        let mut seen_svc_keys: HashSet<String> = HashSet::new();
         for group in &dc.service_groups {
             for svc in &group.services {
-                if let Some(node) = nodes.get(&svc.node_id) {
-                    let key = format!("{}/{}", group.name, svc.name);
-                    desired.insert(key, (svc.clone(), node.clone()));
+                let key = format!("{}/{}", group.name, svc.name);
+                if nodes.contains_key(&svc.node_id) && seen_svc_keys.insert(key.clone()) {
+                    desired.insert(key, (svc.name.clone(), svc.domains.clone()));
                 }
             }
         }
@@ -129,7 +131,7 @@ async fn manage_proxies(
         }
 
         // Start proxies for newly desired services.
-        for (key, (svc, node)) in desired {
+        for (key, (svc_name, svc_domains)) in desired {
             if proxies.contains_key(&key) {
                 continue;
             }
@@ -138,21 +140,18 @@ async fn manage_proxies(
             // proxy already owns this name, skip to avoid inconsistency.
             {
                 let ports = service_ports.read().await;
-                if ports.contains_key(&svc.name) {
+                if ports.contains_key(&svc_name) {
                     tracing::warn!(
                         "service name '{}' already proxied, skipping {key}",
-                        svc.name
+                        svc_name
                     );
                     continue;
                 }
             }
 
-            let svc_name = svc.name.clone();
-            let svc_domains = svc.domains.clone();
             let (port_tx, port_rx) = tokio::sync::oneshot::channel();
             let join_handle = tokio::spawn(proxy::run_proxy(
-                svc,
-                node,
+                svc_name.clone(),
                 state.clone(),
                 port_tx,
             ));

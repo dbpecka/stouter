@@ -36,8 +36,8 @@ Export request rates, tunnel latency histograms, pool utilization (reverse + tun
 ### ~~Graceful drain~~ (DONE)
 On SIGINT/SIGTERM: cancels a CancellationToken that stops all listeners and background loops, broadcasts NodeLeave to peers, then waits up to 30s for in-flight connections to drain via an RAII-guarded atomic counter before exiting.
 
-### Multi-node service routing
-When multiple nodes host the same service, only one node is selected (HashMap insert race in manage_proxies). The rest are silently dropped — no redundancy, no failover. Route across all available replicas with round-robin or least-connections, and failover when a node becomes unreachable.
+### ~~Multi-node service routing~~ (DONE)
+One proxy per service now routes across all nodes hosting it via round-robin. `find_service_nodes` resolves available nodes dynamically per connection from the service index and known_nodes, so nodes joining/leaving are picked up immediately without proxy restarts.
 
 ### ~~Rate limiting and backpressure~~ (DROPPED)
 Yamux provides built-in flow control and stream limits. Tunnel and reverse pools are already finite. No unbounded queueing exists. Revisit only if cascading failures are observed in practice.
