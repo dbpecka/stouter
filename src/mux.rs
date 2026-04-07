@@ -127,7 +127,7 @@ pub async fn handle_mux_session(stream: TcpStream, state: Arc<SharedState>) {
                 let state = state.clone();
                 tokio::spawn(async move {
                     let compat = yamux_stream.compat();
-                    if let Err(e) = handle_mux_stream(compat, &state).await {
+                    if let Err(e) = handle_mux_stream(compat, state).await {
                         debug!("mux stream error: {e}");
                     }
                 });
@@ -147,7 +147,7 @@ pub async fn handle_mux_session(stream: TcpStream, state: Arc<SharedState>) {
 /// Handle a single yamux stream carrying a tunnel request.
 async fn handle_mux_stream(
     mut stream: Compat<yamux::Stream>,
-    state: &SharedState,
+    state: Arc<SharedState>,
 ) -> Result<()> {
     let secret = &state.config.cluster_secret;
     let msg = gossip::recv_message(&mut stream, secret)
@@ -156,7 +156,7 @@ async fn handle_mux_stream(
 
     match msg {
         Message::TunnelRequest {
-            node_id: _,
+            node_id,
             service_name,
             timestamp_ms,
         } => {
@@ -173,8 +173,21 @@ async fn handle_mux_stream(
                 bail!("{msg}");
             }
 
+            // Check if this tunnel targets us or needs relaying
+            let our_node_id = &state.config.node_id;
+            if !node_id.is_empty() && node_id != *our_node_id {
+                return crate::node::relay::relay_tunnel(
+                    stream,
+                    &node_id,
+                    &service_name,
+                    timestamp_ms,
+                    &state,
+                )
+                .await;
+            }
+
             // Connect to local service
-            let backend = match connect_local_service(&service_name, state).await {
+            let backend = match connect_local_service(&service_name, &state).await {
                 Ok(s) => s,
                 Err(err_msg) => {
                     send_tunnel_error(&mut stream, &err_msg).await;
@@ -187,6 +200,7 @@ async fn handle_mux_stream(
                 .write_all(&[0x00])
                 .await
                 .context("write tunnel success byte")?;
+            stream.flush().await.context("flush tunnel success byte")?;
 
             // Proxy the yamux stream to the local service
             crate::io::proxy_bidirectional(stream, backend)

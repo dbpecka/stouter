@@ -19,6 +19,7 @@ pub(crate) async fn send_tunnel_error<W: AsyncWrite + Unpin>(stream: &mut W, msg
         .write_all(&(b.len() as u32).to_be_bytes())
         .await;
     let _ = stream.write_all(b).await;
+    let _ = stream.flush().await;
 }
 
 /// Handle a tunnel request with already-parsed fields.

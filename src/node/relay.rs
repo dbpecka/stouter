@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::info;
 
@@ -75,27 +75,22 @@ pub async fn handle_reverse_registration(
     Ok(())
 }
 
-/// Write a tunnel error response to the subscriber: `0x01` status byte,
-/// 4-byte big-endian message length, then the UTF-8 message bytes.
-async fn send_relay_error(stream: &mut TcpStream, msg: &str) {
-    let _ = stream.write_all(&[0x01]).await;
-    let b = msg.as_bytes();
-    let _ = stream.write_all(&(b.len() as u32).to_be_bytes()).await;
-    let _ = stream.write_all(b).await;
-}
-
 /// Relay a tunnel request to a NAT'd node via a reverse connection.
 ///
 /// Takes an idle reverse connection from the pool, forwards the tunnel request
 /// as a [`Message::TunnelRequest`], reads the response, and bridges the two
-/// streams.
-pub async fn relay_tunnel(
-    mut subscriber: TcpStream,
+/// streams. Generic over the subscriber stream type so it works with both
+/// raw TCP and yamux streams.
+pub async fn relay_tunnel<S>(
+    mut subscriber: S,
     node_id: &str,
     service_name: &str,
     timestamp_ms: u64,
     state: &Arc<SharedState>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut reverse_stream = match state
         .reverse_pool
         .take(node_id, POOL_WAIT_TIMEOUT)
@@ -104,7 +99,7 @@ pub async fn relay_tunnel(
         Some(s) => s,
         None => {
             let msg = format!("no idle reverse connections for node {node_id}");
-            send_relay_error(&mut subscriber, &msg).await;
+            crate::node::tunnel::send_tunnel_error(&mut subscriber, &msg).await;
             bail!("{msg}");
         }
     };
@@ -130,6 +125,10 @@ pub async fn relay_tunnel(
         .write_all(&status)
         .await
         .context("forward tunnel status to subscriber")?;
+    subscriber
+        .flush()
+        .await
+        .context("flush tunnel status to subscriber")?;
 
     if status[0] != 0x00 {
         // Forward the error message.
@@ -153,6 +152,10 @@ pub async fn relay_tunnel(
             .write_all(&err_bytes)
             .await
             .context("forward tunnel error to subscriber")?;
+        subscriber
+            .flush()
+            .await
+            .context("flush tunnel error to subscriber")?;
 
         bail!("NAT'd node rejected tunnel");
     }

@@ -48,6 +48,7 @@ where
                 Ok(Err(e)) => return Err(e),
             };
             bw.write_all(&buf[..n]).await?;
+            bw.flush().await?;
         }
         bw.shutdown().await
     };
@@ -61,6 +62,7 @@ where
                 Ok(Err(e)) => return Err(e),
             };
             aw.write_all(&buf[..n]).await?;
+            aw.flush().await?;
         }
         aw.shutdown().await
     };

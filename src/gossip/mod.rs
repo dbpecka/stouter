@@ -38,6 +38,7 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
         .await
         .context("write length prefix")?;
     stream.write_all(&frame).await.context("write frame")?;
+    stream.flush().await.context("flush message")?;
     Ok(())
 }
 
@@ -210,6 +211,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
         };
 
         let current_version = state.dynamic_config.read().await.version;
+        debug!("config poll: file version={}, in-memory version={}", new_cfg.dynamic_config.version, current_version);
         if new_cfg.dynamic_config.version > current_version {
             info!(
                 "config file changed: version {} -> {}",
