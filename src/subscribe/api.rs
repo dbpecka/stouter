@@ -166,6 +166,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
+    use tokio_util::sync::CancellationToken;
 
     fn make_app(entries: &[(&str, u16, &[&str])]) -> Router {
         let map: HashMap<String, ServiceInfo> = entries
@@ -181,7 +182,7 @@ mod tests {
             })
             .collect();
         let service_ports: ServicePorts = Arc::new(RwLock::new(map));
-        let shared = SharedState::new(Config::default(), String::new());
+        let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new());
         let state = AppState {
             service_ports,
             shared,
@@ -303,7 +304,7 @@ mod tests {
         use crate::config::NodeInfo;
 
         let service_ports: ServicePorts = Arc::new(RwLock::new(HashMap::new()));
-        let shared = SharedState::new(Config::default(), String::new());
+        let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new());
         shared
             .update_known_nodes(|nodes| {
                 nodes.insert(

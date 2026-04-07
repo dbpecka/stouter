@@ -11,39 +11,46 @@ use tracing::{debug, error, info};
 
 use crate::config::NodeInfo;
 use crate::state::SharedState;
-use messages::{Message, SignedMessage};
+use messages::Message;
 
 /// Maximum allowed message size: 1 MiB.
 const MAX_MSG_BYTES: u32 = 1024 * 1024;
+
+/// Size of the HMAC-SHA256 signature prepended to each frame.
+const HMAC_LEN: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize `msg`, sign it with `secret`, and write it to `stream` using a
-/// 4-byte big-endian length prefix.
+/// Serialize `msg` to MessagePack, sign the payload with HMAC-SHA256, and
+/// write the frame as `[4-byte payload len][32-byte HMAC][payload]`.
 pub async fn send_message<W: AsyncWriteExt + Unpin>(
     stream: &mut W,
     msg: &Message,
     secret: &str,
 ) -> Result<()> {
-    let payload = serde_json::to_string(msg).context("serialize Message")?;
-    let signature = crate::crypto::sign(secret, &payload);
-    let signed = SignedMessage { payload, signature };
-    let frame = serde_json::to_vec(&signed).context("serialize SignedMessage")?;
+    let payload = rmp_serde::to_vec(msg).context("serialize Message")?;
+    let hmac = crate::crypto::sign_bytes(secret, &payload);
 
-    let len = u32::try_from(frame.len()).context("message too large")?;
+    let len = u32::try_from(payload.len()).context("message too large")?;
     stream
         .write_all(&len.to_be_bytes())
         .await
         .context("write length prefix")?;
-    stream.write_all(&frame).await.context("write frame")?;
+    stream.write_all(&hmac).await.context("write HMAC")?;
+    stream
+        .write_all(&payload)
+        .await
+        .context("write payload")?;
     stream.flush().await.context("flush message")?;
     Ok(())
 }
 
-/// Read a length-prefixed message from `stream`, verify its HMAC
-/// signature, and return the inner [`Message`].
+/// Read a binary-framed message from `stream`, verify its HMAC signature,
+/// and deserialize the MessagePack payload.
+///
+/// Wire format: `[4-byte payload len][32-byte HMAC][payload]`.
 pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     stream
@@ -56,21 +63,23 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str)
         bail!("message too large: {len} bytes");
     }
 
-    let mut frame = vec![0u8; len as usize];
+    let mut hmac = [0u8; HMAC_LEN];
     stream
-        .read_exact(&mut frame)
+        .read_exact(&mut hmac)
         .await
-        .context("read message frame")?;
+        .context("read HMAC")?;
 
-    let signed: SignedMessage =
-        serde_json::from_slice(&frame).context("deserialize SignedMessage")?;
+    let mut payload = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .context("read payload")?;
 
-    if !crate::crypto::verify(secret, &signed.payload, &signed.signature) {
+    if !crate::crypto::verify_bytes(secret, &payload, &hmac) {
         bail!("message signature verification failed");
     }
 
-    let msg: Message =
-        serde_json::from_str(&signed.payload).context("deserialize Message")?;
+    let msg: Message = rmp_serde::from_slice(&payload).context("deserialize Message")?;
     Ok(msg)
 }
 
@@ -200,7 +209,10 @@ async fn handle_status_request(mut stream: TcpStream, state: Arc<SharedState>) {
 pub async fn run_config_poll_loop(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(10));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown.cancelled() => break,
+        }
 
         let new_cfg = match crate::config::Config::load(&state.config_path) {
             Ok(c) => c,
@@ -251,7 +263,10 @@ async fn peer_addrs(state: &Arc<SharedState>) -> Vec<String> {
 pub async fn run_sync_loop(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(10));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown.cancelled() => break,
+        }
 
         let peers = peer_addrs(&state).await;
 
@@ -499,7 +514,10 @@ pub async fn run_member_log(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(60));
     interval.tick().await; // skip the immediate first tick
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown.cancelled() => break,
+        }
         let nodes = state.known_nodes.load();
         info!("{} member node(s) in cluster", nodes.len());
         for node in nodes.values() {

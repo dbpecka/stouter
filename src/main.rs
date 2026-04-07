@@ -7,13 +7,20 @@ mod node;
 mod state;
 mod subscribe;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rand::Rng;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use config::{Config, Service, ServiceGroup};
 use gossip::messages::Message;
 use state::SharedState;
+
+/// Maximum time to wait for in-flight connections to drain on shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "stouter", about = "Light-weight service discovery and tunneling")]
@@ -70,10 +77,21 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         None => {
             let cfg = Config::load(&cli.config)?;
-            let state = SharedState::new(cfg.clone(), cli.config.clone());
-            match cfg.mode {
-                config::Mode::Node => node::run_node(state).await?,
-                config::Mode::Subscribe => subscribe::run_subscribe(state).await?,
+            let shutdown = CancellationToken::new();
+            let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone());
+
+            let daemon = async {
+                match cfg.mode {
+                    config::Mode::Node => node::run_node(state.clone()).await,
+                    config::Mode::Subscribe => subscribe::run_subscribe(state.clone()).await,
+                }
+            };
+
+            tokio::select! {
+                result = daemon => result?,
+                _ = tokio::signal::ctrl_c() => {
+                    graceful_drain(state).await;
+                }
             }
         }
 
@@ -99,7 +117,7 @@ async fn main() -> Result<()> {
 
             // Announce our presence to any already-known peers.
             if !cfg.known_nodes.is_empty() {
-                let state = SharedState::new(cfg.clone(), cli.config.clone());
+                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new());
                 gossip::broadcast_message(
                     &state,
                     Message::NodeJoin {
@@ -220,7 +238,7 @@ async fn main() -> Result<()> {
             cfg.save(&cli.config)?;
 
             let version = cfg.dynamic_config.version;
-            let state = SharedState::new(cfg.clone(), cli.config.clone());
+            let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new());
             gossip::broadcast_message(
                 &state,
                 Message::ConfigUpdate {
@@ -259,4 +277,31 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Graceful shutdown: broadcast NodeLeave, stop accepting, drain in-flight.
+async fn graceful_drain(state: std::sync::Arc<SharedState>) {
+    info!("shutting down gracefully...");
+
+    // Signal all listeners and background loops to stop.
+    state.shutdown.cancel();
+
+    // Broadcast NodeLeave so peers stop routing to us.
+    if !state.config.node_id.is_empty() {
+        info!("broadcasting NodeLeave for {}", state.config.node_id);
+        gossip::broadcast_message(
+            &state,
+            Message::NodeLeave {
+                id: state.config.node_id.clone(),
+            },
+        )
+        .await;
+    }
+
+    // Wait for in-flight connections to finish.
+    if state.in_flight.wait_zero(DRAIN_TIMEOUT).await {
+        info!("all connections drained");
+    } else {
+        info!("drain timeout reached, shutting down with connections still active");
+    }
 }

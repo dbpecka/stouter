@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use arc_swap::ArcSwap;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, DynamicConfig, NodeInfo, Service};
 
@@ -97,6 +99,56 @@ impl StreamPool {
     }
 }
 
+/// RAII guard that decrements the in-flight counter on drop.
+pub struct InFlightGuard(Arc<InFlightTracker>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let prev = self.0.count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.0.zero.notify_waiters();
+        }
+    }
+}
+
+/// Tracks the number of in-flight connections for graceful drain.
+pub struct InFlightTracker {
+    count: AtomicUsize,
+    zero: Notify,
+}
+
+impl InFlightTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            count: AtomicUsize::new(0),
+            zero: Notify::new(),
+        })
+    }
+
+    /// Increment the counter and return a guard that decrements on drop.
+    pub fn track(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Wait until in-flight count reaches zero, or timeout expires.
+    pub async fn wait_zero(&self, timeout: Duration) -> bool {
+        if self.count.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                self.zero.notified().await;
+                if self.count.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
 /// Cluster state shared across async tasks within a single daemon process.
 pub struct SharedState {
     pub config: Arc<Config>,
@@ -123,6 +175,10 @@ pub struct SharedState {
     /// Pool of yamux multiplexed sessions to nodes, keyed by connect address.
     /// Allows opening many logical streams over a single TCP connection.
     pub mux_pool: Arc<crate::mux::MuxPool>,
+    /// Cancellation token for graceful shutdown.
+    pub shutdown: CancellationToken,
+    /// Tracks in-flight connections for graceful drain.
+    pub in_flight: Arc<InFlightTracker>,
 }
 
 impl SharedState {
@@ -131,7 +187,7 @@ impl SharedState {
     /// The `dynamic_config` is seeded from `config.dynamic_config`.
     /// Bootstrap peer addresses are stored separately; the member list
     /// (`known_nodes`) starts empty and is populated by gossip sync.
-    pub fn new(config: Config, config_path: String) -> Arc<Self> {
+    pub fn new(config: Config, config_path: String, shutdown: CancellationToken) -> Arc<Self> {
         let dynamic_config = config.dynamic_config.clone();
         let bootstrap_peers = config.known_nodes.clone();
         let service_index = build_service_index(&dynamic_config);
@@ -147,6 +203,8 @@ impl SharedState {
             reverse_pool: Arc::new(StreamPool::new()),
             tunnel_pool: Arc::new(StreamPool::new()),
             mux_pool: Arc::new(crate::mux::MuxPool::new()),
+            shutdown,
+            in_flight: InFlightTracker::new(),
         })
     }
 

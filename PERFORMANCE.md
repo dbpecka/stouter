@@ -8,39 +8,39 @@ Implemented via yamux. Subscriber maintains persistent multiplexed sessions to e
 ### TLS (rustls + mTLS)
 Adds confidentiality (currently plaintext) and replaces HMAC auth with mutual TLS. Session resumption and 0-RTT on warm connections keeps latency low. Eliminates per-message HMAC sign/verify overhead on the hot path.
 
-### Reverse connection reuse
-Reverse workers currently reconnect after each tunnel completes. Instead, return completed reverse connections to the pool for reuse, or multiplex them. Halves reverse pool pressure and eliminates reconnect latency.
+### ~~Reverse connection reuse~~ (SKIPPED)
+Reverse workers already spawn tunnel handlers in background tasks and immediately reconnect, so the pool stays full during bursts. The raw TCP+registration reconnect cost is negligible. When TLS is added, reverse connections should be multiplexed via yamux over a single TLS session per relay — fold into the TLS work rather than treating as a standalone item.
 
 ### L7 health checks
 Don't route to dead services. Add HTTP-level health checks (configurable path), exponential backoff on failures, and circuit breaker logic. Remove unhealthy services from the routing index so proxies never attempt a doomed tunnel.
 
 ## Tier 2 — Throughput and efficiency
 
-### splice(2) / zero-copy proxy
-The proxy path currently copies through 64KB user-space buffers. On Linux, use splice(2) (via tokio-splice or raw syscall) to move data directly between sockets in kernel space. 20-40% throughput gain on sustained transfers.
+### ~~splice(2) / zero-copy proxy~~ (DROPPED)
+Not viable: proxy_bidirectional is generic over AsyncRead+AsyncWrite (yamux, TLS), so splice(2) can't apply. Linux-only (project targets macOS). Current 64 KiB buffer implementation is already efficient for HTTP proxy workloads.
 
-### Binary framing on hot path
-Every message round-trips through serde_json. For tunnel requests and relay forwarding (the hot path), switch to a compact binary format (bincode, MessagePack, or hand-rolled header). Keep JSON for gossip where debuggability matters more than speed.
+### ~~Binary framing on hot path~~ (DONE)
+Replaced double-JSON wire format (Message→JSON→SignedMessage→JSON) with MessagePack + raw 32-byte HMAC. Wire format is now `[4-byte len][32-byte HMAC][msgpack payload]`. Eliminates double serialization, hex encoding, and JSON overhead on all message paths.
 
-### Adaptive pool sizing
-Fixed 8 warm connections per node doesn't match bursty HTTP traffic. Size pools proportional to recent request rate (exponential moving average) with high/low watermarks and hysteresis. Replace the fixed 10ms sleep in fill_tunnel_pool with a semaphore-bounded connect loop.
+### ~~Adaptive pool sizing~~ (DROPPED)
+Yamux multiplexing makes the fixed tunnel pool a fallback path. Streams are opened on demand over persistent mux sessions, so pool sizing is no longer a bottleneck.
 
-### Connection coalescing
-Multiple services on the same node get independent tunnel connections. A single multiplexed tunnel per node reduces file descriptor pressure and pool management overhead significantly.
+### ~~Connection coalescing~~ (DROPPED)
+Already effectively implemented via yamux — all services on the same node share a single mux session. The tunnel pool fallback also keys by address, so connections are shared.
 
 ## Tier 3 — Operational maturity
 
 ### Prometheus/OpenTelemetry metrics
 Export request rates, tunnel latency histograms, pool utilization (reverse + tunnel), gossip version lag, and peer reachability. Essential for capacity planning and debugging production issues.
 
-### Graceful drain
-On shutdown, broadcast NodeLeave, stop accepting new tunnels, drain in-flight connections with a configurable timeout, then exit. Enables zero-downtime deploys and rolling restarts.
+### ~~Graceful drain~~ (DONE)
+On SIGINT/SIGTERM: cancels a CancellationToken that stops all listeners and background loops, broadcasts NodeLeave to peers, then waits up to 30s for in-flight connections to drain via an RAII-guarded atomic counter before exiting.
 
-### Load balancing across replicas
-When multiple nodes host the same service, distribute connections via round-robin or least-connections. Currently the subscribe proxy picks a single node per service — no redundancy or spread.
+### Multi-node service routing
+When multiple nodes host the same service, only one node is selected (HashMap insert race in manage_proxies). The rest are silently dropped — no redundancy, no failover. Route across all available replicas with round-robin or least-connections, and failover when a node becomes unreachable.
 
-### Rate limiting and backpressure
-Semaphore-bound concurrent tunnels per node. When the limit is hit, return a backpressure signal to subscribers rather than queueing unbounded. Prevents cascade failures under overload.
+### ~~Rate limiting and backpressure~~ (DROPPED)
+Yamux provides built-in flow control and stream limits. Tunnel and reverse pools are already finite. No unbounded queueing exists. Revisit only if cascading failures are observed in practice.
 
-### Adaptive gossip convergence
-Reduce sync interval to 1-2s when cluster membership is changing (detected via version bumps in recent syncs). Relax back to 10s when stable. Gives fast convergence during deploys without constant overhead in steady state.
+### ~~Adaptive gossip convergence~~ (DROPPED)
+The fixed 10s sync interval is adequate for small clusters. Deploys converge within one round. If faster convergence is needed, simply lower the fixed interval — adaptive logic adds complexity for marginal gain.

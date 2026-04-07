@@ -22,7 +22,10 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(5));
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown.cancelled() => break,
+        }
 
         let peers: Vec<String> = state
             .known_nodes

@@ -2,25 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{DynamicConfig, NodeInfo};
 
-/// A message with its HMAC-SHA256 signature.
-///
-/// The `payload` field contains the JSON serialization of a [`Message`].
-/// The `signature` field contains the hex-encoded HMAC-SHA256 of `payload` keyed
-/// with the cluster secret.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignedMessage {
-    /// Raw JSON encoding of the inner [`Message`].
-    pub payload: String,
-    /// Hex-encoded HMAC-SHA256(cluster_secret, payload).
-    pub signature: String,
-}
-
 /// All message types exchanged between cluster members over TCP.
 ///
-/// Every TCP connection starts with a single `Message` sent via the signed
-/// message framing (4-byte length prefix + JSON [`SignedMessage`]).  The
-/// variant of that first message determines how the connection is handled.
+/// Every TCP connection starts with a single `Message` sent via the binary
+/// message framing (4-byte length prefix + 32-byte HMAC + MessagePack payload).
+/// The variant of that first message determines how the connection is handled.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Message {
@@ -62,17 +48,19 @@ mod tests {
     use super::*;
     use crate::config::{DynamicConfig, NodeInfo, Service, ServiceGroup};
 
+    /// Helper: round-trip a Message through MessagePack serialization.
+    fn msgpack_round_trip(msg: &Message) -> Message {
+        let bytes = rmp_serde::to_vec(msg).expect("serialize");
+        rmp_serde::from_slice(&bytes).expect("deserialize")
+    }
+
     #[test]
-    fn node_join_serde_round_trip() {
+    fn node_join_round_trip() {
         let msg = Message::NodeJoin {
             id: "n1".into(),
             addr: "1.2.3.4:8080".into(),
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"nodeJoin""#));
-
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::NodeJoin { id, addr } => {
                 assert_eq!(id, "n1");
                 assert_eq!(addr, "1.2.3.4:8080");
@@ -82,20 +70,16 @@ mod tests {
     }
 
     #[test]
-    fn node_leave_serde_round_trip() {
+    fn node_leave_round_trip() {
         let msg = Message::NodeLeave { id: "n1".into() };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"nodeLeave""#));
-
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::NodeLeave { id } => assert_eq!(id, "n1"),
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn config_update_serde_round_trip() {
+    fn config_update_round_trip() {
         let msg = Message::ConfigUpdate {
             config: DynamicConfig {
                 version: 42,
@@ -110,9 +94,7 @@ mod tests {
                 }],
             },
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::ConfigUpdate { config } => {
                 assert_eq!(config.version, 42);
                 assert_eq!(config.service_groups[0].services[0].name, "api");
@@ -122,14 +104,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_serde_round_trip() {
+    fn sync_round_trip() {
         let msg = Message::Sync {
             config: DynamicConfig { version: 1, service_groups: vec![] },
             nodes: vec![NodeInfo { id: "n1".into(), addr: "10.0.0.1:8080".into(), relay: None }],
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::Sync { config, nodes } => {
                 assert_eq!(config.version, 1);
                 assert_eq!(nodes.len(), 1);
@@ -140,16 +120,13 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_request_serde_round_trip() {
+    fn tunnel_request_round_trip() {
         let msg = Message::TunnelRequest {
             node_id: "host1".into(),
             service_name: "web".into(),
             timestamp_ms: 1234567890,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"tunnelRequest""#));
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::TunnelRequest { node_id, service_name, timestamp_ms } => {
                 assert_eq!(node_id, "host1");
                 assert_eq!(service_name, "web");
@@ -160,15 +137,12 @@ mod tests {
     }
 
     #[test]
-    fn reverse_registration_serde_round_trip() {
+    fn reverse_registration_round_trip() {
         let msg = Message::ReverseRegistration {
             node_id: "nat-host".into(),
             timestamp_ms: 1234567890,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"reverseRegistration""#));
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::ReverseRegistration { node_id, timestamp_ms } => {
                 assert_eq!(node_id, "nat-host");
                 assert_eq!(timestamp_ms, 1234567890);
@@ -178,16 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn status_request_serde_round_trip() {
+    fn status_request_round_trip() {
         let msg = Message::StatusRequest;
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"statusRequest""#));
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        assert!(matches!(restored, Message::StatusRequest));
+        assert!(matches!(msgpack_round_trip(&msg), Message::StatusRequest));
     }
 
     #[test]
-    fn status_response_serde_round_trip() {
+    fn status_response_round_trip() {
         let msg = Message::StatusResponse {
             mode: "node".into(),
             node_id: "host1".into(),
@@ -195,9 +166,7 @@ mod tests {
             dynamic_config: DynamicConfig { version: 1, service_groups: vec![] },
             known_nodes: vec![],
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        let restored: Message = serde_json::from_str(&json).unwrap();
-        match restored {
+        match msgpack_round_trip(&msg) {
             Message::StatusResponse { mode, node_id, .. } => {
                 assert_eq!(mode, "node");
                 assert_eq!(node_id, "host1");
@@ -207,14 +176,8 @@ mod tests {
     }
 
     #[test]
-    fn signed_message_serde_round_trip() {
-        let sm = SignedMessage {
-            payload: r#"{"type":"nodeLeave","id":"x"}"#.into(),
-            signature: "abc123def456".into(),
-        };
-        let json = serde_json::to_string(&sm).unwrap();
-        let restored: SignedMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.payload, sm.payload);
-        assert_eq!(restored.signature, sm.signature);
+    fn mux_tunnel_round_trip() {
+        let msg = Message::MuxTunnel {};
+        assert!(matches!(msgpack_round_trip(&msg), Message::MuxTunnel {}));
     }
 }

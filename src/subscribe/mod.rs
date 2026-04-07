@@ -60,11 +60,23 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
     tokio::spawn(maintain_mux_sessions(state.clone()));
 
     loop {
-        let (stream, _) = listener.accept().await.context("accept connection")?;
+        let (stream, _) = tokio::select! {
+            result = listener.accept() => result.context("accept connection")?,
+            _ = state.shutdown.cancelled() => {
+                info!("subscribe listener shutting down");
+                break;
+            }
+        };
         stream.set_nodelay(true).ok();
         let state = state.clone();
-        tokio::spawn(gossip::dispatch_connection(stream, state));
+        let guard = state.in_flight.track();
+        tokio::spawn(async move {
+            gossip::dispatch_connection(stream, state).await;
+            drop(guard);
+        });
     }
+
+    Ok(())
 }
 
 /// Background task that reconciles running proxies with the current set of
@@ -81,7 +93,10 @@ async fn manage_proxies(
     let mut interval = tokio::time::interval(Duration::from_secs(2));
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown.cancelled() => break,
+        }
 
         // Snapshot current desired state.
         let dc = state.dynamic_config.read().await.clone();
@@ -166,7 +181,7 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
     /// Target number of warm connections per node address.
     const POOL_TARGET: usize = 8;
 
-    loop {
+    while !state.shutdown.is_cancelled() {
         let addrs: Vec<String> = {
             let nodes = state.known_nodes.load();
             nodes
@@ -207,7 +222,7 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
 /// establishes one. Dead sessions are lazily removed by the MuxPool when
 /// `open_stream()` fails.
 async fn maintain_mux_sessions(state: Arc<SharedState>) {
-    loop {
+    while !state.shutdown.is_cancelled() {
         let addrs: Vec<String> = {
             let nodes = state.known_nodes.load();
             nodes

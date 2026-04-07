@@ -33,7 +33,7 @@ pub async fn run_node(state: Arc<SharedState>) -> Result<()> {
     }
 }
 
-/// Bind the TCP listener and accept connections.
+/// Bind the TCP listener and accept connections until shutdown.
 async fn run_listener(state: Arc<SharedState>) -> Result<()> {
     let listener = TcpListener::bind(&state.config.bind)
         .await
@@ -42,11 +42,23 @@ async fn run_listener(state: Arc<SharedState>) -> Result<()> {
     info!("Node listening on {}", state.config.bind);
 
     loop {
-        let (stream, peer_addr) = listener.accept().await.context("accept connection")?;
+        let (stream, peer_addr) = tokio::select! {
+            result = listener.accept() => result.context("accept connection")?,
+            _ = state.shutdown.cancelled() => {
+                info!("listener shutting down");
+                break;
+            }
+        };
         stream.set_nodelay(true).ok();
         debug!("accepted connection from {peer_addr}");
 
         let state = state.clone();
-        tokio::spawn(gossip::dispatch_connection(stream, state));
+        let guard = state.in_flight.track();
+        tokio::spawn(async move {
+            gossip::dispatch_connection(stream, state).await;
+            drop(guard);
+        });
     }
+
+    Ok(())
 }
