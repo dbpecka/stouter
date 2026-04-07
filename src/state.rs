@@ -131,6 +131,11 @@ impl InFlightTracker {
         InFlightGuard(Arc::clone(self))
     }
 
+    /// Current number of in-flight connections.
+    pub fn current(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
     /// Wait until in-flight count reaches zero, or timeout expires.
     pub async fn wait_zero(&self, timeout: Duration) -> bool {
         if self.count.load(Ordering::SeqCst) == 0 {

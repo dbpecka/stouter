@@ -2,6 +2,7 @@ mod config;
 mod crypto;
 mod gossip;
 mod io;
+mod metrics;
 mod mux;
 mod node;
 mod state;
@@ -80,10 +81,13 @@ async fn main() -> Result<()> {
             let shutdown = CancellationToken::new();
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone());
 
+            let metrics_handle = metrics::install();
+            tokio::spawn(metrics::run_gauge_loop(state.clone()));
+
             let daemon = async {
                 match cfg.mode {
                     config::Mode::Node => node::run_node(state.clone()).await,
-                    config::Mode::Subscribe => subscribe::run_subscribe(state.clone()).await,
+                    config::Mode::Subscribe => subscribe::run_subscribe(state.clone(), metrics_handle).await,
                 }
             };
 

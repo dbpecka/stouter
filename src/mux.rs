@@ -92,6 +92,11 @@ impl MuxPool {
         self.sessions.lock().unwrap().contains_key(addr)
     }
 
+    /// Number of active sessions in the pool.
+    pub fn session_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
     /// Remove a session entry.
     #[allow(dead_code)]
     pub fn remove(&self, addr: &str) {

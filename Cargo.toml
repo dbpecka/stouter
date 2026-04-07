@@ -27,6 +27,8 @@ yamux = "0.13"
 tokio-util = { version = "0.7", features = ["compat"] }
 rmp-serde = "1"
 futures = "0.3"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 [dev-dependencies]
 tower = "0.5"

@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -20,6 +21,7 @@ type ServicePorts = Arc<RwLock<HashMap<String, ServiceInfo>>>;
 struct AppState {
     service_ports: ServicePorts,
     shared: Arc<SharedState>,
+    metrics_handle: PrometheusHandle,
 }
 
 /// Run a minimal REST API on `127.0.0.1:{port}`.
@@ -31,15 +33,18 @@ struct AppState {
 pub async fn run_api(
     service_ports: ServicePorts,
     shared: Arc<SharedState>,
+    metrics_handle: PrometheusHandle,
     port: u16,
 ) -> Result<()> {
     let state = AppState {
         service_ports,
         shared,
+        metrics_handle,
     };
 
     let app = Router::new()
         .route("/__health", get(health_check))
+        .route("/metrics", get(prometheus_metrics))
         .route("/services", get(list_services))
         .route("/services/{name}", get(get_service))
         .with_state(state);
@@ -113,6 +118,10 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+async fn prometheus_metrics(State(state): State<AppState>) -> String {
+    state.metrics_handle.render()
+}
+
 async fn list_services(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
     let ports = state.service_ports.read().await;
     let services: Vec<serde_json::Value> = ports
@@ -168,6 +177,12 @@ mod tests {
     use crate::config::Config;
     use tokio_util::sync::CancellationToken;
 
+    fn test_metrics_handle() -> PrometheusHandle {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle()
+    }
+
     fn make_app(entries: &[(&str, u16, &[&str])]) -> Router {
         let map: HashMap<String, ServiceInfo> = entries
             .iter()
@@ -186,6 +201,7 @@ mod tests {
         let state = AppState {
             service_ports,
             shared,
+            metrics_handle: test_metrics_handle(),
         };
         Router::new()
             .route("/__health", get(health_check))
@@ -320,6 +336,7 @@ mod tests {
         let state = AppState {
             service_ports,
             shared,
+            metrics_handle: test_metrics_handle(),
         };
         let app = Router::new()
             .route("/__health", get(health_check))

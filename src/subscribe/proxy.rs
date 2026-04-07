@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -49,6 +49,7 @@ pub async fn run_proxy(
         tokio::spawn(async move {
             let nodes = find_service_nodes(&service_name, &state);
             if nodes.is_empty() {
+                metrics::counter!("stouter_tunnel_errors_total", "service" => service_name.clone(), "reason" => "no_nodes").increment(1);
                 tracing::warn!("no nodes available for service {service_name}");
                 return;
             }
@@ -56,8 +57,15 @@ pub async fn run_proxy(
             let idx = counter.fetch_add(1, Ordering::Relaxed) % nodes.len();
             let node = &nodes[idx];
 
-            if let Err(e) = handle_connection(client, node, service_name, &state).await {
+            metrics::counter!("stouter_tunnel_requests_total", "service" => service_name.clone(), "node_id" => node.id.clone()).increment(1);
+            let start = Instant::now();
+
+            if let Err(e) = handle_connection(client, node, service_name.clone(), &state).await {
+                metrics::counter!("stouter_tunnel_errors_total", "service" => service_name, "reason" => "connection_error").increment(1);
                 tracing::warn!("proxy connection error: {e}");
+            } else {
+                metrics::histogram!("stouter_proxy_duration_seconds", "service" => service_name)
+                    .record(start.elapsed().as_secs_f64());
             }
         });
     }
@@ -139,12 +147,15 @@ async fn handle_connection(
     };
 
     let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
+    let connect_start = Instant::now();
 
     // --- Try mux pool first (multiplexed yamux stream) ---
     if !connect_addr.is_empty() {
         if let Some(yamux_stream) = state.mux_pool.open_stream(connect_addr).await {
             let mut compat = yamux_stream.compat();
             send_and_check_tunnel(&mut compat, &msg, &state.config.cluster_secret).await?;
+            metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
+                .record(connect_start.elapsed().as_secs_f64());
             crate::io::proxy_bidirectional(client, compat)
                 .await
                 .context("mux proxy_bidirectional")?;
@@ -153,11 +164,15 @@ async fn handle_connection(
     }
 
     // --- Fallback: legacy single-connection path ---
+    let method;
     let mut node_stream = if let Some(stream) = state.reverse_pool.try_take(&node.id) {
+        method = "reverse";
         stream
     } else if let Some(stream) = state.tunnel_pool.try_take(connect_addr) {
+        method = "pool";
         stream
     } else if connect_addr.is_empty() {
+        method = "reverse";
         state
             .reverse_pool
             .take(&node.id, REVERSE_POOL_TIMEOUT)
@@ -169,6 +184,7 @@ async fn handle_connection(
                 )
             })?
     } else {
+        method = "cold";
         let stream = TcpStream::connect(connect_addr)
             .await
             .with_context(|| format!("connect to {connect_addr}"))?;
@@ -178,6 +194,8 @@ async fn handle_connection(
     };
 
     send_and_check_tunnel(&mut node_stream, &msg, &state.config.cluster_secret).await?;
+    metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => method)
+        .record(connect_start.elapsed().as_secs_f64());
 
     crate::io::proxy_bidirectional(client, node_stream)
         .await

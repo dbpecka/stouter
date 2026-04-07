@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -32,7 +33,7 @@ struct ProxyHandle {
 ///
 /// Starts the gossip sync loop, REST API, local proxy manager, and a TCP
 /// listener that accepts inbound connections.
-pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
+pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHandle) -> Result<()> {
     tokio::spawn(gossip::run_sync_loop(state.clone()));
     tokio::spawn(gossip::run_member_log(state.clone()));
     tokio::spawn(gossip::run_config_poll_loop(state.clone()));
@@ -43,7 +44,7 @@ pub async fn run_subscribe(state: Arc<SharedState>) -> Result<()> {
     let api_ports = service_ports.clone();
     let api_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = api::run_api(api_ports, api_state, 5381).await {
+        if let Err(e) = api::run_api(api_ports, api_state, metrics_handle, 5381).await {
             tracing::error!("REST API server exited: {e}");
         }
     });

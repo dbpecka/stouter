@@ -105,6 +105,7 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
             | Message::ConfigUpdate { .. }
             | Message::NodeJoin { .. }
             | Message::NodeLeave { .. } => {
+                metrics::counter!("stouter_connections_total", "type" => "gossip").increment(1);
                 handle_gossip_message(stream, msg, state).await;
             }
             Message::TunnelRequest {
@@ -112,6 +113,7 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
                 service_name,
                 timestamp_ms,
             } => {
+                metrics::counter!("stouter_connections_total", "type" => "tunnel").increment(1);
                 if let Err(e) = crate::node::tunnel::handle_tunnel(
                     stream,
                     node_id,
@@ -128,6 +130,7 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
                 node_id,
                 timestamp_ms,
             } => {
+                metrics::counter!("stouter_connections_total", "type" => "reverse").increment(1);
                 if let Err(e) = crate::node::relay::handle_reverse_registration(
                     stream, node_id, timestamp_ms, state,
                 )
@@ -143,6 +146,7 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
                 debug!("unexpected StatusResponse from {peer_addr}");
             }
             Message::MuxTunnel {} => {
+                metrics::counter!("stouter_connections_total", "type" => "mux").increment(1);
                 crate::mux::handle_mux_session(stream, state).await;
             }
         },
@@ -271,10 +275,21 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
         let peers = peer_addrs(&state).await;
 
         for addr in peers {
+            let start = std::time::Instant::now();
             match time::timeout(Duration::from_secs(10), sync_with_peer(&state, &addr)).await {
-                Ok(Err(e)) => debug!("sync with {addr} failed: {e}"),
-                Err(_) => debug!("sync with {addr} timed out"),
-                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    metrics::counter!("stouter_gossip_syncs_total", "result" => "error").increment(1);
+                    debug!("sync with {addr} failed: {e}");
+                }
+                Err(_) => {
+                    metrics::counter!("stouter_gossip_syncs_total", "result" => "timeout").increment(1);
+                    debug!("sync with {addr} timed out");
+                }
+                Ok(Ok(())) => {
+                    metrics::counter!("stouter_gossip_syncs_total", "result" => "ok").increment(1);
+                    metrics::histogram!("stouter_gossip_sync_duration_seconds")
+                        .record(start.elapsed().as_secs_f64());
+                }
             }
         }
     }

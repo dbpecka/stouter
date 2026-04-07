@@ -30,8 +30,8 @@ Already effectively implemented via yamux — all services on the same node shar
 
 ## Tier 3 — Operational maturity
 
-### Prometheus/OpenTelemetry metrics
-Export request rates, tunnel latency histograms, pool utilization (reverse + tunnel), gossip version lag, and peer reachability. Essential for capacity planning and debugging production issues.
+### ~~Prometheus/OpenTelemetry metrics~~ (DONE)
+Implemented via the `metrics` crate with `metrics-exporter-prometheus` backend. Scrape endpoint at `GET /metrics` on the REST API (port 5381). Counters: `stouter_connections_total` (by type), `stouter_tunnel_requests_total` (by service/node), `stouter_tunnel_errors_total`, `stouter_gossip_syncs_total` (by result). Histograms: `stouter_tunnel_connect_duration_seconds` (by method: mux/pool/reverse/cold), `stouter_proxy_duration_seconds`, `stouter_gossip_sync_duration_seconds`. Gauges: `stouter_in_flight_connections`, `stouter_known_nodes`, `stouter_config_version`, `stouter_tunnel_pool_size`, `stouter_reverse_pool_size`, `stouter_mux_sessions` — sampled every 5s by a background task.
 
 ### ~~Graceful drain~~ (DONE)
 On SIGINT/SIGTERM: cancels a CancellationToken that stops all listeners and background loops, broadcasts NodeLeave to peers, then waits up to 30s for in-flight connections to drain via an RAII-guarded atomic counter before exiting.
