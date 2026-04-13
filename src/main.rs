@@ -55,6 +55,9 @@ enum ServiceAction {
         name: String,
         #[arg(long)]
         port: u16,
+        /// Comma-separated list of domains to route to this service
+        #[arg(long, value_delimiter = ',')]
+        domains: Vec<String>,
     },
     /// List all services
     List,
@@ -208,6 +211,7 @@ async fn main() -> Result<()> {
                     group: group_name,
                     name,
                     port,
+                    domains,
                 },
         }) => {
             let mut cfg = Config::load(&cli.config).unwrap_or_default();
@@ -216,7 +220,7 @@ async fn main() -> Result<()> {
                 name: name.clone(),
                 node_id: cfg.node_id.clone(),
                 node_port: port,
-                domains: Vec::new(),
+                domains: domains.clone(),
             };
 
             // Find or create the target service group.
@@ -228,6 +232,7 @@ async fn main() -> Result<()> {
             {
                 if let Some(existing) = g.services.iter_mut().find(|s| s.name == name && s.node_id == cfg.node_id) {
                     existing.node_port = port;
+                    existing.domains = domains.clone();
                 } else {
                     g.services.push(service);
                 }
