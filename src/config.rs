@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::collections::HashSet;
+
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Operating mode of this daemon instance.
@@ -110,6 +112,55 @@ impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let data = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&data)?;
+        Ok(config)
+    }
+
+    /// Validate structural invariants of the dynamic config:
+    /// - service group names are unique
+    /// - service names within a group are unique
+    /// - domain names are globally unique across all services
+    pub fn validate(&self) -> Result<()> {
+        let mut group_names = HashSet::new();
+        let mut domains = HashSet::new();
+
+        for group in &self.dynamic_config.service_groups {
+            if !group_names.insert(group.name.as_str()) {
+                return Err(anyhow!("duplicate service group name: '{}'", group.name));
+            }
+
+            let mut service_names = HashSet::new();
+            for svc in &group.services {
+                if !service_names.insert(svc.name.as_str()) {
+                    return Err(anyhow!(
+                        "duplicate service name '{}' in group '{}'",
+                        svc.name,
+                        group.name
+                    ));
+                }
+                for domain in &svc.domains {
+                    if !domains.insert(domain.as_str()) {
+                        return Err(anyhow!(
+                            "duplicate domain '{}' (service '{}/{}')",
+                            domain,
+                            group.name,
+                            svc.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load a config file and validate its structural invariants.
+    /// Reports JSON parse errors and validation errors distinctly.
+    pub fn check(path: &str) -> Result<Self> {
+        let data = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file '{path}'"))?;
+        let config: Self = serde_json::from_str(&data)
+            .with_context(|| format!("invalid JSON in '{path}'"))?;
+        config.validate()?;
         Ok(config)
     }
 

@@ -38,6 +38,8 @@ enum Commands {
     Init,
     /// Show the status of the running daemon on this host
     Status,
+    /// Validate the configuration file
+    Check,
     /// Manage services
     Service {
         #[command(subcommand)]
@@ -133,6 +135,21 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // check
+        // -----------------------------------------------------------------
+        Some(Commands::Check) => {
+            match Config::check(&cli.config) {
+                Ok(_) => {
+                    println!("{} is valid", cli.config);
+                }
+                Err(err) => {
+                    eprintln!("{}: {:#}", cli.config, err);
+                    std::process::exit(1);
+                }
             }
         }
 
