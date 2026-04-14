@@ -85,9 +85,6 @@ else
   debug "Restart-only mode, skipping build"
 fi
 
-echo "==> Verifying config exists"
-ssh "$REMOTE_HOST" "$SUDO test -f $REMOTE_DIR/stouter.json" 2>&1 | grep -v '^\[sudo\]' || { echo "Error: no config file at $REMOTE_DIR/stouter.json — use -c to provide one"; exit 1; }
-
 echo "==> Restarting container"
 debug "Stopping and removing existing container: $CONTAINER_NAME"
 ssh "$REMOTE_HOST" "

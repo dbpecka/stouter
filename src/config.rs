@@ -16,7 +16,7 @@ impl Default for Mode {
 }
 
 /// A single service exposed by a node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Service {
     pub name: String,
@@ -27,7 +27,7 @@ pub struct Service {
 }
 
 /// A named collection of services.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceGroup {
     pub name: String,
@@ -35,7 +35,7 @@ pub struct ServiceGroup {
 }
 
 /// Versioned, gossip-replicated configuration shared across the cluster.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicConfig {
     pub version: u64,

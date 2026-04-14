@@ -226,27 +226,52 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             }
         };
 
-        let current_version = state.dynamic_config.read().await.version;
-        debug!("config poll: file version={}, in-memory version={}", new_cfg.dynamic_config.version, current_version);
-        if new_cfg.dynamic_config.version > current_version {
+        let (current_version, groups_match) = {
+            let dc = state.dynamic_config.read().await;
+            (
+                dc.version,
+                dc.service_groups == new_cfg.dynamic_config.service_groups,
+            )
+        };
+        debug!(
+            "config poll: file version={}, in-memory version={}, groups_match={}",
+            new_cfg.dynamic_config.version, current_version, groups_match
+        );
+
+        let mut new_dc = if new_cfg.dynamic_config.version > current_version {
             info!(
-                "config file changed: version {} -> {}",
+                "config file version advanced: {} -> {}",
                 current_version, new_cfg.dynamic_config.version
             );
-            {
-                let mut dc = state.dynamic_config.write().await;
-                *dc = new_cfg.dynamic_config.clone();
-            }
-            state.rebuild_service_index().await;
-            print_dynamic_config(&state).await;
-            broadcast_message(
-                &state,
-                Message::ConfigUpdate {
-                    config: new_cfg.dynamic_config,
-                },
-            )
-            .await;
+            new_cfg.dynamic_config
+        } else if !groups_match {
+            let bumped = current_version + 1;
+            info!(
+                "manual config edit detected; auto-bumping version {} -> {}",
+                current_version, bumped
+            );
+            new_cfg.dynamic_config
+        } else {
+            continue;
+        };
+        // Ensure the version we store and broadcast is monotonic relative to
+        // in-memory state, so peers accept the update.
+        if new_dc.version <= current_version {
+            new_dc.version = current_version + 1;
         }
+
+        {
+            let mut dc = state.dynamic_config.write().await;
+            *dc = new_dc.clone();
+        }
+        persist_state(&state).await;
+        state.rebuild_service_index().await;
+        print_dynamic_config(&state).await;
+        broadcast_message(
+            &state,
+            Message::ConfigUpdate { config: new_dc },
+        )
+        .await;
     }
 }
 
