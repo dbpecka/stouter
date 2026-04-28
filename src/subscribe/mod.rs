@@ -67,7 +67,7 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
         info!("Subscribe daemon listening on {}", state.config.bind);
 
         loop {
-            let (stream, _) = tokio::select! {
+            let (stream, peer_addr) = tokio::select! {
                 result = listener.accept() => result.context("accept connection")?,
                 _ = state.shutdown.cancelled() => {
                     info!("subscribe listener shutting down");
@@ -76,9 +76,13 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
             };
             stream.set_nodelay(true).ok();
             let state = state.clone();
+            let peer = peer_addr.to_string();
             let guard = state.in_flight.track();
             tokio::spawn(async move {
-                gossip::dispatch_connection(stream, state).await;
+                match state.tls_accept(stream).await {
+                    Ok(mesh) => gossip::dispatch_connection(mesh, peer, state).await,
+                    Err(e) => tracing::debug!("TLS accept from {peer}: {e}"),
+                }
                 drop(guard);
             });
         }
@@ -224,9 +228,12 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
 
         for addr in &addrs {
             match tokio::net::TcpStream::connect(addr.as_str()).await {
-                Ok(stream) => {
-                    crate::io::configure_stream(&stream);
-                    state.tunnel_pool.push(addr.clone(), stream);
+                Ok(tcp) => {
+                    crate::io::configure_stream(&tcp);
+                    match state.tls_connect(tcp).await {
+                        Ok(stream) => state.tunnel_pool.push(addr.clone(), stream),
+                        Err(e) => tracing::debug!("TLS connect to {addr} failed: {e}"),
+                    }
                 }
                 Err(_) => continue,
             }
@@ -259,7 +266,7 @@ async fn maintain_mux_sessions(state: Arc<SharedState>) {
         };
 
         for addr in &addrs {
-            match crate::mux::establish_mux_session(addr, &state.config.cluster_secret).await {
+            match crate::mux::establish_mux_session(addr, &state.config.cluster_secret, &state).await {
                 Ok(handle) => {
                     info!("mux session established to {addr}");
                     state.mux_pool.insert(addr.clone(), handle);

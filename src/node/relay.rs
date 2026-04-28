@@ -3,12 +3,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::info;
 
 use crate::gossip;
 use crate::gossip::messages::Message;
 use crate::state::SharedState;
+use crate::tls::MeshStream;
 
 /// Maximum time to wait for an idle reverse connection before failing.
 const POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,7 +22,7 @@ const MAX_SKEW_MS: u64 = 30_000;
 /// dispatcher. This function verifies the timestamp, updates known_nodes,
 /// and stores the connection in the reverse pool.
 pub async fn handle_reverse_registration(
-    stream: TcpStream,
+    stream: MeshStream,
     node_id: String,
     timestamp_ms: u64,
     state: Arc<SharedState>,

@@ -10,18 +10,19 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, DynamicConfig, NodeInfo, Service};
+use crate::tls::{MeshStream, TlsContext};
 
-/// Pool of idle TCP connections keyed by a string identifier.
+/// Pool of idle connections keyed by a string identifier.
 ///
-/// Supports both immediate (`try_take`) and blocking (`take`) retrieval.
-/// When the pool is empty, callers can wait (with timeout) for a connection
-/// to become available instead of failing immediately.
-pub struct StreamPool {
-    connections: Mutex<HashMap<String, Vec<TcpStream>>>,
+/// Generic over the stream type so it can hold either plain `TcpStream`s or
+/// `MeshStream`s (TLS-wrapped or not). Supports both immediate (`try_take`)
+/// and blocking (`take`) retrieval.
+pub struct StreamPool<T> {
+    connections: Mutex<HashMap<String, Vec<T>>>,
     notifiers: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
-impl StreamPool {
+impl<T: Send> StreamPool<T> {
     pub fn new() -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
@@ -30,7 +31,7 @@ impl StreamPool {
     }
 
     /// Add an idle connection for `key` and wake one waiter.
-    pub fn push(&self, key: String, stream: TcpStream) {
+    pub fn push(&self, key: String, stream: T) {
         {
             let mut conns = self.connections.lock().unwrap();
             conns.entry(key.clone()).or_default().push(stream);
@@ -45,11 +46,7 @@ impl StreamPool {
     }
 
     /// Take a connection, waiting up to `timeout` for one to become available.
-    ///
-    /// Uses a register-before-check pattern to avoid races: interest is
-    /// registered on the [`Notify`] *before* inspecting the pool, so a
-    /// [`push`] that fires between the check and the await is never lost.
-    pub async fn take(&self, key: &str, timeout: Duration) -> Option<TcpStream> {
+    pub async fn take(&self, key: &str, timeout: Duration) -> Option<T> {
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -86,7 +83,7 @@ impl StreamPool {
     }
 
     /// Take a connection without waiting.
-    pub fn try_take(&self, key: &str) -> Option<TcpStream> {
+    pub fn try_take(&self, key: &str) -> Option<T> {
         let mut conns = self.connections.lock().unwrap();
         let vec = conns.get_mut(key)?;
         vec.pop()
@@ -125,18 +122,15 @@ impl InFlightTracker {
         })
     }
 
-    /// Increment the counter and return a guard that decrements on drop.
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
         self.count.fetch_add(1, Ordering::SeqCst);
         InFlightGuard(Arc::clone(self))
     }
 
-    /// Current number of in-flight connections.
     pub fn current(&self) -> usize {
         self.count.load(Ordering::SeqCst)
     }
 
-    /// Wait until in-flight count reaches zero, or timeout expires.
     pub async fn wait_zero(&self, timeout: Duration) -> bool {
         if self.count.load(Ordering::SeqCst) == 0 {
             return true;
@@ -158,41 +152,29 @@ impl InFlightTracker {
 pub struct SharedState {
     pub config: Arc<Config>,
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
-    /// Member nodes discovered via gossip, keyed by node_id.
-    /// Uses ArcSwap for lock-free reads on the hot path.
     pub known_nodes: ArcSwap<HashMap<String, NodeInfo>>,
-    /// Serializes writes to `known_nodes` so concurrent updates don't lose changes.
     known_nodes_write: tokio::sync::Mutex<()>,
-    /// O(1) service lookup by (node_id, service_name). Rebuilt when dynamic_config changes.
-    /// Uses ArcSwap for lock-free reads on the hot path.
     pub service_index: ArcSwap<HashMap<(String, String), Service>>,
-    /// Bootstrap peer addresses from config, used only for initiating connections.
-    /// These are never treated as member identities.
     pub bootstrap_peers: Vec<String>,
-    /// Path to the on-disk config file, used to persist dynamic config updates.
     pub config_path: String,
-    /// Pool of idle reverse connections from NAT'd nodes, keyed by node_id.
-    /// Used by relay nodes to dispatch tunnel requests to unreachable peers.
-    pub reverse_pool: Arc<StreamPool>,
-    /// Pool of pre-established tunnel connections to nodes, keyed by connect address.
-    /// Eliminates TCP handshake latency on the proxy hot path.
-    pub tunnel_pool: Arc<StreamPool>,
-    /// Pool of yamux multiplexed sessions to nodes, keyed by connect address.
-    /// Allows opening many logical streams over a single TCP connection.
+    /// Idle reverse connections from NAT'd nodes, keyed by node_id.
+    pub reverse_pool: Arc<StreamPool<MeshStream>>,
+    /// Pre-established connections to nodes, keyed by connect address.
+    pub tunnel_pool: Arc<StreamPool<MeshStream>>,
     pub mux_pool: Arc<crate::mux::MuxPool>,
-    /// Cancellation token for graceful shutdown.
+    /// TLS context when `tls_dir` is configured; `None` → plain TCP.
+    pub tls: Option<Arc<TlsContext>>,
     pub shutdown: CancellationToken,
-    /// Tracks in-flight connections for graceful drain.
     pub in_flight: Arc<InFlightTracker>,
 }
 
 impl SharedState {
-    /// Construct a new `SharedState` and wrap it in an `Arc`.
-    ///
-    /// The `dynamic_config` is seeded from `config.dynamic_config`.
-    /// Bootstrap peer addresses are stored separately; the member list
-    /// (`known_nodes`) starts empty and is populated by gossip sync.
-    pub fn new(config: Config, config_path: String, shutdown: CancellationToken) -> Arc<Self> {
+    pub fn new(
+        config: Config,
+        config_path: String,
+        shutdown: CancellationToken,
+        tls: Option<TlsContext>,
+    ) -> Arc<Self> {
         let dynamic_config = config.dynamic_config.clone();
         let bootstrap_peers = config.known_nodes.clone();
         let service_index = build_service_index(&dynamic_config);
@@ -208,21 +190,34 @@ impl SharedState {
             reverse_pool: Arc::new(StreamPool::new()),
             tunnel_pool: Arc::new(StreamPool::new()),
             mux_pool: Arc::new(crate::mux::MuxPool::new()),
+            tls: tls.map(Arc::new),
             shutdown,
             in_flight: InFlightTracker::new(),
         })
     }
 
-    /// Rebuild the service index from the current dynamic_config.
-    /// Call this after every dynamic_config update.
+    /// Wrap a newly accepted `TcpStream` with TLS (if enabled).
+    pub async fn tls_accept(&self, stream: TcpStream) -> anyhow::Result<MeshStream> {
+        match &self.tls {
+            Some(ctx) => ctx.accept(stream).await,
+            None => Ok(MeshStream::from_plain(stream)),
+        }
+    }
+
+    /// Wrap an outbound `TcpStream` with TLS (if enabled).
+    pub async fn tls_connect(&self, stream: TcpStream) -> anyhow::Result<MeshStream> {
+        match &self.tls {
+            Some(ctx) => ctx.connect(stream).await,
+            None => Ok(MeshStream::from_plain(stream)),
+        }
+    }
+
     pub async fn rebuild_service_index(&self) {
         let dc = self.dynamic_config.read().await;
         let idx = build_service_index(&dc);
         self.service_index.store(Arc::new(idx));
     }
 
-    /// Atomically update `known_nodes` via a clone-modify-swap pattern.
-    /// The write mutex ensures concurrent updates don't lose changes.
     pub async fn update_known_nodes<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut HashMap<String, NodeInfo>) -> R,
@@ -235,7 +230,6 @@ impl SharedState {
     }
 }
 
-/// Build a HashMap from (node_id, service_name) to Service.
 fn build_service_index(dc: &DynamicConfig) -> HashMap<(String, String), Service> {
     let mut idx = HashMap::new();
     for group in &dc.service_groups {

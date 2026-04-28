@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::info;
 
+use crate::tls::MeshStream;
+
 use crate::config::NodeInfo;
 use crate::gossip;
 use crate::gossip::messages::Message;
@@ -165,7 +167,7 @@ async fn handle_connection(
 
     // --- Fallback: legacy single-connection path ---
     let method;
-    let mut node_stream = if let Some(stream) = state.reverse_pool.try_take(&node.id) {
+    let mut node_stream: MeshStream = if let Some(stream) = state.reverse_pool.try_take(&node.id) {
         method = "reverse";
         stream
     } else if let Some(stream) = state.tunnel_pool.try_take(connect_addr) {
@@ -185,12 +187,11 @@ async fn handle_connection(
             })?
     } else {
         method = "cold";
-        let stream = TcpStream::connect(connect_addr)
+        let tcp = TcpStream::connect(connect_addr)
             .await
             .with_context(|| format!("connect to {connect_addr}"))?;
-
-        stream.set_nodelay(true).ok();
-        stream
+        tcp.set_nodelay(true).ok();
+        state.tls_connect(tcp).await?
     };
 
     send_and_check_tunnel(&mut node_stream, &msg, &state.config.cluster_secret).await?;

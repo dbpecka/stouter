@@ -15,6 +15,7 @@ use crate::gossip;
 use crate::gossip::messages::Message;
 use crate::node::tunnel::{connect_local_service, send_tunnel_error};
 use crate::state::SharedState;
+use crate::tls::MeshStream;
 
 /// Maximum timestamp skew allowed for tunnel authentication.
 const MAX_SKEW_MS: u64 = 30_000;
@@ -108,18 +109,14 @@ impl MuxPool {
 // Server side (Node): accept a yamux mux session
 // ---------------------------------------------------------------------------
 
-/// Accept a yamux multiplexed session on a TCP connection.
+/// Accept a yamux multiplexed session on a `MeshStream`.
 ///
 /// The `MuxTunnel` message has already been read by the dispatcher.
 /// Each incoming yamux stream carries one tunnel lifecycle:
 /// TunnelRequest → status byte → bidirectional proxy.
-pub async fn handle_mux_session(stream: TcpStream, state: Arc<SharedState>) {
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-
+pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
     let compat_stream = stream.compat();
+    let peer = String::from("mux-peer");
     let config = yamux::Config::default();
     let mut connection = yamux::Connection::new(compat_stream, config, yamux::Mode::Server);
 
@@ -224,25 +221,31 @@ async fn handle_mux_stream(
 // Client side (Subscriber): establish a yamux session
 // ---------------------------------------------------------------------------
 
-/// Open a TCP connection to `addr`, send a signed `MuxTunnel` message,
-/// and upgrade to yamux client mode.
+/// Open a connection to `addr`, TLS-wrap it if configured, send a signed
+/// `MuxTunnel` message, and upgrade to yamux client mode.
 ///
 /// Returns a [`MuxHandle`] for opening streams. A background task is spawned
 /// to drive the yamux connection.
-pub async fn establish_mux_session(addr: &str, secret: &str) -> Result<MuxHandle> {
-    let mut tcp = TcpStream::connect(addr)
+pub async fn establish_mux_session(
+    addr: &str,
+    secret: &str,
+    state: &Arc<SharedState>,
+) -> Result<MuxHandle> {
+    let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("mux connect to {addr}"))?;
 
     crate::io::configure_stream(&tcp);
 
+    let mut stream = state.tls_connect(tcp).await.context("mux TLS connect")?;
+
     // Send the MuxTunnel handshake via the existing signed message protocol.
-    gossip::send_message(&mut tcp, &Message::MuxTunnel {}, secret)
+    gossip::send_message(&mut stream, &Message::MuxTunnel {}, secret)
         .await
         .context("send MuxTunnel")?;
 
     // Upgrade to yamux client mode.
-    let compat = tcp.compat();
+    let compat = stream.compat();
     let config = yamux::Config::default();
     let connection = yamux::Connection::new(compat, config, yamux::Mode::Client);
 

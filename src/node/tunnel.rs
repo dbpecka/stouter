@@ -6,6 +6,7 @@ use tokio::io::{AsyncWriteExt, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::state::SharedState;
+use crate::tls::MeshStream;
 
 /// Maximum timestamp skew allowed for tunnel authentication.
 const MAX_SKEW_MS: u64 = 30_000;
@@ -30,7 +31,7 @@ pub(crate) async fn send_tunnel_error<W: AsyncWrite + Unpin>(stream: &mut W, msg
 /// 3. Open a TCP connection to `127.0.0.1:{node_port}`.
 /// 4. Write `0x00` (success) and then transparently copy bytes in both directions.
 pub async fn handle_tunnel(
-    mut client: TcpStream,
+    mut client: MeshStream,
     node_id: String,
     service_name: String,
     timestamp_ms: u64,
@@ -52,14 +53,8 @@ pub async fn handle_tunnel(
     // --- Check if this tunnel targets us or needs relaying ---
     let our_node_id = &state.config.node_id;
     if !node_id.is_empty() && node_id != *our_node_id {
-        return super::relay::relay_tunnel(
-            client,
-            &node_id,
-            &service_name,
-            timestamp_ms,
-            &state,
-        )
-        .await;
+        return super::relay::relay_tunnel(client, &node_id, &service_name, timestamp_ms, &state)
+            .await;
     }
 
     // --- Locate service and connect ---

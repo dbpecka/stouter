@@ -5,8 +5,10 @@ mod io;
 mod metrics;
 mod mux;
 mod node;
+mod pki;
 mod state;
 mod subscribe;
+mod tls;
 
 use std::time::Duration;
 
@@ -87,7 +89,15 @@ async fn main() -> Result<()> {
         None => {
             let cfg = Config::load(&cli.config)?;
             let shutdown = CancellationToken::new();
-            let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone());
+
+            let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
+                let material = pki::load_or_create(dir, &cfg.node_id)?;
+                Some(tls::TlsContext::new(&material)?)
+            } else {
+                None
+            };
+
+            let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), tls_ctx);
 
             let metrics_handle = metrics::install();
             tokio::spawn(metrics::run_gauge_loop(state.clone()));
@@ -131,7 +141,7 @@ async fn main() -> Result<()> {
 
             // Announce our presence to any already-known peers.
             if !cfg.known_nodes.is_empty() {
-                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new());
+                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), None);
                 gossip::broadcast_message(
                     &state,
                     Message::NodeJoin {
@@ -272,7 +282,7 @@ async fn main() -> Result<()> {
             cfg.save(&cli.config)?;
 
             let version = cfg.dynamic_config.version;
-            let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new());
+            let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), None);
             gossip::broadcast_message(
                 &state,
                 Message::ConfigUpdate {

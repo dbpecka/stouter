@@ -118,6 +118,10 @@ pub struct Config {
     /// Absent or empty → all services are proxied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscribe_filter: Option<SubscribeFilter>,
+    /// Directory holding `ca.crt`, `ca.key` for TLS.
+    /// When set, all inter-node connections are mutually authenticated with TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -134,6 +138,7 @@ impl Default for Config {
             known_nodes: Vec::new(),
             dynamic_config: DynamicConfig::default(),
             subscribe_filter: None,
+            tls_dir: None,
         }
     }
 }

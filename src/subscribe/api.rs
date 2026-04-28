@@ -197,7 +197,7 @@ mod tests {
             })
             .collect();
         let service_ports: ServicePorts = Arc::new(RwLock::new(map));
-        let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new());
+        let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
         let state = AppState {
             service_ports,
             shared,
@@ -320,7 +320,7 @@ mod tests {
         use crate::config::NodeInfo;
 
         let service_ports: ServicePorts = Arc::new(RwLock::new(HashMap::new()));
-        let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new());
+        let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
         shared
             .update_known_nodes(|nodes| {
                 nodes.insert(

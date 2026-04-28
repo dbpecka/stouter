@@ -82,11 +82,12 @@ async fn reverse_worker(state: Arc<SharedState>, relay_addr: String, slot: usize
 /// a spawned task so the caller can immediately open a replacement connection,
 /// keeping the pool full during bursts.
 async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str) -> Result<()> {
-    let mut stream = TcpStream::connect(relay_addr)
+    let tcp = TcpStream::connect(relay_addr)
         .await
         .with_context(|| format!("connect to relay {relay_addr}"))?;
 
-    crate::io::configure_stream(&stream);
+    crate::io::configure_stream(&tcp);
+    let mut stream = state.tls_connect(tcp).await?;
 
     // Send registration.
     let timestamp_ms = SystemTime::now()

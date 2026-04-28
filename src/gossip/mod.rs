@@ -11,6 +11,7 @@ use tracing::{debug, error, info};
 
 use crate::config::NodeInfo;
 use crate::state::SharedState;
+use crate::tls::MeshStream;
 use messages::Message;
 
 /// Maximum allowed message size: 1 MiB.
@@ -87,13 +88,9 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str)
 // Connection dispatch
 // ---------------------------------------------------------------------------
 
-/// Handle an inbound TCP connection by reading the first message and
-/// dispatching to the appropriate handler based on its variant.
-pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>) {
-    let peer_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
+/// Handle an inbound connection by reading the first message and dispatching
+/// to the appropriate handler based on its variant.
+pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, state: Arc<SharedState>) {
     let secret = state.config.cluster_secret.clone();
 
     match recv_message(&mut stream, &secret).await {
@@ -106,7 +103,7 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
             | Message::NodeJoin { .. }
             | Message::NodeLeave { .. } => {
                 metrics::counter!("stouter_connections_total", "type" => "gossip").increment(1);
-                handle_gossip_message(stream, msg, state).await;
+                handle_gossip_message(stream, peer_addr, msg, state).await;
             }
             Message::TunnelRequest {
                 node_id,
@@ -157,16 +154,7 @@ pub async fn dispatch_connection(mut stream: TcpStream, state: Arc<SharedState>)
 // Gossip message handling
 // ---------------------------------------------------------------------------
 
-/// Handle an already-parsed gossip message (Sync, ConfigUpdate, NodeJoin, NodeLeave).
-///
-/// If the message is a [`Message::Sync`], the state is merged and a Sync
-/// reply is sent back so the peer can also update itself.
-async fn handle_gossip_message(mut stream: TcpStream, msg: Message, state: Arc<SharedState>) {
-    let peer_addr = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-
+async fn handle_gossip_message(mut stream: MeshStream, peer_addr: String, msg: Message, state: Arc<SharedState>) {
     match msg {
         Message::Sync { config, mut nodes } => {
             if !peer_addr.is_empty() {
@@ -187,8 +175,7 @@ async fn handle_gossip_message(mut stream: TcpStream, msg: Message, state: Arc<S
     }
 }
 
-/// Handle a status request by replying with the daemon's current state.
-async fn handle_status_request(mut stream: TcpStream, state: Arc<SharedState>) {
+async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) {
     let response = Message::StatusResponse {
         mode: format!("{:?}", state.config.mode).to_lowercase(),
         node_id: state.config.node_id.clone(),
@@ -320,13 +307,12 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
     }
 }
 
-/// Attempt a single sync round-trip with `addr`.
 async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
-    let mut stream = TcpStream::connect(addr)
+    let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect to {addr}"))?;
-
-    stream.set_nodelay(true).ok();
+    tcp.set_nodelay(true).ok();
+    let mut stream = state.tls_connect(tcp).await?;
 
     let secret = &state.config.cluster_secret;
     let our_sync = build_sync_msg(state).await;
@@ -361,15 +347,17 @@ fn fix_unroutable_addrs(nodes: &mut [NodeInfo], connected_addr: &str) {
 // Broadcast
 // ---------------------------------------------------------------------------
 
-/// Send `msg` to every known peer node.  Connection errors are logged at
-/// `debug` level because peers may be temporarily unreachable.
 pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     let peers = peer_addrs(state).await;
-
     let secret = state.config.cluster_secret.clone();
 
     for addr in peers {
-        match time::timeout(Duration::from_secs(5), send_to_peer(&addr, &msg, &secret)).await {
+        match time::timeout(
+            Duration::from_secs(5),
+            send_to_peer(&addr, &msg, &secret, state),
+        )
+        .await
+        {
             Ok(Err(e)) => debug!("broadcast to {addr} failed: {e}"),
             Err(_) => debug!("broadcast to {addr} timed out"),
             Ok(Ok(())) => {}
@@ -377,13 +365,12 @@ pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     }
 }
 
-/// Open a connection to `addr` and send one message.
-async fn send_to_peer(addr: &str, msg: &Message, secret: &str) -> Result<()> {
-    let mut stream = TcpStream::connect(addr)
+async fn send_to_peer(addr: &str, msg: &Message, secret: &str, state: &Arc<SharedState>) -> Result<()> {
+    let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect to {addr}"))?;
-
-    stream.set_nodelay(true).ok();
+    tcp.set_nodelay(true).ok();
+    let mut stream = state.tls_connect(tcp).await?;
     send_message(&mut stream, msg, secret).await
 }
 

@@ -53,9 +53,13 @@ async fn run_listener(state: Arc<SharedState>) -> Result<()> {
         debug!("accepted connection from {peer_addr}");
 
         let state = state.clone();
+        let peer = peer_addr.to_string();
         let guard = state.in_flight.track();
         tokio::spawn(async move {
-            gossip::dispatch_connection(stream, state).await;
+            match state.tls_accept(stream).await {
+                Ok(mesh) => gossip::dispatch_connection(mesh, peer, state).await,
+                Err(e) => debug!("TLS accept from {peer}: {e}"),
+            }
             drop(guard);
         });
     }
