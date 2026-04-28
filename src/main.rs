@@ -49,7 +49,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Add a service on this node
+    /// Add a service to a node
     Add {
         #[arg(long)]
         group: String,
@@ -60,6 +60,9 @@ enum ServiceAction {
         /// Comma-separated list of domains to route to this service
         #[arg(long, value_delimiter = ',')]
         domains: Vec<String>,
+        /// Node ID to register the service on (defaults to this node)
+        #[arg(long)]
+        node: Option<String>,
     },
     /// List all services
     List,
@@ -92,7 +95,9 @@ async fn main() -> Result<()> {
             let daemon = async {
                 match cfg.mode {
                     config::Mode::Node => node::run_node(state.clone()).await,
-                    config::Mode::Subscribe => subscribe::run_subscribe(state.clone(), metrics_handle).await,
+                    config::Mode::Subscribe | config::Mode::NodeSubscribe => {
+                        subscribe::run_subscribe(state.clone(), metrics_handle).await
+                    }
                 }
             };
 
@@ -229,13 +234,16 @@ async fn main() -> Result<()> {
                     name,
                     port,
                     domains,
+                    node,
                 },
         }) => {
             let mut cfg = Config::load(&cli.config).unwrap_or_default();
 
+            let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+
             let service = Service {
                 name: name.clone(),
-                node_id: cfg.node_id.clone(),
+                node_id: node_id.clone(),
                 node_port: port,
                 domains: domains.clone(),
             };
@@ -247,7 +255,7 @@ async fn main() -> Result<()> {
                 .iter_mut()
                 .find(|g| g.name == group_name)
             {
-                if let Some(existing) = g.services.iter_mut().find(|s| s.name == name && s.node_id == cfg.node_id) {
+                if let Some(existing) = g.services.iter_mut().find(|s| s.name == name && s.node_id == node_id) {
                     existing.node_port = port;
                     existing.domains = domains.clone();
                 } else {

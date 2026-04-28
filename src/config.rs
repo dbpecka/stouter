@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum Mode {
     Node,
     Subscribe,
+    NodeSubscribe,
 }
 
 impl Default for Mode {
@@ -34,6 +35,31 @@ pub struct Service {
 pub struct ServiceGroup {
     pub name: String,
     pub services: Vec<Service>,
+}
+
+/// Optional filter limiting which services a subscribe node will proxy.
+///
+/// If both lists are empty the filter has no effect (all services allowed).
+/// Otherwise a service is allowed if its group name is in `service_groups`
+/// OR its bare service name is in `services`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeFilter {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+}
+
+impl SubscribeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.service_groups.is_empty() && self.services.is_empty()
+    }
+
+    pub fn allows(&self, group_name: &str, service_name: &str) -> bool {
+        self.service_groups.iter().any(|g| g == group_name)
+            || self.services.iter().any(|s| s == service_name)
+    }
 }
 
 /// Versioned, gossip-replicated configuration shared across the cluster.
@@ -88,6 +114,10 @@ pub struct Config {
     /// Peer addresses in `"host:port"` form.
     pub known_nodes: Vec<String>,
     pub dynamic_config: DynamicConfig,
+    /// Limits which services a subscribe node will proxy.
+    /// Absent or empty → all services are proxied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe_filter: Option<SubscribeFilter>,
 }
 
 impl Default for Config {
@@ -103,6 +133,7 @@ impl Default for Config {
             reverse_pool_size: None,
             known_nodes: Vec::new(),
             dynamic_config: DynamicConfig::default(),
+            subscribe_filter: None,
         }
     }
 }
@@ -148,6 +179,14 @@ impl Config {
                     }
                 }
             }
+        }
+
+        if self.subscribe_filter.is_some()
+            && !matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe)
+        {
+            return Err(anyhow!(
+                "`subscribeFilter` is only valid in subscribe or nodeSubscribe mode"
+            ));
         }
 
         Ok(())
@@ -250,6 +289,109 @@ mod tests {
         let cfg = Config::default();
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("advertiseAddr"));
+    }
+
+    #[test]
+    fn subscribe_filter_is_empty() {
+        let f = SubscribeFilter::default();
+        assert!(f.is_empty());
+
+        let f = SubscribeFilter {
+            service_groups: vec!["web".into()],
+            services: vec![],
+        };
+        assert!(!f.is_empty());
+
+        let f = SubscribeFilter {
+            service_groups: vec![],
+            services: vec!["api".into()],
+        };
+        assert!(!f.is_empty());
+    }
+
+    #[test]
+    fn subscribe_filter_allows() {
+        let f = SubscribeFilter {
+            service_groups: vec!["web".into()],
+            services: vec!["auth".into()],
+        };
+
+        assert!(f.allows("web", "anything"));
+        assert!(f.allows("other", "auth"));
+        assert!(!f.allows("other", "api"));
+        assert!(f.allows("web", "auth"));
+    }
+
+    #[test]
+    fn subscribe_filter_invalid_on_node_mode() {
+        let cfg = Config {
+            mode: Mode::Node,
+            subscribe_filter: Some(SubscribeFilter {
+                service_groups: vec!["web".into()],
+                services: vec![],
+            }),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn subscribe_filter_valid_on_subscribe_mode() {
+        let cfg = Config {
+            mode: Mode::Subscribe,
+            subscribe_filter: Some(SubscribeFilter {
+                service_groups: vec!["web".into()],
+                services: vec![],
+            }),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn nodesubscribe_mode_serde_round_trip() {
+        let cfg = Config {
+            mode: Mode::NodeSubscribe,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"nodeSubscribe\""));
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored.mode, Mode::NodeSubscribe));
+    }
+
+    #[test]
+    fn subscribe_filter_valid_on_node_subscribe_mode() {
+        let cfg = Config {
+            mode: Mode::NodeSubscribe,
+            subscribe_filter: Some(SubscribeFilter {
+                service_groups: vec!["web".into()],
+                services: vec![],
+            }),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn outbound_only_accepted_on_node_subscribe_mode() {
+        let cfg = Config {
+            mode: Mode::NodeSubscribe,
+            outbound_only: true,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn subscribe_filter_serde_omits_empty_lists() {
+        let f = SubscribeFilter {
+            service_groups: vec!["web".into()],
+            services: vec![],
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("serviceGroups"));
+        assert!(!json.contains("services"));
     }
 
     #[test]

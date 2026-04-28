@@ -1,5 +1,5 @@
 pub mod relay;
-mod reverse;
+pub mod reverse;
 pub mod tunnel;
 
 use std::sync::Arc;

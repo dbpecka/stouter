@@ -49,31 +49,39 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
         }
     });
 
-    let listener = TcpListener::bind(&state.config.bind)
-        .await
-        .with_context(|| format!("bind gossip listener to {}", state.config.bind))?;
-
-    info!("Subscribe daemon listening on {}", state.config.bind);
-
     tokio::spawn(manage_proxies(state.clone(), service_ports));
     tokio::spawn(fill_tunnel_pool(state.clone()));
     tokio::spawn(maintain_mux_sessions(state.clone()));
 
-    loop {
-        let (stream, _) = tokio::select! {
-            result = listener.accept() => result.context("accept connection")?,
-            _ = state.shutdown.cancelled() => {
-                info!("subscribe listener shutting down");
-                break;
-            }
-        };
-        stream.set_nodelay(true).ok();
-        let state = state.clone();
-        let guard = state.in_flight.track();
-        tokio::spawn(async move {
-            gossip::dispatch_connection(stream, state).await;
-            drop(guard);
-        });
+    if state.config.outbound_only {
+        info!(
+            "Subscribe daemon running in outbound-only mode (NAT'd), node_id={}",
+            state.config.node_id
+        );
+        crate::node::reverse::run_reverse_pool_loop(state).await;
+    } else {
+        let listener = TcpListener::bind(&state.config.bind)
+            .await
+            .with_context(|| format!("bind gossip listener to {}", state.config.bind))?;
+
+        info!("Subscribe daemon listening on {}", state.config.bind);
+
+        loop {
+            let (stream, _) = tokio::select! {
+                result = listener.accept() => result.context("accept connection")?,
+                _ = state.shutdown.cancelled() => {
+                    info!("subscribe listener shutting down");
+                    break;
+                }
+            };
+            stream.set_nodelay(true).ok();
+            let state = state.clone();
+            let guard = state.in_flight.track();
+            tokio::spawn(async move {
+                gossip::dispatch_connection(stream, state).await;
+                drop(guard);
+            });
+        }
     }
 
     Ok(())
@@ -109,6 +117,18 @@ async fn manage_proxies(
         let mut seen_svc_keys: HashSet<String> = HashSet::new();
         for group in &dc.service_groups {
             for svc in &group.services {
+                // In nodeSubscribe mode, services this node owns are already running
+                // locally — tunneling to self would be a pointless double-hop.
+                if matches!(state.config.mode, crate::config::Mode::NodeSubscribe)
+                    && svc.node_id == state.config.node_id
+                {
+                    continue;
+                }
+                if let Some(filter) = &state.config.subscribe_filter {
+                    if !filter.is_empty() && !filter.allows(&group.name, &svc.name) {
+                        continue;
+                    }
+                }
                 let key = format!("{}/{}", group.name, svc.name);
                 if nodes.contains_key(&svc.node_id) && seen_svc_keys.insert(key.clone()) {
                     desired.insert(key, (svc.name.clone(), svc.domains.clone()));
