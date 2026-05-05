@@ -1,0 +1,23 @@
+{
+  "name": "Stouter: No Nodes Available for Service",
+  "tags": ["stouter", "service-mesh"],
+  "rule_type_id": ".es-query",
+  "consumer": "alerts",
+  "schedule": {
+    "interval": "1m"
+  },
+  "params": {
+    "index": ["logs-stouter-*"],
+    "timeField": "@timestamp",
+    "size": 100,
+    "threshold": [1],
+    "thresholdComparator": ">=",
+    "timeWindowSize": 5,
+    "timeWindowUnit": "m",
+    "searchType": "esQuery",
+    "excludeHitsFromPreviousRun": true,
+    "esQuery": "{\"query\":{\"bool\":{\"filter\":[{\"match_phrase\":{\"message\":\"no nodes available\"}}]}}}"
+  },
+  "actions": [],
+  "enabled": true
+}
