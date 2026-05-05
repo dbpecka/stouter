@@ -266,7 +266,7 @@ async fn maintain_mux_sessions(state: Arc<SharedState>) {
         };
 
         for addr in &addrs {
-            match crate::mux::establish_mux_session(addr, &state.config.cluster_secret, &state).await {
+            match crate::mux::establish_mux_session(addr, &state).await {
                 Ok(handle) => {
                     info!("mux session established to {addr}");
                     state.mux_pool.insert(addr.clone(), handle);

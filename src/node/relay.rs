@@ -110,7 +110,7 @@ where
         service_name: service_name.to_string(),
         timestamp_ms,
     };
-    gossip::send_message(&mut reverse_stream, &msg, &state.config.cluster_secret)
+    gossip::send_message(&mut reverse_stream, &msg)
         .await
         .context("forward tunnel request to reverse connection")?;
 

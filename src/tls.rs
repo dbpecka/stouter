@@ -19,14 +19,21 @@ use crate::pki::PkiMaterial;
 /// All variants are `Unpin` (TcpStream and TlsStream<TcpStream> are both
 /// Unpin), so `AsyncRead` / `AsyncWrite` can be implemented via `get_mut()`.
 pub enum MeshStream {
-    Plain(TcpStream),
-    TlsServer(tokio_rustls::server::TlsStream<TcpStream>),
+    TlsServer {
+        stream: tokio_rustls::server::TlsStream<TcpStream>,
+        peer_cn: Option<String>,
+    },
     TlsClient(tokio_rustls::client::TlsStream<TcpStream>),
 }
 
 impl MeshStream {
-    pub fn from_plain(s: TcpStream) -> Self {
-        MeshStream::Plain(s)
+    /// Returns the Common Name from the peer's leaf certificate, if known.
+    /// Only populated for server-accepted streams.
+    pub fn peer_cn(&self) -> Option<&str> {
+        match self {
+            MeshStream::TlsServer { peer_cn, .. } => peer_cn.as_deref(),
+            MeshStream::TlsClient(_) => None,
+        }
     }
 }
 
@@ -37,8 +44,7 @@ impl AsyncRead for MeshStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            MeshStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            MeshStream::TlsServer(s) => Pin::new(s).poll_read(cx, buf),
+            MeshStream::TlsServer { stream, .. } => Pin::new(stream).poll_read(cx, buf),
             MeshStream::TlsClient(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -51,24 +57,21 @@ impl AsyncWrite for MeshStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            MeshStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            MeshStream::TlsServer(s) => Pin::new(s).poll_write(cx, buf),
+            MeshStream::TlsServer { stream, .. } => Pin::new(stream).poll_write(cx, buf),
             MeshStream::TlsClient(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            MeshStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            MeshStream::TlsServer(s) => Pin::new(s).poll_flush(cx),
+            MeshStream::TlsServer { stream, .. } => Pin::new(stream).poll_flush(cx),
             MeshStream::TlsClient(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            MeshStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            MeshStream::TlsServer(s) => Pin::new(s).poll_shutdown(cx),
+            MeshStream::TlsServer { stream, .. } => Pin::new(stream).poll_shutdown(cx),
             MeshStream::TlsClient(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -124,7 +127,8 @@ impl TlsContext {
 
     pub async fn accept(&self, stream: TcpStream) -> Result<MeshStream> {
         let tls = self.acceptor.accept(stream).await.context("TLS accept")?;
-        Ok(MeshStream::TlsServer(tls))
+        let peer_cn = peer_leaf_cn(&tls);
+        Ok(MeshStream::TlsServer { stream: tls, peer_cn })
     }
 
     pub async fn connect(&self, stream: TcpStream) -> Result<MeshStream> {
@@ -135,4 +139,20 @@ impl TlsContext {
             .context("TLS connect")?;
         Ok(MeshStream::TlsClient(tls))
     }
+}
+
+/// Extract the Common Name from the leaf cert of a freshly-accepted server-side
+/// TLS stream. Returns `None` if the peer presented no cert (mTLS would have
+/// already failed the handshake) or if the cert subject has no CN.
+fn peer_leaf_cn(tls: &tokio_rustls::server::TlsStream<TcpStream>) -> Option<String> {
+    let (_, conn) = tls.get_ref();
+    let leaf = conn.peer_certificates()?.first()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(|s| s.to_string());
+    cn
 }

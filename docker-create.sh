@@ -2,6 +2,6 @@
 docker run -d \
     --name stouter \
     --network host \
-    -v /srv/stouter/stouter.json:/srv/stouter/stouter.json \
-    stouter --config /srv/stouter/stouter.json
+    -v /srv/stouter/config/:/srv/stouter/config/ \
+    stouter --config /srv/stouter/config/stouter.json
 

@@ -17,29 +17,23 @@ use messages::Message;
 /// Maximum allowed message size: 1 MiB.
 const MAX_MSG_BYTES: u32 = 1024 * 1024;
 
-/// Size of the HMAC-SHA256 signature prepended to each frame.
-const HMAC_LEN: usize = 32;
-
 // ---------------------------------------------------------------------------
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize `msg` to MessagePack, sign the payload with HMAC-SHA256, and
-/// write the frame as `[4-byte payload len][32-byte HMAC][payload]`.
+/// Serialize `msg` to MessagePack and write the frame as `[4-byte len][payload]`.
+///
+/// Authentication is provided by the mTLS layer; no application-level MAC is added.
 pub async fn send_message<W: AsyncWriteExt + Unpin>(
     stream: &mut W,
     msg: &Message,
-    secret: &str,
 ) -> Result<()> {
     let payload = rmp_serde::to_vec(msg).context("serialize Message")?;
-    let hmac = crate::crypto::sign_bytes(secret, &payload);
-
     let len = u32::try_from(payload.len()).context("message too large")?;
     stream
         .write_all(&len.to_be_bytes())
         .await
         .context("write length prefix")?;
-    stream.write_all(&hmac).await.context("write HMAC")?;
     stream
         .write_all(&payload)
         .await
@@ -48,11 +42,10 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Read a binary-framed message from `stream`, verify its HMAC signature,
-/// and deserialize the MessagePack payload.
+/// Read a binary-framed message from `stream` and deserialize the MessagePack payload.
 ///
-/// Wire format: `[4-byte payload len][32-byte HMAC][payload]`.
-pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str) -> Result<Message> {
+/// Wire format: `[4-byte payload len][payload]`.
+pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -64,21 +57,11 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str)
         bail!("message too large: {len} bytes");
     }
 
-    let mut hmac = [0u8; HMAC_LEN];
-    stream
-        .read_exact(&mut hmac)
-        .await
-        .context("read HMAC")?;
-
     let mut payload = vec![0u8; len as usize];
     stream
         .read_exact(&mut payload)
         .await
         .context("read payload")?;
-
-    if !crate::crypto::verify_bytes(secret, &payload, &hmac) {
-        bail!("message signature verification failed");
-    }
 
     let msg: Message = rmp_serde::from_slice(&payload).context("deserialize Message")?;
     Ok(msg)
@@ -91,9 +74,7 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R, secret: &str)
 /// Handle an inbound connection by reading the first message and dispatching
 /// to the appropriate handler based on its variant.
 pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, state: Arc<SharedState>) {
-    let secret = state.config.cluster_secret.clone();
-
-    match recv_message(&mut stream, &secret).await {
+    match recv_message(&mut stream).await {
         Err(e) => {
             debug!("failed to receive message from {peer_addr}: {e}");
         }
@@ -146,6 +127,13 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
                 metrics::counter!("stouter_connections_total", "type" => "mux").increment(1);
                 crate::mux::handle_mux_session(stream, state).await;
             }
+            Message::AdminRequest { op } => {
+                metrics::counter!("stouter_connections_total", "type" => "admin").increment(1);
+                handle_admin_request(stream, op, state).await;
+            }
+            Message::AdminResponse { .. } => {
+                debug!("unexpected AdminResponse from {peer_addr}");
+            }
         },
     }
 }
@@ -164,14 +152,106 @@ async fn handle_gossip_message(mut stream: MeshStream, peer_addr: String, msg: M
 
             // Reply with our current state.
             let reply = build_sync_msg(&state).await;
-            let secret = &state.config.cluster_secret;
-            if let Err(e) = send_message(&mut stream, &reply, secret).await {
+            if let Err(e) = send_message(&mut stream, &reply).await {
                 debug!("failed to send sync reply: {e}");
             }
         }
         other => {
             apply_message(&state, other).await;
         }
+    }
+}
+
+async fn handle_admin_request(
+    mut stream: MeshStream,
+    op: messages::AdminOp,
+    state: Arc<SharedState>,
+) {
+    use crate::config::{Mode, MutateErr, Service};
+    use messages::{AdminErrCode, AdminOp, AdminResult, Message as Msg};
+
+    // Authorization: peer's TLS CN must be in the configured allowlist.
+    let allowed = match stream.peer_cn() {
+        Some(cn) => state.config.admin_cns.iter().any(|a| a == cn),
+        None => false,
+    };
+    if !allowed {
+        let _ = send_message(
+            &mut stream,
+            &Msg::AdminResponse {
+                result: AdminResult::Err {
+                    code: AdminErrCode::Unauthorized,
+                    message: "client cert CN not in adminCns allowlist".into(),
+                },
+            },
+        )
+        .await;
+        return;
+    }
+
+    if matches!(state.config.mode, Mode::Subscribe) {
+        let _ = send_message(
+            &mut stream,
+            &Msg::AdminResponse {
+                result: AdminResult::Err {
+                    code: AdminErrCode::Validation,
+                    message: "admin RPC not supported in subscribe-only mode".into(),
+                },
+            },
+        )
+        .await;
+        return;
+    }
+
+    // Apply mutation. Hold the write lock across persist so concurrent
+    // admin RPCs serialize on version, and the file is updated before any
+    // other writer can see the in-memory state.
+    let outcome: Result<(u64, crate::config::DynamicConfig), MutateErr> = {
+        let mut dc = state.dynamic_config.write().await;
+        let result = match op {
+            AdminOp::ServiceAdd { group, name, owner_node_id, port, domains } => {
+                let svc = Service {
+                    name,
+                    node_id: owner_node_id,
+                    node_port: port,
+                    domains,
+                };
+                Ok(dc.upsert_service(&group, svc))
+            }
+            AdminOp::ServiceRename { group, owner_node_id, from, to } => {
+                dc.rename_service(&group, &owner_node_id, &from, &to)
+            }
+        };
+        match result {
+            Ok(new_version) => {
+                persist_state_with(&state, &dc);
+                Ok((new_version, dc.clone()))
+            }
+            Err(err) => Err(err),
+        }
+    };
+
+    let response = match outcome {
+        Ok((new_version, new_dc)) => {
+            state.rebuild_service_index().await;
+            broadcast_message(&state, Msg::ConfigUpdate { config: new_dc }).await;
+            Msg::AdminResponse { result: AdminResult::Ok { new_version } }
+        }
+        Err(err) => {
+            let code = match err {
+                MutateErr::GroupNotFound { .. } | MutateErr::ServiceNotFound { .. } => {
+                    AdminErrCode::NotFound
+                }
+                MutateErr::DuplicateService { .. } => AdminErrCode::Validation,
+            };
+            Msg::AdminResponse {
+                result: AdminResult::Err { code, message: err.to_string() },
+            }
+        }
+    };
+
+    if let Err(e) = send_message(&mut stream, &response).await {
+        debug!("admin: failed to send response: {e}");
     }
 }
 
@@ -184,8 +264,7 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
         known_nodes: state.known_nodes.load().values().cloned().collect(),
     };
 
-    let secret = &state.config.cluster_secret;
-    if let Err(e) = send_message(&mut stream, &response, secret).await {
+    if let Err(e) = send_message(&mut stream, &response).await {
         debug!("status: failed to send response: {e}");
     }
 }
@@ -314,11 +393,10 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
     tcp.set_nodelay(true).ok();
     let mut stream = state.tls_connect(tcp).await?;
 
-    let secret = &state.config.cluster_secret;
     let our_sync = build_sync_msg(state).await;
-    send_message(&mut stream, &our_sync, secret).await?;
+    send_message(&mut stream, &our_sync).await?;
 
-    let reply = recv_message(&mut stream, secret).await?;
+    let reply = recv_message(&mut stream).await?;
     if let Message::Sync { config, mut nodes } = reply {
         fix_unroutable_addrs(&mut nodes, addr);
         merge_sync(state, config, nodes).await;
@@ -349,12 +427,11 @@ fn fix_unroutable_addrs(nodes: &mut [NodeInfo], connected_addr: &str) {
 
 pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     let peers = peer_addrs(state).await;
-    let secret = state.config.cluster_secret.clone();
 
     for addr in peers {
         match time::timeout(
             Duration::from_secs(5),
-            send_to_peer(&addr, &msg, &secret, state),
+            send_to_peer(&addr, &msg, state),
         )
         .await
         {
@@ -365,13 +442,13 @@ pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     }
 }
 
-async fn send_to_peer(addr: &str, msg: &Message, secret: &str, state: &Arc<SharedState>) -> Result<()> {
+async fn send_to_peer(addr: &str, msg: &Message, state: &Arc<SharedState>) -> Result<()> {
     let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect to {addr}"))?;
     tcp.set_nodelay(true).ok();
     let mut stream = state.tls_connect(tcp).await?;
-    send_message(&mut stream, msg, secret).await
+    send_message(&mut stream, msg).await
 }
 
 // ---------------------------------------------------------------------------
@@ -390,10 +467,19 @@ async fn print_dynamic_config(state: &Arc<SharedState>) {
 /// Persist dynamic config to disk.
 ///
 /// Loads the current config file first so that external changes to static
-/// fields (e.g. `cluster_secret`, `bind`) are preserved.  The `known_nodes`
+/// fields (e.g. `bind`) are preserved.  The `known_nodes`
 /// list in the config file is left untouched — it contains bootstrap peer
 /// addresses, not the gossip-discovered member list.
 async fn persist_state(state: &Arc<SharedState>) {
+    let dc = state.dynamic_config.read().await.clone();
+    persist_state_with(state, &dc);
+}
+
+/// Same as `persist_state`, but accepts the dynamic config directly so the
+/// caller can persist while still holding a write lock on
+/// `state.dynamic_config` — `persist_state` itself takes a read lock and would
+/// deadlock under such a caller.
+fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) {
     let mut cfg = match crate::config::Config::load(&state.config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -401,7 +487,7 @@ async fn persist_state(state: &Arc<SharedState>) {
             return;
         }
     };
-    cfg.dynamic_config = state.dynamic_config.read().await.clone();
+    cfg.dynamic_config = dc.clone();
     if let Err(e) = cfg.save(&state.config_path) {
         error!("failed to persist state to {}: {e}", state.config_path);
     }
@@ -538,7 +624,7 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
 
 /// Periodically logs the number of known member nodes.
 pub async fn run_member_log(state: Arc<SharedState>) {
-    let mut interval = time::interval(Duration::from_secs(60));
+    let mut interval = time::interval(Duration::from_secs(300));
     interval.tick().await; // skip the immediate first tick
     loop {
         tokio::select! {

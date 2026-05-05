@@ -99,12 +99,12 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str) -> 
         node_id: state.config.node_id.clone(),
         timestamp_ms,
     };
-    gossip::send_message(&mut stream, &msg, &state.config.cluster_secret).await?;
+    gossip::send_message(&mut stream, &msg).await?;
 
     debug!("reverse connection established to {relay_addr}");
 
     // Wait for a tunnel dispatch from the relay.
-    let msg = gossip::recv_message(&mut stream, &state.config.cluster_secret).await?;
+    let msg = gossip::recv_message(&mut stream).await?;
     match msg {
         Message::TunnelRequest {
             node_id,

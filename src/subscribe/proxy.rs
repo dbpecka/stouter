@@ -92,9 +92,8 @@ fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<NodeInfo> 
 async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     msg: &Message,
-    secret: &str,
 ) -> Result<()> {
-    gossip::send_message(stream, msg, secret)
+    gossip::send_message(stream, msg)
         .await
         .context("send tunnel request")?;
 
@@ -155,7 +154,7 @@ async fn handle_connection(
     if !connect_addr.is_empty() {
         if let Some(yamux_stream) = state.mux_pool.open_stream(connect_addr).await {
             let mut compat = yamux_stream.compat();
-            send_and_check_tunnel(&mut compat, &msg, &state.config.cluster_secret).await?;
+            send_and_check_tunnel(&mut compat, &msg).await?;
             metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
                 .record(connect_start.elapsed().as_secs_f64());
             crate::io::proxy_bidirectional(client, compat)
@@ -194,7 +193,7 @@ async fn handle_connection(
         state.tls_connect(tcp).await?
     };
 
-    send_and_check_tunnel(&mut node_stream, &msg, &state.config.cluster_secret).await?;
+    send_and_check_tunnel(&mut node_stream, &msg).await?;
     metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => method)
         .record(connect_start.elapsed().as_secs_f64());
 

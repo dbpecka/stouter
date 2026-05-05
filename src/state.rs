@@ -196,19 +196,19 @@ impl SharedState {
         })
     }
 
-    /// Wrap a newly accepted `TcpStream` with TLS (if enabled).
+    /// Wrap a newly accepted `TcpStream` with mTLS.
     pub async fn tls_accept(&self, stream: TcpStream) -> anyhow::Result<MeshStream> {
         match &self.tls {
             Some(ctx) => ctx.accept(stream).await,
-            None => Ok(MeshStream::from_plain(stream)),
+            None => anyhow::bail!("mTLS is required but tlsDir is not configured"),
         }
     }
 
-    /// Wrap an outbound `TcpStream` with TLS (if enabled).
+    /// Wrap an outbound `TcpStream` with mTLS.
     pub async fn tls_connect(&self, stream: TcpStream) -> anyhow::Result<MeshStream> {
         match &self.tls {
             Some(ctx) => ctx.connect(stream).await,
-            None => Ok(MeshStream::from_plain(stream)),
+            None => anyhow::bail!("mTLS is required but tlsDir is not configured"),
         }
     }
 

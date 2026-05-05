@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,103 @@ impl Default for DynamicConfig {
     }
 }
 
+/// Failure modes for in-memory mutations of `DynamicConfig`.
+///
+/// Used by the local CLI mutation path and by the remote admin RPC handler so
+/// both report identical errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutateErr {
+    GroupNotFound { group: String },
+    ServiceNotFound { group: String, node: String, name: String },
+    DuplicateService { group: String, node: String, name: String },
+}
+
+impl fmt::Display for MutateErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MutateErr::GroupNotFound { group } => write!(f, "group '{group}' not found"),
+            MutateErr::ServiceNotFound { group, node, name } => write!(
+                f,
+                "service '{name}' on node '{node}' not found in group '{group}'"
+            ),
+            MutateErr::DuplicateService { group, node, name } => write!(
+                f,
+                "service '{name}' already exists on node '{node}' in group '{group}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MutateErr {}
+
+impl DynamicConfig {
+    /// Insert a service into `group`, or replace it in place when an entry
+    /// with the same `(name, node_id)` already exists. Bumps `version` on
+    /// success and returns the new version.
+    pub fn upsert_service(&mut self, group: &str, service: Service) -> u64 {
+        if let Some(g) = self.service_groups.iter_mut().find(|g| g.name == group) {
+            if let Some(existing) = g
+                .services
+                .iter_mut()
+                .find(|s| s.name == service.name && s.node_id == service.node_id)
+            {
+                existing.node_port = service.node_port;
+                existing.domains = service.domains;
+            } else {
+                g.services.push(service);
+            }
+        } else {
+            self.service_groups.push(ServiceGroup {
+                name: group.to_string(),
+                services: vec![service],
+            });
+        }
+        self.version += 1;
+        self.version
+    }
+
+    /// Rename the service identified by `(group, owner_node_id, from)` to
+    /// `to`. Bumps `version` on success and returns the new version.
+    pub fn rename_service(
+        &mut self,
+        group: &str,
+        owner_node_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, MutateErr> {
+        let g = self
+            .service_groups
+            .iter_mut()
+            .find(|g| g.name == group)
+            .ok_or_else(|| MutateErr::GroupNotFound { group: group.to_string() })?;
+
+        if g.services
+            .iter()
+            .any(|s| s.name == to && s.node_id == owner_node_id)
+        {
+            return Err(MutateErr::DuplicateService {
+                group: group.to_string(),
+                node: owner_node_id.to_string(),
+                name: to.to_string(),
+            });
+        }
+
+        let svc = g
+            .services
+            .iter_mut()
+            .find(|s| s.name == from && s.node_id == owner_node_id)
+            .ok_or_else(|| MutateErr::ServiceNotFound {
+                group: group.to_string(),
+                node: owner_node_id.to_string(),
+                name: from.to_string(),
+            })?;
+        svc.name = to.to_string();
+
+        self.version += 1;
+        Ok(self.version)
+    }
+}
+
 /// Identity and address of a known peer node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,7 +192,6 @@ pub struct NodeInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
-    pub cluster_secret: String,
     pub mode: Mode,
     /// Bind address for the listener, e.g. `"0.0.0.0:8080"`.
     pub bind: String,
@@ -104,7 +201,6 @@ pub struct Config {
     pub advertise_addr: Option<String>,
     /// This node's identity (typically the hostname).
     pub node_id: String,
-    pub local_secret: String,
     /// When true, the node only makes outbound connections (behind NAT).
     #[serde(default)]
     pub outbound_only: bool,
@@ -122,23 +218,27 @@ pub struct Config {
     /// When set, all inter-node connections are mutually authenticated with TLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_dir: Option<String>,
+    /// Common Names allowed to issue admin RPCs against this daemon.
+    /// Empty (the default) disables admin RPC entirely; clients can still
+    /// query status with any cert signed by the cluster CA.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admin_cns: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            cluster_secret: String::new(),
             mode: Mode::default(),
             bind: String::from("0.0.0.0:8080"),
             advertise_addr: None,
             node_id: String::new(),
-            local_secret: String::new(),
             outbound_only: false,
             reverse_pool_size: None,
             known_nodes: Vec::new(),
             dynamic_config: DynamicConfig::default(),
             subscribe_filter: None,
             tls_dir: None,
+            admin_cns: Vec::new(),
         }
     }
 }
@@ -274,7 +374,6 @@ mod tests {
     #[test]
     fn config_serde_round_trip() {
         let cfg = Config {
-            cluster_secret: "test-secret".into(),
             node_id: "node1".into(),
             bind: "10.0.0.1:8080".into(),
             advertise_addr: Some("external:8080".into()),
@@ -283,7 +382,6 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.cluster_secret, "test-secret");
         assert_eq!(restored.node_id, "node1");
         assert_eq!(restored.advertise_addr.as_deref(), Some("external:8080"));
         assert_eq!(restored.known_nodes, vec!["peer1:8080"]);
@@ -400,12 +498,140 @@ mod tests {
     }
 
     #[test]
+    fn upsert_service_creates_group_when_missing() {
+        let mut dc = DynamicConfig::default();
+        let v = dc.upsert_service(
+            "web",
+            Service {
+                name: "api".into(),
+                node_id: "n1".into(),
+                node_port: 3000,
+                domains: vec![],
+            },
+        );
+        assert_eq!(v, 1);
+        assert_eq!(dc.version, 1);
+        assert_eq!(dc.service_groups.len(), 1);
+        assert_eq!(dc.service_groups[0].name, "web");
+        assert_eq!(dc.service_groups[0].services.len(), 1);
+    }
+
+    #[test]
+    fn upsert_service_appends_to_existing_group() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        let v = dc.upsert_service(
+            "web",
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![] },
+        );
+        assert_eq!(v, 2);
+        assert_eq!(dc.service_groups.len(), 1);
+        assert_eq!(dc.service_groups[0].services.len(), 2);
+    }
+
+    #[test]
+    fn upsert_service_replaces_existing_match_by_name_and_node() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        let v = dc.upsert_service(
+            "web",
+            Service {
+                name: "api".into(),
+                node_id: "n1".into(),
+                node_port: 9999,
+                domains: vec!["x.example".into()],
+            },
+        );
+        assert_eq!(v, 2);
+        assert_eq!(dc.service_groups[0].services.len(), 1);
+        assert_eq!(dc.service_groups[0].services[0].node_port, 9999);
+        assert_eq!(dc.service_groups[0].services[0].domains, vec!["x.example".to_string()]);
+    }
+
+    #[test]
+    fn upsert_service_keeps_same_name_on_different_nodes() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![] },
+        );
+        assert_eq!(dc.service_groups[0].services.len(), 2);
+    }
+
+    #[test]
+    fn rename_service_success_bumps_version() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
+        assert_eq!(v, 2);
+        assert_eq!(dc.service_groups[0].services[0].name, "api2");
+    }
+
+    #[test]
+    fn rename_service_missing_group_returns_err() {
+        let mut dc = DynamicConfig::default();
+        let err = dc.rename_service("nope", "n1", "api", "api2").unwrap_err();
+        assert!(matches!(err, MutateErr::GroupNotFound { .. }));
+    }
+
+    #[test]
+    fn rename_service_missing_source_returns_err() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
+        assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
+    }
+
+    #[test]
+    fn rename_service_conflicts_on_destination() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        dc.upsert_service(
+            "web",
+            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![] },
+        );
+        let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
+        assert!(matches!(err, MutateErr::DuplicateService { .. }));
+    }
+
+    #[test]
+    fn admin_cns_round_trips_and_omitted_when_empty() {
+        let cfg = Config::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("adminCns"));
+
+        let cfg = Config { admin_cns: vec!["admin-cli".into()], ..Config::default() };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"adminCns\":[\"admin-cli\"]"));
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.admin_cns, vec!["admin-cli".to_string()]);
+    }
+
+    #[test]
     fn config_save_and_load() {
         let path = std::env::temp_dir().join(format!("stouter_test_{}.json", std::process::id()));
         let path_str = path.to_str().unwrap();
 
         let cfg = Config {
-            cluster_secret: "s3cret".into(),
             node_id: "host1".into(),
             dynamic_config: DynamicConfig {
                 version: 5,
@@ -423,7 +649,6 @@ mod tests {
         };
         cfg.save(path_str).unwrap();
         let loaded = Config::load(path_str).unwrap();
-        assert_eq!(loaded.cluster_secret, "s3cret");
         assert_eq!(loaded.dynamic_config.version, 5);
         assert_eq!(loaded.dynamic_config.service_groups[0].services[0].name, "api");
 

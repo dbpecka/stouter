@@ -41,6 +41,47 @@ pub enum Message {
     },
     /// Upgrade this TCP connection to a yamux multiplexed tunnel session.
     MuxTunnel {},
+    /// Mutating admin RPC. Authorized via `adminCns` allowlist on the receiver.
+    AdminRequest { op: AdminOp },
+    /// Reply to an `AdminRequest`.
+    AdminResponse { result: AdminResult },
+}
+
+/// A single admin operation. Extend this enum to add new mutating commands
+/// without changing the connection-dispatch table.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AdminOp {
+    ServiceAdd {
+        group: String,
+        name: String,
+        owner_node_id: String,
+        port: u16,
+        #[serde(default)]
+        domains: Vec<String>,
+    },
+    ServiceRename {
+        group: String,
+        owner_node_id: String,
+        from: String,
+        to: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AdminResult {
+    Ok { new_version: u64 },
+    Err { code: AdminErrCode, message: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AdminErrCode {
+    Unauthorized,
+    Validation,
+    NotFound,
+    Internal,
 }
 
 #[cfg(test)]
@@ -179,5 +220,85 @@ mod tests {
     fn mux_tunnel_round_trip() {
         let msg = Message::MuxTunnel {};
         assert!(matches!(msgpack_round_trip(&msg), Message::MuxTunnel {}));
+    }
+
+    #[test]
+    fn admin_request_service_add_round_trip() {
+        let msg = Message::AdminRequest {
+            op: AdminOp::ServiceAdd {
+                group: "web".into(),
+                name: "api".into(),
+                owner_node_id: "n1".into(),
+                port: 3000,
+                domains: vec!["api.example.com".into()],
+            },
+        };
+        match msgpack_round_trip(&msg) {
+            Message::AdminRequest {
+                op: AdminOp::ServiceAdd { group, name, owner_node_id, port, domains },
+            } => {
+                assert_eq!(group, "web");
+                assert_eq!(name, "api");
+                assert_eq!(owner_node_id, "n1");
+                assert_eq!(port, 3000);
+                assert_eq!(domains, vec!["api.example.com"]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_request_service_rename_round_trip() {
+        let msg = Message::AdminRequest {
+            op: AdminOp::ServiceRename {
+                group: "web".into(),
+                owner_node_id: "n1".into(),
+                from: "api".into(),
+                to: "api2".into(),
+            },
+        };
+        match msgpack_round_trip(&msg) {
+            Message::AdminRequest {
+                op: AdminOp::ServiceRename { group, owner_node_id, from, to },
+            } => {
+                assert_eq!(group, "web");
+                assert_eq!(owner_node_id, "n1");
+                assert_eq!(from, "api");
+                assert_eq!(to, "api2");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_response_ok_round_trip() {
+        let msg = Message::AdminResponse {
+            result: AdminResult::Ok { new_version: 42 },
+        };
+        match msgpack_round_trip(&msg) {
+            Message::AdminResponse { result: AdminResult::Ok { new_version } } => {
+                assert_eq!(new_version, 42);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_response_err_round_trip() {
+        let msg = Message::AdminResponse {
+            result: AdminResult::Err {
+                code: AdminErrCode::Unauthorized,
+                message: "nope".into(),
+            },
+        };
+        match msgpack_round_trip(&msg) {
+            Message::AdminResponse {
+                result: AdminResult::Err { code, message },
+            } => {
+                assert_eq!(code, AdminErrCode::Unauthorized);
+                assert_eq!(message, "nope");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

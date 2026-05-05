@@ -151,8 +151,7 @@ async fn handle_mux_stream(
     mut stream: Compat<yamux::Stream>,
     state: Arc<SharedState>,
 ) -> Result<()> {
-    let secret = &state.config.cluster_secret;
-    let msg = gossip::recv_message(&mut stream, secret)
+    let msg = gossip::recv_message(&mut stream)
         .await
         .context("recv tunnel request on mux stream")?;
 
@@ -228,7 +227,6 @@ async fn handle_mux_stream(
 /// to drive the yamux connection.
 pub async fn establish_mux_session(
     addr: &str,
-    secret: &str,
     state: &Arc<SharedState>,
 ) -> Result<MuxHandle> {
     let tcp = TcpStream::connect(addr)
@@ -239,8 +237,7 @@ pub async fn establish_mux_session(
 
     let mut stream = state.tls_connect(tcp).await.context("mux TLS connect")?;
 
-    // Send the MuxTunnel handshake via the existing signed message protocol.
-    gossip::send_message(&mut stream, &Message::MuxTunnel {}, secret)
+    gossip::send_message(&mut stream, &Message::MuxTunnel {})
         .await
         .context("send MuxTunnel")?;
 
