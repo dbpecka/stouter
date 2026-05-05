@@ -1,0 +1,23 @@
+{
+  "name": "Stouter: Node Has No Known Peers",
+  "tags": ["stouter", "service-mesh", "critical"],
+  "rule_type_id": ".es-query",
+  "consumer": "alerts",
+  "schedule": {
+    "interval": "1m"
+  },
+  "params": {
+    "index": ["metrics-stouter-*"],
+    "timeField": "@timestamp",
+    "size": 100,
+    "threshold": [1],
+    "thresholdComparator": ">=",
+    "timeWindowSize": 5,
+    "timeWindowUnit": "m",
+    "searchType": "esQuery",
+    "excludeHitsFromPreviousRun": false,
+    "esQuery": "{\"query\":{\"bool\":{\"filter\":[{\"exists\":{\"field\":\"prometheus.metrics.stouter_known_nodes\"}},{\"range\":{\"prometheus.metrics.stouter_known_nodes\":{\"lte\":0}}}]}}}"
+  },
+  "actions": [],
+  "enabled": true
+}
