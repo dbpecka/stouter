@@ -60,6 +60,7 @@ Create a `stouter.json` file:
 | `reverse_pool_size` | Number of idle reverse connections to maintain per relay peer (default 64) |
 | `known_nodes` | Bootstrap peer addresses for initial gossip |
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
+| `apiPort` | Subscribe-mode REST API port on `127.0.0.1` (default 5381). Set per-cluster when running multiple instances on one host. |
 
 ### Modes
 
@@ -253,7 +254,7 @@ All async tasks share a single `Arc<State>` that contains:
 
 ### Subscribe REST API
 
-Subscribe-mode nodes expose a REST API on port `5381`:
+Subscribe-mode nodes expose a REST API on port `5381` by default (override with `apiPort`):
 
 ```
 GET /services          → list all proxied services and their local ports

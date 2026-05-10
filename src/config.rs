@@ -223,6 +223,11 @@ pub struct Config {
     /// query status with any cert signed by the cluster CA.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admin_cns: Vec<String>,
+    /// Port for the subscribe-mode REST API on `127.0.0.1` (default 5381).
+    /// Set this to a unique value when running multiple stouter clusters
+    /// on the same host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -239,6 +244,7 @@ impl Default for Config {
             subscribe_filter: None,
             tls_dir: None,
             admin_cns: Vec::new(),
+            api_port: None,
         }
     }
 }
@@ -325,6 +331,11 @@ impl Config {
     /// Number of idle reverse connections to maintain per relay peer.
     pub fn pool_size(&self) -> usize {
         self.reverse_pool_size.unwrap_or(64) as usize
+    }
+
+    /// Port for the subscribe-mode REST API on `127.0.0.1`.
+    pub fn api_port(&self) -> u16 {
+        self.api_port.unwrap_or(5381)
     }
 }
 

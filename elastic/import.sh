@@ -51,10 +51,14 @@ result=$(kibana_req POST "/api/saved_objects/_import?overwrite=true" \
 if echo "$result" | jq -e '.success == true' >/dev/null 2>&1; then
   count=$(echo "$result" | jq -r '.successCount')
   echo "    OK — imported ${count} objects"
-else
+elif echo "$result" | jq -e 'has("errors")' >/dev/null 2>&1; then
   errors=$(echo "$result" | jq -r '.errors | length')
   echo "    WARN — completed with ${errors} error(s):"
   echo "$result" | jq -r '.errors[] | "      [\(.type)/\(.id)] \(.error.message)"'
+else
+  echo "    ERROR — unexpected response from Kibana:"
+  echo "$result" | sed 's/^/      /'
+  exit 1
 fi
 echo ""
 

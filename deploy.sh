@@ -4,17 +4,21 @@ set -euo pipefail
 debug() { echo "  [DEBUG] $*"; }
 
 usage() {
-  echo "Usage: ./deploy.sh [-c config_file] [-r] user@host"
+  echo "Usage: ./deploy.sh [-c config_file] [-n cluster] [-r] user@host"
   echo "  -c  config file to upload"
+  echo "  -n  cluster name (default: 'default'). Lets multiple stouter clusters"
+  echo "      coexist on one host with separate container, config, and build dir."
   echo "  -r  restart only (skip build, just update config and restart container)"
   exit 1
 }
 
 CONFIG_FILE=""
 RESTART_ONLY=false
-while getopts "c:r" opt; do
+CLUSTER="default"
+while getopts "c:n:r" opt; do
   case $opt in
     c) CONFIG_FILE="$OPTARG" ;;
+    n) CLUSTER="$OPTARG" ;;
     r) RESTART_ONLY=true ;;
     *) usage ;;
   esac
@@ -22,10 +26,19 @@ done
 shift $((OPTIND - 1))
 
 REMOTE_HOST="${1:?$(usage)}"
-REMOTE_DIR="/srv/stouter"
-CONTAINER_NAME="stouter"
+if [[ "$CLUSTER" == "default" ]]; then
+  REMOTE_DIR="/srv/stouter"
+  CONTAINER_NAME="stouter"
+else
+  REMOTE_DIR="/srv/stouter/$CLUSTER"
+  CONTAINER_NAME="stouter-$CLUSTER"
+fi
+IMAGE_TAG="stouter:latest"
 
 debug "REMOTE_HOST=$REMOTE_HOST"
+debug "CLUSTER=$CLUSTER"
+debug "REMOTE_DIR=$REMOTE_DIR"
+debug "CONTAINER_NAME=$CONTAINER_NAME"
 debug "CONFIG_FILE=${CONFIG_FILE:-<none>}"
 debug "RESTART_ONLY=$RESTART_ONLY"
 
@@ -103,7 +116,7 @@ ssh "$REMOTE_HOST" "
 " 2>&1 | grep -v '^\[sudo\]'
 
 echo "==> Deployed. Checking status..."
-CONTAINER_STATUS=$(ssh "$REMOTE_HOST" "$SUDO docker ps --filter name=$CONTAINER_NAME --format '{{.Status}}'" 2>&1 | grep -v '^\[sudo\]')
+CONTAINER_STATUS=$(ssh "$REMOTE_HOST" "$SUDO docker ps --filter name=^${CONTAINER_NAME}\$ --format '{{.Status}}'" 2>&1 | grep -v '^\[sudo\]')
 echo "$CONTAINER_STATUS"
 debug "Container status: ${CONTAINER_STATUS:-<not running>}"
 debug "Deploy finished at $(date '+%Y-%m-%d %H:%M:%S')"

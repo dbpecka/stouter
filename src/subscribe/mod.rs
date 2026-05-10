@@ -43,8 +43,9 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
 
     let api_ports = service_ports.clone();
     let api_state = state.clone();
+    let api_port = state.config.api_port();
     tokio::spawn(async move {
-        if let Err(e) = api::run_api(api_ports, api_state, metrics_handle, 5381).await {
+        if let Err(e) = api::run_api(api_ports, api_state, metrics_handle, api_port).await {
             tracing::error!("REST API server exited: {e}");
         }
     });
