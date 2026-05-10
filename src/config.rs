@@ -337,6 +337,26 @@ impl Config {
     pub fn api_port(&self) -> u16 {
         self.api_port.unwrap_or(5381)
     }
+
+    /// Connect target for querying *this* daemon from the local host.
+    ///
+    /// Wildcard bind addresses (`0.0.0.0`, `[::]`) are not valid connect
+    /// targets — they're rewritten to the matching loopback so a local CLI
+    /// (e.g. `stouter status`) can reach a daemon that binds on all
+    /// interfaces.
+    pub fn local_target(&self) -> String {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        match self.bind.parse::<SocketAddr>() {
+            Ok(addr) if addr.ip().is_unspecified() => {
+                let loopback = match addr.ip() {
+                    IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                };
+                SocketAddr::new(loopback, addr.port()).to_string()
+            }
+            _ => self.bind.clone(),
+        }
+    }
 }
 
 /// Retrieve the system hostname via syscall, falling back to `"unknown"` on error.
@@ -635,6 +655,30 @@ mod tests {
         assert!(json.contains("\"adminCns\":[\"admin-cli\"]"));
         let restored: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.admin_cns, vec!["admin-cli".to_string()]);
+    }
+
+    #[test]
+    fn local_target_rewrites_wildcard_v4() {
+        let cfg = Config { bind: "0.0.0.0:60001".into(), ..Config::default() };
+        assert_eq!(cfg.local_target(), "127.0.0.1:60001");
+    }
+
+    #[test]
+    fn local_target_rewrites_wildcard_v6() {
+        let cfg = Config { bind: "[::]:60001".into(), ..Config::default() };
+        assert_eq!(cfg.local_target(), "[::1]:60001");
+    }
+
+    #[test]
+    fn local_target_preserves_specific_address() {
+        let cfg = Config { bind: "10.0.0.5:60001".into(), ..Config::default() };
+        assert_eq!(cfg.local_target(), "10.0.0.5:60001");
+    }
+
+    #[test]
+    fn local_target_preserves_unparseable_bind() {
+        let cfg = Config { bind: "myhost:60001".into(), ..Config::default() };
+        assert_eq!(cfg.local_target(), "myhost:60001");
     }
 
     #[test]

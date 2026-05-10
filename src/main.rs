@@ -222,7 +222,7 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         Some(Commands::Status { remote }) => {
             let cfg = Config::load(&cli.config).unwrap_or_default();
-            let target = remote.clone().unwrap_or_else(|| cfg.bind.clone());
+            let target = remote.clone().unwrap_or_else(|| cfg.local_target());
 
             match tokio::net::TcpStream::connect(&target).await {
                 Err(_) => {
