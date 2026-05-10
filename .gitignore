@@ -2,4 +2,8 @@
 .idea/
 /target/
 .claude/
-
+tlsDir/
+*.pem
+*.key
+*.crt
+.env*
