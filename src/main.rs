@@ -152,6 +152,20 @@ enum ServiceAction {
         #[arg(long)]
         remote: Option<String>,
     },
+    /// Remove a service from a node
+    Remove {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        name: String,
+        /// Node ID the service is registered on (defaults to this node)
+        #[arg(long)]
+        node: Option<String>,
+        /// Address `host:port` of a remote daemon to mutate via admin RPC.
+        /// When set, no local config file is read or written.
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -433,6 +447,66 @@ async fn main() -> Result<()> {
                 println!(
                     "Service '{}' renamed to '{}' in group '{}' (version {})",
                     from, to, group_name, version
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // service remove
+        // -----------------------------------------------------------------
+        Some(Commands::Service {
+            action:
+                ServiceAction::Remove {
+                    group: group_name,
+                    name,
+                    node,
+                    remote,
+                },
+        }) => {
+            if let Some(target) = remote {
+                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let version = run_admin_rpc(
+                    &target,
+                    AdminOp::ServiceRemove {
+                        group: group_name.clone(),
+                        owner_node_id,
+                        name: name.clone(),
+                    },
+                    &cfg,
+                    cli.cert_dir.as_deref(),
+                )
+                .await?;
+                println!(
+                    "Service '{}' removed from group '{}' on {} (version {})",
+                    name, group_name, target, version
+                );
+            } else {
+                let mut cfg = Config::load(&cli.config)?;
+                let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+
+                let version = cfg
+                    .dynamic_config
+                    .remove_service(&group_name, &node_id, &name)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                cfg.save(&cli.config)?;
+
+                let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
+                    let material = pki::load_or_create(dir, &cfg.node_id)?;
+                    Some(tls::TlsContext::new(&material)?)
+                } else {
+                    None
+                };
+                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
+                gossip::broadcast_message(
+                    &state,
+                    Message::ConfigUpdate { config: cfg.dynamic_config.clone() },
+                )
+                .await;
+
+                println!(
+                    "Service '{}' removed from group '{}' (version {})",
+                    name, group_name, version
                 );
             }
         }
