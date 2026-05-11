@@ -221,6 +221,9 @@ async fn handle_admin_request(
             AdminOp::ServiceRename { group, owner_node_id, from, to } => {
                 dc.rename_service(&group, &owner_node_id, &from, &to)
             }
+            AdminOp::ServiceRemove { group, owner_node_id, name } => {
+                dc.remove_service(&group, &owner_node_id, &name)
+            }
         };
         match result {
             Ok(new_version) => {

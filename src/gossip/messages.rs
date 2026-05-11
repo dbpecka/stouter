@@ -66,6 +66,11 @@ pub enum AdminOp {
         from: String,
         to: String,
     },
+    ServiceRemove {
+        group: String,
+        owner_node_id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -265,6 +270,27 @@ mod tests {
                 assert_eq!(owner_node_id, "n1");
                 assert_eq!(from, "api");
                 assert_eq!(to, "api2");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_request_service_remove_round_trip() {
+        let msg = Message::AdminRequest {
+            op: AdminOp::ServiceRemove {
+                group: "web".into(),
+                owner_node_id: "n1".into(),
+                name: "api".into(),
+            },
+        };
+        match msgpack_round_trip(&msg) {
+            Message::AdminRequest {
+                op: AdminOp::ServiceRemove { group, owner_node_id, name },
+            } => {
+                assert_eq!(group, "web");
+                assert_eq!(owner_node_id, "n1");
+                assert_eq!(name, "api");
             }
             other => panic!("wrong variant: {other:?}"),
         }

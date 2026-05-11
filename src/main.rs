@@ -102,6 +102,41 @@ enum ServiceAction {
         #[arg(long)]
         remote: Option<String>,
     },
+    /// Move a service from one cluster to another. Both `--from` and `--to`
+    /// must point at remote daemons (one in each cluster). The service's
+    /// port and domains are copied verbatim from the source.
+    Move {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        name: String,
+        /// Owner node ID in the source cluster (defaults to this node)
+        #[arg(long)]
+        node: Option<String>,
+        /// Destination group name (defaults to `--group`)
+        #[arg(long = "to-group")]
+        to_group: Option<String>,
+        /// Owner node ID in the destination cluster (defaults to `--node`)
+        #[arg(long = "to-node")]
+        to_node: Option<String>,
+        /// Address `host:port` of a daemon in the source cluster.
+        #[arg(long)]
+        from: String,
+        /// Address `host:port` of a daemon in the destination cluster.
+        #[arg(long)]
+        to: String,
+        /// Cert directory (ca.crt + node.crt + node.key) trusted by the
+        /// source cluster. Falls back to the global `--cert-dir`, then to
+        /// the local config's `tlsDir`. The leaf's CN must be in the
+        /// source cluster's `adminCns`.
+        #[arg(long = "from-cert-dir")]
+        from_cert_dir: Option<String>,
+        /// Cert directory trusted by the destination cluster. Same
+        /// fallback rules as `--from-cert-dir`. The leaf's CN must be in
+        /// the destination cluster's `adminCns`.
+        #[arg(long = "to-cert-dir")]
+        to_cert_dir: Option<String>,
+    },
     /// Rename a service within a group
     Rename {
         #[arg(long)]
@@ -319,16 +354,7 @@ async fn main() -> Result<()> {
         }) => {
             let dc = if let Some(target) = remote {
                 let cfg = Config::load(&cli.config).unwrap_or_default();
-                let tls_ctx = build_cli_tls(&cfg, cli.cert_dir.as_deref())?;
-                let tcp = tokio::net::TcpStream::connect(&target)
-                    .await
-                    .with_context(|| format!("connect to {target}"))?;
-                let mut stream = tls_ctx.connect(tcp).await?;
-                gossip::send_message(&mut stream, &Message::StatusRequest).await?;
-                match gossip::recv_message(&mut stream).await? {
-                    Message::StatusResponse { dynamic_config, .. } => dynamic_config,
-                    _ => anyhow::bail!("unexpected response from daemon"),
-                }
+                fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?
             } else {
                 let cfg = Config::load(&cli.config)?;
                 cfg.dynamic_config
@@ -412,6 +438,131 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
+        // service move (cross-cluster)
+        // -----------------------------------------------------------------
+        Some(Commands::Service {
+            action:
+                ServiceAction::Move {
+                    group: group_name,
+                    name,
+                    node,
+                    to_group,
+                    to_node,
+                    from,
+                    to,
+                    from_cert_dir,
+                    to_cert_dir,
+                },
+        }) => {
+            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+            let dest_group = to_group.unwrap_or_else(|| group_name.clone());
+            let dest_node = to_node.unwrap_or_else(|| owner_node_id.clone());
+
+            // Each cluster has its own CA, so each side needs its own cert
+            // dir. Fall back through: per-side flag → global --cert-dir →
+            // local tlsDir.
+            let from_certs = from_cert_dir.as_deref().or(cli.cert_dir.as_deref());
+            let to_certs = to_cert_dir.as_deref().or(cli.cert_dir.as_deref());
+
+            // 1. Read the service from the source cluster.
+            let src_dc =
+                fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
+            let (port, domains) = src_dc
+                .service_groups
+                .iter()
+                .find(|g| g.name == group_name)
+                .and_then(|g| {
+                    g.services
+                        .iter()
+                        .find(|s| s.name == name && s.node_id == owner_node_id)
+                })
+                .map(|s| (s.node_port, s.domains.clone()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "service '{}' on node '{}' not found in group '{}' on {}",
+                        name,
+                        owner_node_id,
+                        group_name,
+                        from
+                    )
+                })?;
+
+            // 2. Add to the destination cluster.
+            let add_version = match try_admin_rpc(
+                &to,
+                AdminOp::ServiceAdd {
+                    group: dest_group.clone(),
+                    name: name.clone(),
+                    owner_node_id: dest_node.clone(),
+                    port,
+                    domains: domains.clone(),
+                },
+                &cfg,
+                to_certs,
+            )
+            .await?
+            {
+                Ok(v) => v,
+                Err((_, msg)) => anyhow::bail!("add to {to} failed: {msg}"),
+            };
+
+            // 3. Remove from the source cluster. If this fails, roll back
+            //    the add so we don't end up with the service in both
+            //    clusters.
+            let remove_result = try_admin_rpc(
+                &from,
+                AdminOp::ServiceRemove {
+                    group: group_name.clone(),
+                    owner_node_id: owner_node_id.clone(),
+                    name: name.clone(),
+                },
+                &cfg,
+                from_certs,
+            )
+            .await;
+
+            match remove_result {
+                Ok(Ok(remove_version)) => {
+                    println!(
+                        "Moved '{}/{}' from {} (v{}) to {} (v{})",
+                        group_name, name, from, remove_version, to, add_version
+                    );
+                }
+                outcome => {
+                    eprintln!(
+                        "remove from {from} failed; rolling back add on {to}"
+                    );
+                    let rollback = try_admin_rpc(
+                        &to,
+                        AdminOp::ServiceRemove {
+                            group: dest_group,
+                            owner_node_id: dest_node,
+                            name: name.clone(),
+                        },
+                        &cfg,
+                        to_certs,
+                    )
+                    .await;
+                    if let Err(e) = rollback {
+                        eprintln!(
+                            "rollback failed: service '{name}' may now exist in both clusters: {e:#}"
+                        );
+                    } else if let Ok(Err((_, msg))) = rollback {
+                        eprintln!(
+                            "rollback failed: service '{name}' may now exist in both clusters: {msg}"
+                        );
+                    }
+                    match outcome {
+                        Ok(Err((_, msg))) => anyhow::bail!("move failed: {msg}"),
+                        Err(e) => return Err(e.context("move failed")),
+                        Ok(Ok(_)) => unreachable!(),
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
         // cert issue
         // -----------------------------------------------------------------
         Some(Commands::Cert {
@@ -471,14 +622,14 @@ fn build_cli_tls(cfg: &Config, cert_dir: Option<&str>) -> Result<tls::TlsContext
 }
 
 /// Send a single `AdminRequest` to `target` and decode the response.
-/// On `AdminResult::Err`, exits the process with a code derived from
-/// `AdminErrCode` so callers don't need to handle it.
-async fn run_admin_rpc(
+/// Returns the typed admin result; transport-level failures bubble up as
+/// `anyhow::Error`.
+async fn try_admin_rpc(
     target: &str,
     op: AdminOp,
     cfg: &Config,
     cert_dir: Option<&str>,
-) -> Result<u64> {
+) -> Result<std::result::Result<u64, (AdminErrCode, String)>> {
     let tls_ctx = build_cli_tls(cfg, cert_dir)?;
     let tcp = tokio::net::TcpStream::connect(target)
         .await
@@ -487,8 +638,26 @@ async fn run_admin_rpc(
 
     gossip::send_message(&mut stream, &Message::AdminRequest { op }).await?;
     match gossip::recv_message(&mut stream).await? {
-        Message::AdminResponse { result: AdminResult::Ok { new_version } } => Ok(new_version),
+        Message::AdminResponse { result: AdminResult::Ok { new_version } } => Ok(Ok(new_version)),
         Message::AdminResponse { result: AdminResult::Err { code, message } } => {
+            Ok(Err((code, message)))
+        }
+        _ => anyhow::bail!("unexpected response from daemon"),
+    }
+}
+
+/// Like `try_admin_rpc`, but on `AdminResult::Err` exits the process with a
+/// code derived from `AdminErrCode` so single-step callers don't need to
+/// handle it.
+async fn run_admin_rpc(
+    target: &str,
+    op: AdminOp,
+    cfg: &Config,
+    cert_dir: Option<&str>,
+) -> Result<u64> {
+    match try_admin_rpc(target, op, cfg, cert_dir).await? {
+        Ok(new_version) => Ok(new_version),
+        Err((code, message)) => {
             eprintln!("error: {message}");
             let exit_code = match code {
                 AdminErrCode::Unauthorized => 3,
@@ -497,7 +666,24 @@ async fn run_admin_rpc(
             };
             std::process::exit(exit_code);
         }
-        _ => anyhow::bail!("unexpected response from daemon"),
+    }
+}
+
+/// Fetch the `DynamicConfig` from a remote daemon via `StatusRequest`.
+async fn fetch_remote_dynamic_config(
+    target: &str,
+    cfg: &Config,
+    cert_dir: Option<&str>,
+) -> Result<config::DynamicConfig> {
+    let tls_ctx = build_cli_tls(cfg, cert_dir)?;
+    let tcp = tokio::net::TcpStream::connect(target)
+        .await
+        .with_context(|| format!("connect to {target}"))?;
+    let mut stream = tls_ctx.connect(tcp).await?;
+    gossip::send_message(&mut stream, &Message::StatusRequest).await?;
+    match gossip::recv_message(&mut stream).await? {
+        Message::StatusResponse { dynamic_config, .. } => Ok(dynamic_config),
+        _ => anyhow::bail!("unexpected response from {target}"),
     }
 }
 

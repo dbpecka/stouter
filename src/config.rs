@@ -135,6 +135,35 @@ impl DynamicConfig {
         self.version
     }
 
+    /// Remove the service identified by `(group, owner_node_id, name)`.
+    /// Bumps `version` on success and returns the new version.
+    pub fn remove_service(
+        &mut self,
+        group: &str,
+        owner_node_id: &str,
+        name: &str,
+    ) -> Result<u64, MutateErr> {
+        let g = self
+            .service_groups
+            .iter_mut()
+            .find(|g| g.name == group)
+            .ok_or_else(|| MutateErr::GroupNotFound { group: group.to_string() })?;
+
+        let before = g.services.len();
+        g.services
+            .retain(|s| !(s.name == name && s.node_id == owner_node_id));
+        if g.services.len() == before {
+            return Err(MutateErr::ServiceNotFound {
+                group: group.to_string(),
+                node: owner_node_id.to_string(),
+                name: name.to_string(),
+            });
+        }
+
+        self.version += 1;
+        Ok(self.version)
+    }
+
     /// Rename the service identified by `(group, owner_node_id, from)` to
     /// `to`. Bumps `version` on success and returns the new version.
     pub fn rename_service(
@@ -597,6 +626,52 @@ mod tests {
             Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![] },
         );
         assert_eq!(dc.service_groups[0].services.len(), 2);
+    }
+
+    #[test]
+    fn remove_service_success_bumps_version() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        let v = dc.remove_service("web", "n1", "api").unwrap();
+        assert_eq!(v, 2);
+        assert!(dc.service_groups[0].services.is_empty());
+    }
+
+    #[test]
+    fn remove_service_missing_group_returns_err() {
+        let mut dc = DynamicConfig::default();
+        let err = dc.remove_service("nope", "n1", "api").unwrap_err();
+        assert!(matches!(err, MutateErr::GroupNotFound { .. }));
+    }
+
+    #[test]
+    fn remove_service_missing_service_returns_err() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        let err = dc.remove_service("web", "n1", "api").unwrap_err();
+        assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
+    }
+
+    #[test]
+    fn remove_service_leaves_other_services_alone() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+        );
+        dc.upsert_service(
+            "web",
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![] },
+        );
+        dc.remove_service("web", "n1", "api").unwrap();
+        assert_eq!(dc.service_groups[0].services.len(), 1);
+        assert_eq!(dc.service_groups[0].services[0].node_id, "n2");
     }
 
     #[test]
