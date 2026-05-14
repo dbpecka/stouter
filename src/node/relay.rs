@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -55,6 +55,9 @@ pub async fn handle_reverse_registration(
             .update_known_nodes(|kn| {
                 if let Some(node) = kn.get_mut(&nid) {
                     node.relay = Some(our_addr);
+                    // A reverse registration is direct contact with the NAT'd
+                    // node, so it counts as a liveness signal.
+                    node.last_seen = Some(Instant::now());
                 } else {
                     kn.insert(
                         nid.clone(),
@@ -62,6 +65,7 @@ pub async fn handle_reverse_registration(
                             id: nid,
                             addr: String::new(),
                             relay: Some(our_addr),
+                            last_seen: Some(Instant::now()),
                         },
                     );
                 }

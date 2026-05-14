@@ -1,7 +1,7 @@
 pub mod messages;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -148,7 +148,11 @@ async fn handle_gossip_message(mut stream: MeshStream, peer_addr: String, msg: M
             if !peer_addr.is_empty() {
                 fix_unroutable_addrs(&mut nodes, &peer_addr);
             }
-            merge_sync(&state, config, nodes).await;
+            // No `contact_addr`: an inbound connection arrives from an
+            // ephemeral source port, which won't match the peer's advertised
+            // address, so it can't be used as a liveness signal here. The
+            // outbound sync loop confirms every peer independently.
+            merge_sync(&state, config, nodes, None).await;
 
             // Reply with our current state.
             let reply = build_sync_msg(&state).await;
@@ -402,7 +406,9 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
     let reply = recv_message(&mut stream).await?;
     if let Message::Sync { config, mut nodes } = reply {
         fix_unroutable_addrs(&mut nodes, addr);
-        merge_sync(state, config, nodes).await;
+        // A successful outbound sync is direct evidence the peer at `addr` is
+        // reachable, so pass it as the liveness `contact_addr`.
+        merge_sync(state, config, nodes, Some(addr)).await;
     }
     Ok(())
 }
@@ -505,7 +511,16 @@ fn is_valid_node_id(id: &str) -> bool {
 }
 
 /// Merge an incoming Sync payload into local state.
-async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConfig, nodes: Vec<NodeInfo>) {
+///
+/// `contact_addr` is the address of the peer we are in direct contact with,
+/// when known (i.e. an outbound sync we initiated). The node matching that
+/// address has its `last_seen` liveness marker refreshed.
+async fn merge_sync(
+    state: &Arc<SharedState>,
+    config: crate::config::DynamicConfig,
+    nodes: Vec<NodeInfo>,
+    contact_addr: Option<&str>,
+) {
     let updated = {
         let mut dc = state.dynamic_config.write().await;
         if config.version > dc.version {
@@ -528,7 +543,7 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
 
     let nodes_changed = state.update_known_nodes(|kn| {
         let mut changed = false;
-        for node in nodes {
+        for mut node in nodes {
             if !is_valid_node_id(&node.id) {
                 debug!("ignoring node with invalid id: {:?}", node.id);
                 continue;
@@ -552,8 +567,19 @@ async fn merge_sync(state: &Arc<SharedState>, config: crate::config::DynamicConf
                 }
             } else {
                 info!("discovered new node: {} @ {}", node.id, node.addr);
+                // Give a freshly discovered node an initial liveness grace
+                // period; the sync loop will confirm or expire it shortly.
+                node.last_seen = Some(Instant::now());
                 kn.insert(node.id.clone(), node);
                 changed = true;
+            }
+        }
+        // Refresh the liveness marker for the peer we just synced with directly.
+        if let Some(addr) = contact_addr {
+            for node in kn.values_mut() {
+                if !node.addr.is_empty() && node.addr == addr {
+                    node.last_seen = Some(Instant::now());
+                }
             }
         }
         changed
@@ -603,7 +629,15 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
                     }
                 } else {
                     info!("node joined: {id} @ {addr}");
-                    kn.insert(id.clone(), NodeInfo { id, addr, relay: None });
+                    kn.insert(
+                        id.clone(),
+                        NodeInfo {
+                            id,
+                            addr,
+                            relay: None,
+                            last_seen: Some(Instant::now()),
+                        },
+                    );
                     true
                 }
             }).await;
@@ -619,7 +653,7 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
             }).await;
         }
         Message::Sync { config, nodes } => {
-            merge_sync(state, config, nodes).await;
+            merge_sync(state, config, nodes, None).await;
         }
         _ => {}
     }
@@ -665,6 +699,7 @@ async fn build_sync_msg(state: &Arc<SharedState>) -> Message {
                 id: state.config.node_id.clone(),
                 addr: self_addr,
                 relay: None,
+                last_seen: None,
             });
         }
     }

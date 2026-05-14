@@ -153,7 +153,12 @@ mod tests {
     fn sync_round_trip() {
         let msg = Message::Sync {
             config: DynamicConfig { version: 1, service_groups: vec![] },
-            nodes: vec![NodeInfo { id: "n1".into(), addr: "10.0.0.1:8080".into(), relay: None }],
+            nodes: vec![NodeInfo {
+                id: "n1".into(),
+                addr: "10.0.0.1:8080".into(),
+                relay: None,
+                last_seen: None,
+            }],
         };
         match msgpack_round_trip(&msg) {
             Message::Sync { config, nodes } => {
