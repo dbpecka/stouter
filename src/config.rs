@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -215,6 +216,12 @@ pub struct NodeInfo {
     /// If set, this node is behind NAT and reachable only via this relay address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    /// Local-only liveness marker: when this node was last confirmed reachable
+    /// (a successful outbound gossip sync, or a reverse-connection
+    /// registration). Never gossiped or persisted — each daemon maintains it
+    /// independently. `None` means not yet confirmed.
+    #[serde(skip)]
+    pub last_seen: Option<Instant>,
 }
 
 /// Top-level on-disk configuration for a stouter instance.
