@@ -39,13 +39,13 @@ Create a `stouter.json` file:
   "bind": "0.0.0.0:8080",
   "advertiseAddr": "1.2.3.4:8080",
   "nodeId": "host1",
-  "outbound_only": false,
-  "reverse_pool_size": 64,
-  "known_nodes": ["peer1.example.com:8080", "peer2.example.com:8080"],
+  "outboundOnly": false,
+  "reversePoolSize": 64,
+  "knownNodes": ["peer1.example.com:8080", "peer2.example.com:8080"],
   "tlsDir": "/etc/stouter/tls",
   "dynamicConfig": {
     "version": 1,
-    "service_groups": []
+    "serviceGroups": []
   }
 }
 ```
@@ -56,10 +56,11 @@ Create a `stouter.json` file:
 | `bind` | Address to listen on |
 | `advertiseAddr` | Address peers use to reach this node |
 | `nodeId` | Unique identifier for this node |
-| `outbound_only` | Set `true` for nodes behind NAT — disables listener, uses reverse connections |
-| `reverse_pool_size` | Number of idle reverse connections to maintain per relay peer (default 64) |
-| `known_nodes` | Bootstrap peer addresses for initial gossip |
+| `outboundOnly` | Set `true` for nodes behind NAT — disables listener, uses reverse connections |
+| `reversePoolSize` | Number of idle reverse connections to maintain per relay peer (default 64) |
+| `knownNodes` | Bootstrap peer addresses for initial gossip |
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
+| `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default) disables admin RPC |
 | `apiPort` | Subscribe-mode REST API port on `127.0.0.1` (default 5381). Set per-cluster when running multiple instances on one host. |
 
 ### Modes
@@ -100,14 +101,14 @@ Services are organized into groups. Each service entry maps a name to a local po
 {
   "dynamicConfig": {
     "version": 1,
-    "service_groups": [
+    "serviceGroups": [
       {
         "name": "web",
         "services": [
           {
             "name": "api",
-            "node_id": "host1",
-            "node_port": 3000,
+            "nodeId": "host1",
+            "nodePort": 3000,
             "domains": ["api.example.com"]
           }
         ]
@@ -122,7 +123,7 @@ Subscribe nodes can filter which service groups they proxy:
 ```json
 {
   "subscribeFilter": {
-    "service_groups": ["web"],
+    "serviceGroups": ["web"],
     "services": []
   }
 }
@@ -212,7 +213,7 @@ When a subscribe proxy needs to reach service `api` on node `host2`:
 
 ### NAT Traversal via Reverse Connections
 
-Nodes with `outbound_only: true` cannot accept inbound connections. Instead, they maintain a pool of outbound connections to every reachable relay peer:
+Nodes with `"outboundOnly": true` cannot accept inbound connections. Instead, they maintain a pool of outbound connections to every reachable relay peer:
 
 ```
 NAT'd node                  Relay node
@@ -224,7 +225,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reverse_pool_size` idle connections per relay peer at all times.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay peer at all times.
 
 ### Multiplexing (Yamux)
 
