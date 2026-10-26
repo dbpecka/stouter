@@ -86,6 +86,9 @@ stouter status
 # Register a service
 stouter service add --group web --name api --port 3000 --domains api.example.com
 
+# Give host1's instance of api 9x the connections of others (e.g. a 90/10 canary split)
+stouter service add --group web --name api --port 3000 --node host1 --weight 9
+
 # List all services in the cluster
 stouter service list
 
@@ -117,6 +120,12 @@ Services are organized into groups. Each service entry maps a name to a local po
   }
 }
 ```
+
+When the same service name is registered on several nodes, subscribers spread
+connections across them. An optional `weight` (default `1`) sets each
+instance's relative share, e.g. `9` and `1` for a 90/10 canary split. A weight
+of `0` drains an instance: it gets no new connections unless every instance is
+drained.
 
 Subscribe nodes can filter which service groups they proxy:
 
@@ -200,8 +209,10 @@ All gossip messages are MessagePack-encoded with a 4-byte big-endian length pref
 
 When a subscribe proxy needs to reach service `api` on node `host2`:
 
-1. Look up all nodes hosting `api` in the service index.
-2. Select a node via round-robin.
+1. Look up all nodes hosting `api` in the service index, dropping nodes whose
+   gossip liveness is stale.
+2. Select a node by smooth weighted round-robin, skipping drained (weight `0`)
+   and ejected nodes.
 3. Acquire a connection (in priority order):
    - **Mux session** — open a new yamux stream on an existing multiplexed connection (fastest)
    - **Reverse pool** — take an idle reverse connection (for NAT'd target nodes)
@@ -210,6 +221,14 @@ When a subscribe proxy needs to reach service `api` on node `host2`:
 4. Send a `TunnelRequest{node_id, service_name, timestamp_ms}`.
 5. Read a status byte: `0x00` = success.
 6. Proxy bytes bidirectionally between the local client and the remote service.
+
+If steps 3–5 fail, the client connection is untouched, so the proxy retries on
+another node (up to 3 distinct nodes). A node whose tunnel setup fails 3 times
+in a row (unreachable, or its backend refuses connections) is **ejected**: it
+is left out of rotation for 10s, doubling on each repeat ejection up to 2
+minutes, and a successful tunnel resets it. Every filter fails open: if it would
+exclude all nodes, it is ignored. Ejections are counted in
+`stouter_outlier_ejections_total{service,node_id}`.
 
 ### NAT Traversal via Reverse Connections
 

@@ -59,6 +59,8 @@ pub enum AdminOp {
         port: u16,
         #[serde(default)]
         domains: Vec<String>,
+        #[serde(default = "crate::config::default_weight")]
+        weight: u32,
     },
     ServiceRename {
         group: String,
@@ -94,10 +96,116 @@ mod tests {
     use super::*;
     use crate::config::{DynamicConfig, NodeInfo, Service, ServiceGroup};
 
-    /// Helper: round-trip a Message through MessagePack serialization.
+    /// Helper: round-trip a Message through the gossip wire encoding.
     fn msgpack_round_trip(msg: &Message) -> Message {
-        let bytes = rmp_serde::to_vec(msg).expect("serialize");
+        let bytes = crate::gossip::encode_message(msg).expect("serialize");
         rmp_serde::from_slice(&bytes).expect("deserialize")
+    }
+
+    /// `Service` as it was before `weight` existed, for wire-compat tests.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OldService {
+        name: String,
+        node_id: String,
+        node_port: u16,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        domains: Vec<String>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OldServiceGroup {
+        name: String,
+        services: Vec<OldService>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OldDynamicConfig {
+        version: u64,
+        service_groups: Vec<OldServiceGroup>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    enum OldMessage {
+        ConfigUpdate { config: OldDynamicConfig },
+    }
+
+    fn weighted_config_update() -> Message {
+        Message::ConfigUpdate {
+            config: DynamicConfig {
+                version: 7,
+                service_groups: vec![ServiceGroup {
+                    name: "web".into(),
+                    services: vec![Service {
+                        name: "api".into(),
+                        node_id: "host1".into(),
+                        node_port: 3000,
+                        domains: Vec::new(),
+                        weight: 4,
+                    }],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn weight_survives_round_trip_with_empty_domains() {
+        match msgpack_round_trip(&weighted_config_update()) {
+            Message::ConfigUpdate { config } => {
+                let svc = &config.service_groups[0].services[0];
+                assert!(svc.domains.is_empty());
+                assert_eq!(svc.weight, 4);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn old_reader_accepts_new_message() {
+        let bytes = crate::gossip::encode_message(&weighted_config_update()).unwrap();
+        let OldMessage::ConfigUpdate { config } =
+            rmp_serde::from_slice(&bytes).expect("old reader decodes new message");
+        assert_eq!(config.version, 7);
+        assert_eq!(config.service_groups[0].services[0].node_port, 3000);
+    }
+
+    #[test]
+    fn new_reader_accepts_old_positional_message() {
+        // Old senders used positional (array) struct encoding.
+        let old = OldMessage::ConfigUpdate {
+            config: OldDynamicConfig {
+                version: 3,
+                service_groups: vec![OldServiceGroup {
+                    name: "web".into(),
+                    services: vec![OldService {
+                        name: "api".into(),
+                        node_id: "host1".into(),
+                        node_port: 3000,
+                        domains: Vec::new(),
+                    }],
+                }],
+            },
+        };
+        let bytes = rmp_serde::to_vec(&old).unwrap();
+        match rmp_serde::from_slice::<Message>(&bytes).expect("new reader decodes old message") {
+            Message::ConfigUpdate { config } => {
+                let svc = &config.service_groups[0].services[0];
+                assert_eq!(svc.node_port, 3000);
+                assert_eq!(svc.weight, crate::config::DEFAULT_WEIGHT);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn positional_encoding_breaks_old_readers() {
+        // Documents why `encode_message` uses named encoding: a positional
+        // `Service` with an extra trailing field is rejected by old readers.
+        let bytes = rmp_serde::to_vec(&weighted_config_update()).unwrap();
+        assert!(rmp_serde::from_slice::<OldMessage>(&bytes).is_err());
     }
 
     #[test]
@@ -136,6 +244,7 @@ mod tests {
                         node_id: "host1".into(),
                         node_port: 3000,
                         domains: Vec::new(),
+                        weight: 1,
                     }],
                 }],
             },
@@ -241,17 +350,19 @@ mod tests {
                 owner_node_id: "n1".into(),
                 port: 3000,
                 domains: vec!["api.example.com".into()],
+                weight: 5,
             },
         };
         match msgpack_round_trip(&msg) {
             Message::AdminRequest {
-                op: AdminOp::ServiceAdd { group, name, owner_node_id, port, domains },
+                op: AdminOp::ServiceAdd { group, name, owner_node_id, port, domains, weight },
             } => {
                 assert_eq!(group, "web");
                 assert_eq!(name, "api");
                 assert_eq!(owner_node_id, "n1");
                 assert_eq!(port, 3000);
                 assert_eq!(domains, vec!["api.example.com"]);
+                assert_eq!(weight, 5);
             }
             other => panic!("wrong variant: {other:?}"),
         }

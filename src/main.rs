@@ -87,6 +87,10 @@ enum ServiceAction {
         /// Comma-separated list of domains to route to this service
         #[arg(long, value_delimiter = ',')]
         domains: Vec<String>,
+        /// Relative share of connections this instance receives among all
+        /// instances of the service. `0` drains it.
+        #[arg(long, default_value_t = config::DEFAULT_WEIGHT)]
+        weight: u32,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -304,6 +308,7 @@ async fn main() -> Result<()> {
                     name,
                     port,
                     domains,
+                    weight,
                     node,
                     remote,
                 },
@@ -319,6 +324,7 @@ async fn main() -> Result<()> {
                         owner_node_id,
                         port,
                         domains: domains.clone(),
+                        weight,
                     },
                     &cfg,
                     cli.cert_dir.as_deref(),
@@ -336,6 +342,7 @@ async fn main() -> Result<()> {
                     node_id,
                     node_port: port,
                     domains: domains.clone(),
+                    weight,
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -378,8 +385,8 @@ async fn main() -> Result<()> {
             for group in &dc.service_groups {
                 for svc in &group.services {
                     println!(
-                        "{}/{} -> node={} port={}",
-                        group.name, svc.name, svc.node_id, svc.node_port
+                        "{}/{} -> node={} port={} weight={}",
+                        group.name, svc.name, svc.node_id, svc.node_port, svc.weight
                     );
                     found = true;
                 }
@@ -542,7 +549,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains) = src_dc
+            let (port, domains, weight) = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -551,7 +558,7 @@ async fn main() -> Result<()> {
                         .iter()
                         .find(|s| s.name == name && s.node_id == owner_node_id)
                 })
-                .map(|s| (s.node_port, s.domains.clone()))
+                .map(|s| (s.node_port, s.domains.clone(), s.weight))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "service '{}' on node '{}' not found in group '{}' on {}",
@@ -571,6 +578,7 @@ async fn main() -> Result<()> {
                     owner_node_id: dest_node.clone(),
                     port,
                     domains: domains.clone(),
+                    weight,
                 },
                 &cfg,
                 to_certs,

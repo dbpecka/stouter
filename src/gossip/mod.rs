@@ -28,7 +28,7 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
     stream: &mut W,
     msg: &Message,
 ) -> Result<()> {
-    let payload = rmp_serde::to_vec(msg).context("serialize Message")?;
+    let payload = encode_message(msg)?;
     let len = u32::try_from(payload.len()).context("message too large")?;
     stream
         .write_all(&len.to_be_bytes())
@@ -40,6 +40,16 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
         .context("write payload")?;
     stream.flush().await.context("flush message")?;
     Ok(())
+}
+
+/// Encode `msg` as MessagePack with structs written as field-name maps.
+///
+/// Named encoding keeps the wire format compatible across versions: a reader
+/// ignores fields it does not know and fills defaults for ones the sender
+/// omitted. Positional (array) encoding would break both whenever a field is
+/// added or skipped via `skip_serializing_if`. Readers accept either form.
+pub(crate) fn encode_message(msg: &Message) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(msg).context("serialize Message")
 }
 
 /// Read a binary-framed message from `stream` and deserialize the MessagePack payload.
@@ -213,12 +223,13 @@ async fn handle_admin_request(
     let outcome: Result<(u64, crate::config::DynamicConfig), MutateErr> = {
         let mut dc = state.dynamic_config.write().await;
         let result = match op {
-            AdminOp::ServiceAdd { group, name, owner_node_id, port, domains } => {
+            AdminOp::ServiceAdd { group, name, owner_node_id, port, domains, weight } => {
                 let svc = Service {
                     name,
                     node_id: owner_node_id,
                     node_port: port,
                     domains,
+                    weight,
                 };
                 Ok(dc.upsert_service(&group, svc))
             }
