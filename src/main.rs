@@ -1,5 +1,6 @@
 mod config;
 mod gossip;
+mod health;
 mod io;
 mod metrics;
 mod mux;
@@ -786,10 +787,17 @@ fn print_status(
     for group in &dynamic_config.service_groups {
         println!("  [{}]", group.name);
         for svc in &group.services {
-            println!(
-                "    {:<20} node={:<20} port={}",
-                svc.name, svc.node_id, svc.node_port
+            let unhealthy = known_nodes
+                .iter()
+                .any(|n| n.id == svc.node_id && n.health.is_unhealthy(&svc.name));
+            let line = format!(
+                "    {:<20} node={:<20} port={:<6} {}",
+                svc.name,
+                svc.node_id,
+                svc.node_port,
+                if unhealthy { "UNHEALTHY" } else { "" }
             );
+            println!("{}", line.trim_end());
             any = true;
         }
     }
@@ -802,6 +810,15 @@ fn print_status(
         println!("  (none)");
     }
     for node in known_nodes {
-        println!("  {:<20} {}", node.id, node.addr);
+        if node.health.unhealthy.is_empty() {
+            println!("  {:<20} {}", node.id, node.addr);
+        } else {
+            println!(
+                "  {:<20} {:<22} unhealthy: {}",
+                node.id,
+                node.addr,
+                node.health.unhealthy.join(", ")
+            );
+        }
     }
 }

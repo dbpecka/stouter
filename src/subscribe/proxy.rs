@@ -145,12 +145,13 @@ async fn serve_client(
 ///
 /// Scans the service index for entries matching `service_name`, resolves each
 /// node_id to its current `NodeInfo`, sorts by node id so balancer state maps
-/// to a stable node across connections, and drops nodes whose gossip liveness
-/// marker is stale.
+/// to a stable node across connections, then drops nodes whose gossip
+/// liveness marker is stale and nodes whose health check reports the service
+/// down.
 ///
-/// Fails open: if the staleness filter would drop every node (e.g. a
-/// cluster-wide gossip hiccup), the unfiltered set is returned so per-
-/// connection retry can still find a working backend.
+/// Each filter fails open: if it would drop every node (e.g. a cluster-wide
+/// gossip hiccup, or a health check misconfigured everywhere), it is skipped
+/// so per-connection retry can still find a working backend.
 fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
     let idx = state.service_index.load();
     let kn = state.known_nodes.load();
@@ -166,20 +167,20 @@ fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
     backends.sort_by(|a, b| a.node.id.cmp(&b.node.id));
 
     let now = Instant::now();
-    let healthy: Vec<Backend> = backends
-        .iter()
-        .filter(|b| {
-            b.node
-                .last_seen
-                .is_some_and(|seen| now.duration_since(seen) <= NODE_STALE_AFTER)
-        })
-        .cloned()
-        .collect();
+    let live = prefer(backends, |b| {
+        b.node
+            .last_seen
+            .is_some_and(|seen| now.duration_since(seen) <= NODE_STALE_AFTER)
+    });
+    prefer(live, |b| !state.service_unhealthy(&b.node.id, service_name))
+}
 
-    if healthy.is_empty() {
-        backends
+/// The items of `items` satisfying `keep`, or all of them if none do.
+fn prefer<T>(items: Vec<T>, keep: impl Fn(&T) -> bool) -> Vec<T> {
+    if items.iter().any(&keep) {
+        items.into_iter().filter(|i| keep(i)).collect()
     } else {
-        healthy
+        items
     }
 }
 
@@ -296,4 +297,87 @@ async fn establish_tunnel(
         .record(connect_start.elapsed().as_secs_f64());
 
     Ok(Tunnel::Mesh(Box::new(node_stream)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, DynamicConfig, Service, ServiceGroup, ServiceHealth};
+    use tokio_util::sync::CancellationToken;
+
+    async fn state_with(nodes: &[(&str, bool, &[&str])]) -> Arc<SharedState> {
+        let services = nodes
+            .iter()
+            .map(|(id, _, _)| Service {
+                name: "api".into(),
+                node_id: id.to_string(),
+                node_port: 3000,
+                domains: vec![],
+                weight: 1,
+            })
+            .collect();
+        let cfg = Config {
+            node_id: "sub".into(),
+            dynamic_config: DynamicConfig {
+                version: 1,
+                service_groups: vec![ServiceGroup { name: "web".into(), services }],
+            },
+            ..Config::default()
+        };
+        let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+        state
+            .update_known_nodes(|kn| {
+                for (id, live, unhealthy) in nodes {
+                    kn.insert(
+                        id.to_string(),
+                        NodeInfo {
+                            id: id.to_string(),
+                            addr: format!("{id}:1"),
+                            relay: None,
+                            last_seen: live.then(Instant::now),
+                            health: ServiceHealth {
+                                version: 1,
+                                unhealthy: unhealthy.iter().map(|s| s.to_string()).collect(),
+                            },
+                        },
+                    );
+                }
+            })
+            .await;
+        state
+    }
+
+    fn ids(backends: &[Backend]) -> Vec<&str> {
+        backends.iter().map(|b| b.node.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn skips_nodes_reporting_service_unhealthy() {
+        let state = state_with(&[("a", true, &["api"]), ("b", true, &[]), ("c", true, &["other"])]).await;
+        assert_eq!(ids(&find_service_nodes("api", &state)), ["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn all_unhealthy_fails_open() {
+        let state = state_with(&[("a", true, &["api"]), ("b", true, &["api"])]).await;
+        assert_eq!(ids(&find_service_nodes("api", &state)), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn stale_nodes_dropped_before_health_filter() {
+        // b is healthy but stale; a is live but unhealthy. Liveness wins, then
+        // the health filter fails open over the live set.
+        let state = state_with(&[("a", true, &["api"]), ("b", false, &[])]).await;
+        assert_eq!(ids(&find_service_nodes("api", &state)), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn own_services_use_local_health_not_relayed_copy() {
+        let state = state_with(&[("sub", true, &[]), ("b", true, &[])]).await;
+        state.local_health.store(Arc::new(ServiceHealth {
+            version: 1,
+            unhealthy: vec!["api".into()],
+        }));
+        assert_eq!(ids(&find_service_nodes("api", &state)), ["b"]);
+    }
 }

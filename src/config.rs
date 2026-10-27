@@ -237,6 +237,35 @@ pub struct NodeInfo {
     /// independently. `None` means not yet confirmed.
     #[serde(skip)]
     pub last_seen: Option<Instant>,
+    /// Health of the services this node hosts, as reported by the node itself.
+    #[serde(default, skip_serializing_if = "ServiceHealth::is_unset")]
+    pub health: ServiceHealth,
+}
+
+/// A node's self-reported health for the services it hosts.
+///
+/// Only the hosting node writes this; everyone else relays it through gossip.
+/// `version` orders reports so a relayed copy never overwrites a fresher one.
+/// It is derived from wall-clock milliseconds, so a restarted node's reports
+/// still supersede the ones peers held from before the restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceHealth {
+    pub version: u64,
+    /// Names of hosted services whose backend failed its health check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unhealthy: Vec<String>,
+}
+
+impl ServiceHealth {
+    /// True if the node never reported health (nothing to gossip).
+    pub fn is_unset(&self) -> bool {
+        self.version == 0
+    }
+
+    pub fn is_unhealthy(&self, service_name: &str) -> bool {
+        self.unhealthy.iter().any(|s| s == service_name)
+    }
 }
 
 /// Top-level on-disk configuration for a stouter instance.

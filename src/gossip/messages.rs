@@ -267,6 +267,10 @@ mod tests {
                 addr: "10.0.0.1:8080".into(),
                 relay: None,
                 last_seen: None,
+                health: crate::config::ServiceHealth {
+                    version: 9,
+                    unhealthy: vec!["api".into()],
+                },
             }],
         };
         match msgpack_round_trip(&msg) {
@@ -274,9 +278,29 @@ mod tests {
                 assert_eq!(config.version, 1);
                 assert_eq!(nodes.len(), 1);
                 assert_eq!(nodes[0].id, "n1");
+                assert_eq!(nodes[0].health.version, 9);
+                assert_eq!(nodes[0].health.unhealthy, ["api"]);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn health_omitted_from_wire_until_reported() {
+        let node = NodeInfo {
+            id: "n1".into(),
+            addr: String::new(),
+            relay: None,
+            last_seen: None,
+            health: Default::default(),
+        };
+        assert!(!serde_json::to_string(&node).unwrap().contains("health"));
+        // A node that recovered still reports, so peers clear the old entry.
+        let node = NodeInfo {
+            health: crate::config::ServiceHealth { version: 2, unhealthy: vec![] },
+            ..node
+        };
+        assert!(serde_json::to_string(&node).unwrap().contains("\"health\":{\"version\":2}"));
     }
 
     #[test]

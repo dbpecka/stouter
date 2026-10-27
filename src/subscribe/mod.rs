@@ -38,6 +38,9 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
     tokio::spawn(gossip::run_sync_loop(state.clone()));
     tokio::spawn(gossip::run_member_log(state.clone()));
     tokio::spawn(gossip::run_config_poll_loop(state.clone()));
+    if matches!(state.config.mode, crate::config::Mode::NodeSubscribe) {
+        tokio::spawn(crate::health::run_health_checks(state.clone()));
+    }
 
     let service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>> =
         Arc::new(RwLock::new(HashMap::new()));

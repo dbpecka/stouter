@@ -15,6 +15,9 @@ service mesh. Grouped by area, not prioritized.
   temporarily removed from rotation, with exponential backoff.
 - Weighted traffic splitting at the connection level (`weight` on a service;
   `0` drains a node) via smooth weighted round-robin.
+- Active TCP health checks: each node probes its own services' `nodePort` and
+  gossips a versioned health report, so subscribers skip a dead backend
+  before any client connection reaches it.
 
 ## Architectural prerequisite
 The data plane is L4 only: tunnels copy raw bytes and never parse HTTP. L7
@@ -50,13 +53,15 @@ milestone and should be designed on its own.
   tracing is the gap).
 - Structured access logs with trace IDs.
 - RED metrics per service/route (current metrics are mostly infrastructure-level).
+- A metrics endpoint for pure `node`-mode daemons (only subscribers serve
+  `/metrics` today, so tunnel metrics recorded on nodes can't be scraped).
 - Service-topology endpoint / UI showing live nodes, services, and request flow.
 - `stouter tap` — live request sampler for debugging.
 
 ## Reliability & topology
 - Locality-aware routing (prefer same-zone/region before cross-WAN).
-- Active health checks: hosting nodes probe their local `nodePort` and gossip
-  per-service health, so subscribers skip a dead backend before trying it.
+- HTTP health checks (`healthPath` per service) once the proxy speaks HTTP;
+  current checks only confirm the port accepts connections.
 - Cross-cluster failover / federation of gossip rings.
 
 ## Config & DX
@@ -68,9 +73,10 @@ milestone and should be designed on its own.
 - Separate control-plane vs data-plane binaries once config grows.
 
 ## Next up
-1. **Active health checks** — TCP probes of each service's backend, gossiped so
-   every subscriber avoids a dead backend without paying a failed attempt.
+1. **Circuit breakers** — cap concurrent connections per service so one hot
+   service can't exhaust a node's tunnels; works at L4.
 2. **HTTP-aware data plane** — the prerequisite for L7 routing, per-request
-   retries/timeouts, OpenTelemetry tracing, and per-route RED metrics.
+   retries/timeouts, OpenTelemetry tracing, per-route RED metrics, and HTTP
+   health checks. Needs a design doc first.
 3. **Workload identity + L7 authorization** — builds on the existing mTLS once
    the proxy understands requests.

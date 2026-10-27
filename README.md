@@ -210,7 +210,7 @@ All gossip messages are MessagePack-encoded with a 4-byte big-endian length pref
 When a subscribe proxy needs to reach service `api` on node `host2`:
 
 1. Look up all nodes hosting `api` in the service index, dropping nodes whose
-   gossip liveness is stale.
+   gossip liveness is stale and nodes whose health check reports `api` down.
 2. Select a node by smooth weighted round-robin, skipping drained (weight `0`)
    and ejected nodes.
 3. Acquire a connection (in priority order):
@@ -229,6 +229,22 @@ is left out of rotation for 10s, doubling on each repeat ejection up to 2
 minutes, and a successful tunnel resets it. Every filter fails open: if it would
 exclude all nodes, it is ignored. Ejections are counted in
 `stouter_outlier_ejections_total{service,node_id}`.
+
+### Health Checks
+
+Every node probes each service it hosts every 5s by opening a TCP connection to
+`127.0.0.1:{nodePort}` (2s timeout). Two failures in a row mark the service
+unhealthy; one success marks it healthy again. The node publishes the result in
+its own gossip entry and pushes it to peers as soon as it changes, so
+subscribers stop routing to a dead backend within about 10s of it going down,
+before any client connection has to fail. Reports carry a version (wall-clock
+milliseconds), so a relayed copy never overwrites a newer one and a restarted
+node's first report replaces anything peers held from before.
+
+Health shows up in `stouter status` (an `UNHEALTHY` marker per service) and in
+the `stouter_service_healthy{service,node_id}` gauge (1 or 0), which every
+subscriber exports for the whole cluster. Outlier ejection still applies to
+failures health checks can't see, such as a node being unreachable.
 
 ### NAT Traversal via Reverse Connections
 

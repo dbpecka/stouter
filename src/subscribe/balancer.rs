@@ -157,7 +157,7 @@ mod tests {
 
     fn backend(id: &str, weight: u32) -> Backend {
         Backend {
-            node: NodeInfo { id: id.into(), addr: String::new(), relay: None, last_seen: None },
+            node: NodeInfo { id: id.into(), addr: String::new(), relay: None, last_seen: None, health: Default::default() },
             weight,
         }
     }
