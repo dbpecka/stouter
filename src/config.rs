@@ -33,6 +33,11 @@ pub struct Service {
     /// instances of the same service. `0` drains it (no new connections).
     #[serde(default = "default_weight", skip_serializing_if = "is_default_weight")]
     pub weight: u32,
+    /// Maximum concurrent connections each subscriber opens to this instance.
+    /// When every instance is at its limit, new connections are rejected
+    /// rather than queued. `None` means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
 }
 
 /// Weight assigned to a service instance when none is configured.
@@ -619,6 +624,7 @@ mod tests {
                 node_port: 3000,
                 domains: vec![],
                 weight: 1,
+                max_connections: None,
             },
         );
         assert_eq!(v, 1);
@@ -633,11 +639,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         let v = dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1 },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups.len(), 1);
@@ -649,7 +655,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         let v = dc.upsert_service(
             "web",
@@ -659,6 +665,7 @@ mod tests {
                 node_port: 9999,
                 domains: vec!["x.example".into()],
                 weight: 1,
+                max_connections: None,
             },
         );
         assert_eq!(v, 2);
@@ -672,11 +679,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         assert_eq!(dc.service_groups[0].services.len(), 2);
     }
@@ -686,7 +693,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         let v = dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(v, 2);
@@ -705,7 +712,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         let err = dc.remove_service("web", "n1", "api").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -716,11 +723,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 1);
@@ -732,7 +739,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
         assert_eq!(v, 2);
@@ -751,7 +758,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -762,11 +769,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1 },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1 },
+            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::DuplicateService { .. }));
@@ -840,6 +847,7 @@ mod tests {
                         node_port: 3000,
                         domains: vec!["api.example.com".into(), "www.api.example.com".into()],
                         weight: 1,
+                        max_connections: None,
                     }],
                 }],
             },

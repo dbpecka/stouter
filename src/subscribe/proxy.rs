@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::tls::MeshStream;
 
-use super::balancer::{Backend, Balancer};
+use super::balancer::{Backend, Balancer, Pick};
 use crate::config::NodeInfo;
 use crate::gossip;
 use crate::gossip::messages::Message;
@@ -34,8 +34,10 @@ const NODE_STALE_AFTER: Duration = Duration::from_secs(30);
 /// Binds on `127.0.0.1:0`, sends the assigned port back through `port_tx`,
 /// then accepts connections and forwards each one through an authenticated
 /// tunnel to a node hosting the service. Nodes are selected by smooth
-/// weighted round-robin, and nodes whose tunnel setup keeps failing are
-/// ejected from rotation for a while (see [`Balancer`]).
+/// weighted round-robin, nodes whose tunnel setup keeps failing are ejected
+/// from rotation for a while, and nodes at their `maxConnections` limit are
+/// skipped; when every node is full the connection is closed at once
+/// (see [`Balancer`]).
 pub async fn run_proxy(
     service_name: String,
     state: Arc<SharedState>,
@@ -88,8 +90,18 @@ async fn serve_client(
     // The client stream is not touched until a tunnel is up, so a failed
     // setup can safely be retried against another node.
     while tried.len() < max_attempts {
-        let Some(idx) = balancer.pick(&backends, &tried, Instant::now()) else {
-            break;
+        // `_slot` holds this connection's place under the node's connection
+        // limit until the iteration ends: at once on failure, or after
+        // proxying on success.
+        let (idx, _slot) = match balancer.pick(&backends, &tried, Instant::now()) {
+            Pick::Chosen { index, slot } => (index, slot),
+            Pick::AllTried => break,
+            Pick::AtCapacity if last_err.is_none() => {
+                metrics::counter!("stouter_tunnel_errors_total", "service" => service_name.clone(), "reason" => "circuit_open").increment(1);
+                tracing::debug!("rejecting connection to {service_name}: every backend is at its connection limit");
+                return;
+            }
+            Pick::AtCapacity => break,
         };
         let node = &backends[idx].node;
         tried.push(node.id.clone());
@@ -160,7 +172,11 @@ fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
         .iter()
         .filter(|((_, svc), _)| svc == service_name)
         .filter_map(|((node_id, _), svc)| {
-            kn.get(node_id).map(|node| Backend { node: node.clone(), weight: svc.weight })
+            kn.get(node_id).map(|node| Backend {
+                node: node.clone(),
+                weight: svc.weight,
+                max_connections: svc.max_connections,
+            })
         })
         .collect();
 
@@ -314,6 +330,7 @@ mod tests {
                 node_port: 3000,
                 domains: vec![],
                 weight: 1,
+                max_connections: None,
             })
             .collect();
         let cfg = Config {

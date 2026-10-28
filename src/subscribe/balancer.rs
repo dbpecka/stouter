@@ -1,12 +1,13 @@
-//! Per-service backend selection: smooth weighted round-robin plus passive
-//! outlier ejection.
+//! Per-service backend selection: smooth weighted round-robin, passive
+//! outlier ejection, and per-backend connection limits (circuit breaking).
 //!
-//! Selection is fail-open at every stage: if a filter (drained weight,
-//! ejection) would leave no candidates, it is skipped so a connection can
-//! still try something rather than fail outright.
+//! The drain and ejection filters fail open: if one would leave no
+//! candidates, it is skipped so a connection can still try something rather
+//! than fail outright. The connection limit is the exception: it is a hard
+//! cap, since its whole point is to stop piling load onto a saturated backend.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::NodeInfo;
@@ -21,11 +22,41 @@ const BASE_EJECTION: Duration = Duration::from_secs(10);
 /// Upper bound on a single ejection.
 const MAX_EJECTION: Duration = Duration::from_secs(120);
 
-/// A node hosting the service, with its configured weight.
+/// A node hosting the service, with its configured weight and limit.
 #[derive(Debug, Clone)]
 pub struct Backend {
     pub node: NodeInfo,
     pub weight: u32,
+    /// Maximum concurrent connections from this proxy; `None` is unlimited.
+    pub max_connections: Option<u32>,
+}
+
+/// Outcome of [`Balancer::pick`].
+pub enum Pick {
+    /// Use `candidates[index]`. The connection slot is held until `slot` drops.
+    Chosen { index: usize, slot: Slot },
+    /// Every candidate has already been tried for this connection.
+    AllTried,
+    /// Every untried candidate is at its connection limit.
+    AtCapacity,
+}
+
+/// A reserved connection slot on one backend; released on drop.
+pub struct Slot {
+    balancer: Arc<Balancer>,
+    node_id: String,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut inner = self.balancer.inner.lock().unwrap();
+        if let Some(count) = inner.active.get_mut(&self.node_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.active.remove(&self.node_id);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +78,8 @@ struct Inner {
     /// Smooth weighted round-robin running weight, keyed by node id.
     current: HashMap<String, i64>,
     outliers: HashMap<String, OutlierState>,
+    /// Connections currently open to each node (only nodes with any).
+    active: HashMap<String, u32>,
 }
 
 /// Load balancer state for a single service's proxy.
@@ -60,13 +93,14 @@ impl Balancer {
         Self::default()
     }
 
-    /// Pick a backend from `candidates`, skipping node ids in `tried`.
+    /// Pick a backend from `candidates`, skipping node ids in `tried`, and
+    /// reserve a connection slot on it.
     ///
-    /// Returns an index into `candidates`, or `None` once every candidate has
-    /// been tried. Drained (weight 0) nodes are skipped unless every
-    /// remaining node is drained, in which case they share load equally.
-    /// Ejected nodes are skipped unless every remaining node is ejected.
-    pub fn pick(&self, candidates: &[Backend], tried: &[String], now: Instant) -> Option<usize> {
+    /// Nodes at their connection limit are never picked. Among the rest,
+    /// drained (weight 0) nodes are skipped unless every remaining node is
+    /// drained, in which case they share load equally, and ejected nodes are
+    /// skipped unless every remaining node is ejected.
+    pub fn pick(self: &Arc<Self>, candidates: &[Backend], tried: &[String], now: Instant) -> Pick {
         let mut inner = self.inner.lock().unwrap();
 
         // Forget nodes no longer hosting the service so the maps stay bounded.
@@ -77,10 +111,21 @@ impl Balancer {
             .filter(|&i| !tried.contains(&candidates[i].node.id))
             .collect();
         if untried.is_empty() {
-            return None;
+            return Pick::AllTried;
         }
 
-        let undrained = fail_open(&untried, |i| candidates[i].weight > 0);
+        let open: Vec<usize> = untried
+            .into_iter()
+            .filter(|&i| {
+                let active = inner.active.get(&candidates[i].node.id).copied().unwrap_or(0);
+                candidates[i].max_connections.is_none_or(|max| active < max)
+            })
+            .collect();
+        if open.is_empty() {
+            return Pick::AtCapacity;
+        }
+
+        let undrained = fail_open(&open, |i| candidates[i].weight > 0);
         let eligible = fail_open(&undrained, |i| {
             !inner
                 .outliers
@@ -104,9 +149,14 @@ impl Balancer {
             }
         }
 
-        let (chosen, _) = best?;
-        *inner.current.get_mut(&candidates[chosen].node.id).unwrap() -= total;
-        Some(chosen)
+        let (chosen, _) = best.expect("eligible is non-empty");
+        let node_id = candidates[chosen].node.id.clone();
+        *inner.current.get_mut(&node_id).unwrap() -= total;
+        *inner.active.entry(node_id.clone()).or_insert(0) += 1;
+        Pick::Chosen {
+            index: chosen,
+            slot: Slot { balancer: Arc::clone(self), node_id },
+        }
     }
 
     /// Record that a tunnel to `node_id` was established.
@@ -159,13 +209,27 @@ mod tests {
         Backend {
             node: NodeInfo { id: id.into(), addr: String::new(), relay: None, last_seen: None, health: Default::default() },
             weight,
+            max_connections: None,
         }
     }
 
-    /// Pick `n` times with no retries and return the chosen node ids.
-    fn picks(b: &Balancer, backends: &[Backend], n: usize, now: Instant) -> Vec<String> {
+    fn limited(id: &str, max: u32) -> Backend {
+        Backend { max_connections: Some(max), ..backend(id, 1) }
+    }
+
+    /// Pick once, returning the chosen node id and its (held) slot.
+    fn pick_one(b: &Arc<Balancer>, backends: &[Backend], tried: &[String], now: Instant) -> Option<(String, Slot)> {
+        match b.pick(backends, tried, now) {
+            Pick::Chosen { index, slot } => Some((backends[index].node.id.clone(), slot)),
+            Pick::AllTried | Pick::AtCapacity => None,
+        }
+    }
+
+    /// Pick `n` times with no retries, releasing each slot immediately, and
+    /// return the chosen node ids.
+    fn picks(b: &Arc<Balancer>, backends: &[Backend], n: usize, now: Instant) -> Vec<String> {
         (0..n)
-            .map(|_| backends[b.pick(backends, &[], now).unwrap()].node.id.clone())
+            .map(|_| pick_one(b, backends, &[], now).expect("a pick").0)
             .collect()
     }
 
@@ -175,14 +239,14 @@ mod tests {
 
     #[test]
     fn equal_weights_round_robin() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 1), backend("b", 1), backend("c", 1)];
         assert_eq!(picks(&b, &backends, 6, Instant::now()), ["a", "b", "c", "a", "b", "c"]);
     }
 
     #[test]
     fn weights_split_traffic_proportionally_and_interleave() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 5), backend("b", 1), backend("c", 1)];
         let got = picks(&b, &backends, 7, Instant::now());
         // Smooth WRR: the nginx reference sequence for weights 5/1/1.
@@ -196,7 +260,7 @@ mod tests {
 
     #[test]
     fn canary_split() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("stable", 9), backend("canary", 1)];
         let got = picks(&b, &backends, 1000, Instant::now());
         assert_eq!(count(&got, "canary"), 100);
@@ -204,7 +268,7 @@ mod tests {
 
     #[test]
     fn zero_weight_drains_node() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 1), backend("b", 0)];
         let got = picks(&b, &backends, 10, Instant::now());
         assert_eq!(count(&got, "b"), 0);
@@ -212,32 +276,32 @@ mod tests {
 
     #[test]
     fn all_drained_fails_open_to_equal_split() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 0), backend("b", 0)];
         assert_eq!(picks(&b, &backends, 4, Instant::now()), ["a", "b", "a", "b"]);
     }
 
     #[test]
     fn drained_node_used_as_retry_of_last_resort() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 1), backend("b", 0)];
-        let idx = b.pick(&backends, &["a".into()], Instant::now()).unwrap();
-        assert_eq!(backends[idx].node.id, "b");
+        let (id, _) = pick_one(&b, &backends, &["a".into()], Instant::now()).unwrap();
+        assert_eq!(id, "b");
     }
 
     #[test]
     fn retry_skips_tried_nodes_and_ends_when_exhausted() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 10), backend("b", 1)];
         let now = Instant::now();
-        let idx = b.pick(&backends, &["a".into()], now).unwrap();
-        assert_eq!(backends[idx].node.id, "b");
-        assert!(b.pick(&backends, &["a".into(), "b".into()], now).is_none());
+        let (id, _) = pick_one(&b, &backends, &["a".into()], now).unwrap();
+        assert_eq!(id, "b");
+        assert!(matches!(b.pick(&backends, &["a".into(), "b".into()], now), Pick::AllTried));
     }
 
     #[test]
     fn ejects_after_consecutive_failures() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 1), backend("b", 1)];
         let now = Instant::now();
 
@@ -255,7 +319,7 @@ mod tests {
 
     #[test]
     fn success_resets_failure_count() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let now = Instant::now();
         b.record_failure("a", now);
         b.record_failure("a", now);
@@ -267,7 +331,7 @@ mod tests {
 
     #[test]
     fn repeated_ejections_back_off_up_to_cap() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let mut now = Instant::now();
         let mut durations = Vec::new();
         for _ in 0..6 {
@@ -288,7 +352,7 @@ mod tests {
 
     #[test]
     fn failures_while_ejected_do_not_extend_ejection() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let now = Instant::now();
         for _ in 0..3 {
             b.record_failure("a", now);
@@ -298,7 +362,7 @@ mod tests {
         }
         let backends = [backend("a", 1)];
         // Single node, ejected: fail-open still returns it.
-        assert_eq!(b.pick(&backends, &[], now), Some(0));
+        assert_eq!(pick_one(&b, &backends, &[], now).unwrap().0, "a");
         // And it is back in normal rotation exactly when the first ejection ends.
         let backends = [backend("a", 1), backend("b", 1)];
         assert!(picks(&b, &backends, 2, now + BASE_EJECTION).contains(&"a".to_string()));
@@ -306,7 +370,7 @@ mod tests {
 
     #[test]
     fn all_ejected_fails_open() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let backends = [backend("a", 1), backend("b", 1)];
         let now = Instant::now();
         for id in ["a", "b"] {
@@ -319,14 +383,69 @@ mod tests {
 
     #[test]
     fn forgets_state_for_removed_nodes() {
-        let b = Balancer::new();
+        let b = Arc::new(Balancer::new());
         let now = Instant::now();
         for _ in 0..EJECT_AFTER_FAILURES {
             b.record_failure("gone", now);
         }
-        b.pick(&[backend("a", 1)], &[], now);
+        let _ = b.pick(&[backend("a", 1)], &[], now);
         let inner = b.inner.lock().unwrap();
         assert!(!inner.outliers.contains_key("gone"));
         assert!(!inner.current.contains_key("gone"));
+    }
+
+    #[test]
+    fn connection_limit_is_a_hard_cap() {
+        let b = Arc::new(Balancer::new());
+        let backends = [limited("a", 2)];
+        let now = Instant::now();
+        let s1 = pick_one(&b, &backends, &[], now).unwrap();
+        let _s2 = pick_one(&b, &backends, &[], now).unwrap();
+        assert!(matches!(b.pick(&backends, &[], now), Pick::AtCapacity));
+        // Releasing a slot frees capacity.
+        drop(s1);
+        assert!(pick_one(&b, &backends, &[], now).is_some());
+    }
+
+    #[test]
+    fn full_backend_is_skipped_in_favour_of_others() {
+        let b = Arc::new(Balancer::new());
+        let backends = [limited("a", 1), backend("b", 1)];
+        let now = Instant::now();
+        let (first, _held) = pick_one(&b, &backends, &[], now).unwrap();
+        assert_eq!(first, "a");
+        // a is full while its slot is held, so even its round-robin turn goes to b.
+        for _ in 0..4 {
+            assert_eq!(pick_one(&b, &backends, &[], now).unwrap().0, "b");
+        }
+    }
+
+    #[test]
+    fn capacity_is_not_fail_open_even_when_others_are_ejected() {
+        let b = Arc::new(Balancer::new());
+        let backends = [limited("a", 1), backend("b", 1)];
+        let now = Instant::now();
+        for _ in 0..EJECT_AFTER_FAILURES {
+            b.record_failure("b", now);
+        }
+        let _held = pick_one(&b, &backends, &[], now).unwrap();
+        // a is full and b is ejected: the ejection filter fails open, the
+        // capacity limit does not.
+        assert_eq!(pick_one(&b, &backends, &[], now).unwrap().0, "b");
+        let backends = [limited("a", 1)];
+        assert!(matches!(b.pick(&backends, &[], now), Pick::AtCapacity));
+    }
+
+    #[test]
+    fn slots_survive_node_leaving_and_rejoining() {
+        let b = Arc::new(Balancer::new());
+        let now = Instant::now();
+        let (_, held) = pick_one(&b, &[limited("a", 1)], &[], now).unwrap();
+        // a disappears from the candidate set while its connection is open...
+        let _ = b.pick(&[backend("b", 1)], &[], now);
+        // ...and comes back: its open connection still counts.
+        assert!(matches!(b.pick(&[limited("a", 1)], &[], now), Pick::AtCapacity));
+        drop(held);
+        assert!(b.inner.lock().unwrap().active.is_empty());
     }
 }

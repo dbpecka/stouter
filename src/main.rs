@@ -92,6 +92,10 @@ enum ServiceAction {
         /// instances of the service. `0` drains it.
         #[arg(long, default_value_t = config::DEFAULT_WEIGHT)]
         weight: u32,
+        /// Maximum concurrent connections each subscriber opens to this
+        /// instance. Unlimited when unset.
+        #[arg(long)]
+        max_connections: Option<u32>,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -310,6 +314,7 @@ async fn main() -> Result<()> {
                     port,
                     domains,
                     weight,
+                    max_connections,
                     node,
                     remote,
                 },
@@ -326,6 +331,7 @@ async fn main() -> Result<()> {
                         port,
                         domains: domains.clone(),
                         weight,
+                        max_connections,
                     },
                     &cfg,
                     cli.cert_dir.as_deref(),
@@ -344,6 +350,7 @@ async fn main() -> Result<()> {
                     node_port: port,
                     domains: domains.clone(),
                     weight,
+                    max_connections,
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -385,9 +392,13 @@ async fn main() -> Result<()> {
             let mut found = false;
             for group in &dc.service_groups {
                 for svc in &group.services {
+                    let limit = svc
+                        .max_connections
+                        .map(|m| format!(" maxConnections={m}"))
+                        .unwrap_or_default();
                     println!(
-                        "{}/{} -> node={} port={} weight={}",
-                        group.name, svc.name, svc.node_id, svc.node_port, svc.weight
+                        "{}/{} -> node={} port={} weight={}{}",
+                        group.name, svc.name, svc.node_id, svc.node_port, svc.weight, limit
                     );
                     found = true;
                 }
@@ -550,7 +561,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains, weight) = src_dc
+            let (port, domains, weight, max_connections) = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -559,7 +570,7 @@ async fn main() -> Result<()> {
                         .iter()
                         .find(|s| s.name == name && s.node_id == owner_node_id)
                 })
-                .map(|s| (s.node_port, s.domains.clone(), s.weight))
+                .map(|s| (s.node_port, s.domains.clone(), s.weight, s.max_connections))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "service '{}' on node '{}' not found in group '{}' on {}",
@@ -580,6 +591,7 @@ async fn main() -> Result<()> {
                     port,
                     domains: domains.clone(),
                     weight,
+                    max_connections,
                 },
                 &cfg,
                 to_certs,

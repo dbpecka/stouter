@@ -61,6 +61,8 @@ pub enum AdminOp {
         domains: Vec<String>,
         #[serde(default = "crate::config::default_weight")]
         weight: u32,
+        #[serde(default)]
+        max_connections: Option<u32>,
     },
     ServiceRename {
         group: String,
@@ -145,6 +147,7 @@ mod tests {
                         node_port: 3000,
                         domains: Vec::new(),
                         weight: 4,
+                        max_connections: None,
                     }],
                 }],
             },
@@ -245,6 +248,7 @@ mod tests {
                         node_port: 3000,
                         domains: Vec::new(),
                         weight: 1,
+                        max_connections: None,
                     }],
                 }],
             },
@@ -375,11 +379,12 @@ mod tests {
                 port: 3000,
                 domains: vec!["api.example.com".into()],
                 weight: 5,
+                max_connections: Some(50),
             },
         };
         match msgpack_round_trip(&msg) {
             Message::AdminRequest {
-                op: AdminOp::ServiceAdd { group, name, owner_node_id, port, domains, weight },
+                op: AdminOp::ServiceAdd { group, name, owner_node_id, port, domains, weight, max_connections },
             } => {
                 assert_eq!(group, "web");
                 assert_eq!(name, "api");
@@ -387,6 +392,7 @@ mod tests {
                 assert_eq!(port, 3000);
                 assert_eq!(domains, vec!["api.example.com"]);
                 assert_eq!(weight, 5);
+                assert_eq!(max_connections, Some(50));
             }
             other => panic!("wrong variant: {other:?}"),
         }

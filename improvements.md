@@ -15,6 +15,8 @@ service mesh. Grouped by area, not prioritized.
   temporarily removed from rotation, with exponential backoff.
 - Weighted traffic splitting at the connection level (`weight` on a service;
   `0` drains a node) via smooth weighted round-robin.
+- Circuit breaking: per-instance `maxConnections`, enforced by each
+  subscriber as a hard cap (excess connections are rejected, not queued).
 - Active TCP health checks: each node probes its own services' `nodePort` and
   gossips a versioned health report, so subscribers skip a dead backend
   before any client connection reaches it.
@@ -37,8 +39,9 @@ milestone and should be designed on its own.
 - Further load-balancing policies on top of weighted round-robin: P2C /
   least-connections and consistent-hash (sticky sessions).
 - Retries with budgets, timeouts, and request hedging.
-- Circuit breakers (max connections / pending per service); outlier ejection
-  currently reacts only to tunnel-setup failures.
+- Cluster-wide connection limits (today each subscriber enforces
+  `maxConnections` on its own) and a bounded pending queue instead of
+  immediate rejection.
 - Fault injection (delay/abort) for chaos testing.
 - Rate limiting per route/client.
 - Explicit HTTP/2 + gRPC support, WebSocket upgrade handling, HTTP/3/QUIC.
@@ -73,10 +76,8 @@ milestone and should be designed on its own.
 - Separate control-plane vs data-plane binaries once config grows.
 
 ## Next up
-1. **Circuit breakers** — cap concurrent connections per service so one hot
-   service can't exhaust a node's tunnels; works at L4.
-2. **HTTP-aware data plane** — the prerequisite for L7 routing, per-request
+1. **HTTP-aware data plane** — the prerequisite for L7 routing, per-request
    retries/timeouts, OpenTelemetry tracing, per-route RED metrics, and HTTP
    health checks. Needs a design doc first.
-3. **Workload identity + L7 authorization** — builds on the existing mTLS once
+2. **Workload identity + L7 authorization** — builds on the existing mTLS once
    the proxy understands requests.

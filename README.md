@@ -127,6 +127,14 @@ instance's relative share, e.g. `9` and `1` for a 90/10 canary split. A weight
 of `0` drains an instance: it gets no new connections unless every instance is
 drained.
 
+An optional `maxConnections` caps how many concurrent connections each
+subscriber opens to an instance (a circuit breaker). Instances at their limit
+are skipped; if every instance is full, new connections are closed immediately
+rather than queued, and counted in
+`stouter_tunnel_errors_total{reason="circuit_open"}`. The limit is enforced by
+each subscriber independently, so an instance's total load can reach
+`maxConnections` × the number of subscribers.
+
 Subscribe nodes can filter which service groups they proxy:
 
 ```json
@@ -212,7 +220,7 @@ When a subscribe proxy needs to reach service `api` on node `host2`:
 1. Look up all nodes hosting `api` in the service index, dropping nodes whose
    gossip liveness is stale and nodes whose health check reports `api` down.
 2. Select a node by smooth weighted round-robin, skipping drained (weight `0`)
-   and ejected nodes.
+   and ejected nodes, and nodes at their `maxConnections` limit.
 3. Acquire a connection (in priority order):
    - **Mux session** — open a new yamux stream on an existing multiplexed connection (fastest)
    - **Reverse pool** — take an idle reverse connection (for NAT'd target nodes)
