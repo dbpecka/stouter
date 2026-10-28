@@ -1,5 +1,6 @@
 mod api;
 mod balancer;
+mod http;
 mod proxy;
 
 use std::collections::{HashMap, HashSet};

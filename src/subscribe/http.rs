@@ -1,0 +1,602 @@
+//! HTTP/1.1-aware proxying for services with `protocol: http`.
+//!
+//! Each request is balanced, timed and logged on its own, and travels over a
+//! pooled keep-alive connection to the chosen node. Pooled connections run
+//! over ordinary tunnels, so hosting nodes need no HTTP awareness. See
+//! `docs/http-proxy.md` for the design and the semantics below.
+
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use http::header::{self, HeaderMap, HeaderName, HeaderValue};
+use http::{Method, Request, Response, StatusCode, Uri, Version};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::{Body, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::net::TcpStream;
+use tracing::{debug, info};
+
+use super::balancer::{Balancer, Pick};
+use super::proxy::{establish_tunnel, find_service_nodes, note_tunnel_failure, Tunnel, MAX_TUNNEL_ATTEMPTS};
+use crate::state::SharedState;
+
+type ProxyBody = BoxBody<Bytes, hyper::Error>;
+
+/// How long an idle pooled upstream connection is kept.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Response header naming why the proxy itself answered.
+const ERROR_HEADER: &str = "x-stouter-error";
+
+/// Per-service HTTP proxy state, shared by all of the service's connections.
+pub(super) struct HttpProxy {
+    service_name: String,
+    state: Arc<SharedState>,
+    balancer: Arc<Balancer>,
+    client: Client<TunnelConnector, ProxyBody>,
+}
+
+impl HttpProxy {
+    pub fn new(service_name: String, state: Arc<SharedState>, balancer: Arc<Balancer>) -> Arc<Self> {
+        let connector = TunnelConnector {
+            service_name: service_name.clone(),
+            state: state.clone(),
+        };
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            // The URI authority is a synthetic per-node pool key; the
+            // client's own Host header is forwarded instead.
+            .set_host(false)
+            .build(connector);
+        Arc::new(Self { service_name, state, balancer, client })
+    }
+
+    /// Serve HTTP/1.1 on one accepted client connection.
+    pub async fn serve_connection(self: Arc<Self>, client: TcpStream) {
+        let service = service_fn(move |req| {
+            let proxy = self.clone();
+            async move { Ok::<_, std::convert::Infallible>(proxy.handle(req).await) }
+        });
+        if let Err(e) = http1::Builder::new()
+            .serve_connection(TokioIo::new(client), service)
+            .with_upgrades()
+            .await
+        {
+            debug!("HTTP connection error: {e}");
+        }
+    }
+
+    async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
+        let start = Instant::now();
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+
+        let trace = TraceContext::from_headers(req.headers()).unwrap_or_else(TraceContext::new_root);
+        let upstream_trace = trace.child();
+
+        let upgrade = is_upgrade(req.headers());
+        let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
+
+        let (mut parts, body) = req.into_parts();
+        strip_hop_by_hop(&mut parts.headers, upgrade);
+        if !parts.headers.contains_key(header::HOST) {
+            if let Ok(host) = HeaderValue::from_str(&self.service_name) {
+                parts.headers.insert(header::HOST, host);
+            }
+        }
+        parts.headers.insert(
+            HeaderName::from_static("traceparent"),
+            HeaderValue::from_str(&upstream_trace.to_header()).expect("traceparent is ASCII"),
+        );
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+
+        // A request with no body can be re-sent to another node if a
+        // connection can't be established; a streamed body cannot.
+        let replayable = body.is_end_stream();
+        let mut body = Some(body);
+
+        let backends = find_service_nodes(&self.service_name, &self.state);
+        let max_attempts = backends.len().min(MAX_TUNNEL_ATTEMPTS);
+        let mut tried: Vec<String> = Vec::with_capacity(max_attempts);
+        let mut last_err: Option<String> = None;
+
+        let outcome = loop {
+            if tried.len() >= max_attempts {
+                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+            }
+            let (idx, slot) = match self.balancer.pick(&backends, &tried, Instant::now()) {
+                Pick::Chosen { index, slot } => (index, slot),
+                Pick::AllTried => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
+                Pick::AtCapacity if last_err.is_none() => {
+                    break Outcome::Error(StatusCode::SERVICE_UNAVAILABLE, "circuit_open")
+                }
+                Pick::AtCapacity => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
+            };
+            let backend = &backends[idx];
+            let node_id = backend.node.id.clone();
+            tried.push(node_id.clone());
+
+            let Some(uri) = node_uri(&node_id, &path_and_query) else {
+                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+            };
+            let req_body = if replayable {
+                Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+            } else {
+                match body.take() {
+                    Some(b) => b.boxed(),
+                    None => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
+                }
+            };
+            let mut upstream = Request::new(req_body);
+            *upstream.method_mut() = parts.method.clone();
+            *upstream.uri_mut() = uri;
+            *upstream.version_mut() = Version::HTTP_11;
+            *upstream.headers_mut() = parts.headers.clone();
+
+            let sent = self.client.request(upstream);
+            let result = match backend.request_timeout {
+                Some(limit) => match tokio::time::timeout(limit, sent).await {
+                    Ok(r) => r,
+                    Err(_) => break Outcome::Error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                },
+                None => sent.await,
+            };
+
+            match result {
+                Ok(resp) => {
+                    self.balancer.record_success(&node_id);
+                    break Outcome::Response { resp, slot, node_id };
+                }
+                Err(e) if e.is_connect() => {
+                    debug!("connect to node {node_id} for {} failed: {e:?}", self.service_name);
+                    note_tunnel_failure(&self.balancer, &self.service_name, &node_id, &e);
+                    last_err = Some(e.to_string());
+                    if !replayable {
+                        break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+                    }
+                }
+                Err(e) => {
+                    // The request may have reached the backend: don't retry.
+                    debug!("request to node {node_id} for {} failed: {e:?}", self.service_name);
+                    last_err = Some(e.to_string());
+                    break Outcome::Error(StatusCode::BAD_GATEWAY, "upstream_error");
+                }
+            }
+        };
+
+        let (response, node) = match outcome {
+            Outcome::Response { mut resp, slot, node_id } => {
+                if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                    if let Some(client_upgrade) = client_upgrade {
+                        let backend_upgrade = hyper::upgrade::on(&mut resp);
+                        tokio::spawn(async move {
+                            let _slot = slot;
+                            match tokio::try_join!(client_upgrade, backend_upgrade) {
+                                Ok((client_io, backend_io)) => {
+                                    let _ = crate::io::proxy_bidirectional(
+                                        TokioIo::new(client_io),
+                                        TokioIo::new(backend_io),
+                                    )
+                                    .await;
+                                }
+                                Err(e) => debug!("upgrade failed: {e}"),
+                            }
+                        });
+                    }
+                    (resp.map(|b| b.boxed()), Some(node_id))
+                } else {
+                    strip_hop_by_hop(resp.headers_mut(), false);
+                    // Hold the connection slot until the body is fully sent.
+                    let resp = resp.map(move |b| {
+                        b.map_frame(move |frame| {
+                            let _ = &slot;
+                            frame
+                        })
+                        .boxed()
+                    });
+                    (resp, Some(node_id))
+                }
+            }
+            Outcome::Error(status, reason) => {
+                if let Some(e) = &last_err {
+                    debug!("{} {} for {}: {reason}: {e}", status.as_u16(), path, self.service_name);
+                }
+                (error_response(status, reason), tried.last().cloned())
+            }
+        };
+
+        let status = response.status().as_u16();
+        let elapsed = start.elapsed();
+        metrics::counter!(
+            "stouter_http_requests_total",
+            "service" => self.service_name.clone(),
+            "method" => method_label(&method),
+            "code" => format!("{}xx", status / 100)
+        )
+        .increment(1);
+        metrics::histogram!("stouter_http_request_duration_seconds", "service" => self.service_name.clone())
+            .record(elapsed.as_secs_f64());
+        info!(
+            target: "stouter::access",
+            service = %self.service_name,
+            method = %method,
+            path = %path,
+            status,
+            node = node.as_deref().unwrap_or("-"),
+            attempts = tried.len(),
+            duration_ms = elapsed.as_millis() as u64,
+            trace_id = %trace.trace_id,
+            "request"
+        );
+
+        response
+    }
+}
+
+enum Outcome {
+    Response {
+        resp: Response<Incoming>,
+        slot: super::balancer::Slot,
+        node_id: String,
+    },
+    Error(StatusCode, &'static str),
+}
+
+fn error_response(status: StatusCode, reason: &'static str) -> Response<ProxyBody> {
+    let mut resp = Response::new(
+        Full::new(Bytes::from(format!("{reason}\n")))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(ERROR_HEADER, HeaderValue::from_static(reason));
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    resp
+}
+
+/// Bounded label for a request method, so arbitrary methods can't blow up
+/// metric cardinality.
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+// ---------------------------------------------------------------------------
+
+/// Headers that describe a single hop, never forwarded (RFC 9110 §7.6.1).
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// True if the request asks to switch protocols (e.g. WebSocket).
+fn is_upgrade(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::UPGRADE) && connection_tokens(headers).any(|t| t == "upgrade")
+}
+
+fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = String> + '_ {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+}
+
+/// Remove hop-by-hop headers, including any named in `Connection`. For an
+/// upgrade, `Upgrade` is kept and `Connection: upgrade` re-added.
+fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
+    let named: Vec<String> = connection_tokens(headers).collect();
+    let upgrade = headers.get(header::UPGRADE).cloned();
+    for name in HOP_BY_HOP.iter().copied().map(str::to_string).chain(named) {
+        headers.remove(name.as_str());
+    }
+    if keep_upgrade {
+        if let Some(value) = upgrade {
+            headers.insert(header::UPGRADE, value);
+            headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W3C trace context
+// ---------------------------------------------------------------------------
+
+/// The parts of a W3C `traceparent` header the proxy carries forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceContext {
+    trace_id: String,
+    span_id: String,
+    flags: String,
+}
+
+impl TraceContext {
+    /// Parse a version-00-compatible `traceparent`, or `None` if absent or
+    /// invalid (in which case a new trace is started, per the spec).
+    fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        let value = headers.get("traceparent")?.to_str().ok()?.trim();
+        let mut parts = value.split('-');
+        let (version, trace_id, span_id, flags) =
+            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        // Future versions may append fields; version 00 has exactly four.
+        if version == "00" && parts.next().is_some() {
+            return None;
+        }
+        let is_hex = |s: &str, len: usize| {
+            s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        let valid = is_hex(version, 2)
+            && version != "ff"
+            && is_hex(trace_id, 32)
+            && trace_id.bytes().any(|b| b != b'0')
+            && is_hex(span_id, 16)
+            && span_id.bytes().any(|b| b != b'0')
+            && is_hex(flags, 2);
+        valid.then(|| Self {
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            flags: flags.to_string(),
+        })
+    }
+
+    /// Start a new, sampled trace.
+    fn new_root() -> Self {
+        Self {
+            trace_id: random_hex(16),
+            span_id: random_hex(8),
+            flags: "01".to_string(),
+        }
+    }
+
+    /// Same trace, new span id: the proxy's hop to the upstream.
+    fn child(&self) -> Self {
+        Self { span_id: random_hex(8), ..self.clone() }
+    }
+
+    fn to_header(&self) -> String {
+        format!("00-{}-{}-{}", self.trace_id, self.span_id, self.flags)
+    }
+}
+
+/// `bytes` random bytes as lowercase hex, never all zeros.
+fn random_hex(bytes: usize) -> String {
+    loop {
+        let raw: Vec<u8> = (0..bytes).map(|_| rand::random::<u8>()).collect();
+        if raw.iter().any(|&b| b != 0) {
+            return raw.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upstream connections over tunnels
+// ---------------------------------------------------------------------------
+
+/// Suffix of the synthetic per-node authority used as the pool key.
+const NODE_HOST_SUFFIX: &str = "stouter";
+
+/// Upstream URI addressing `node_id`. The authority only keys the connection
+/// pool (one pool per node); it is never resolved. The node id is hex-encoded
+/// (split into DNS-sized labels) so any id makes a valid authority.
+fn node_uri(node_id: &str, path_and_query: &str) -> Option<Uri> {
+    let hex: String = node_id.bytes().map(|b| format!("{b:02x}")).collect();
+    let labels: Vec<&str> = hex
+        .as_bytes()
+        .chunks(62)
+        .map(|c| std::str::from_utf8(c).expect("hex is ASCII"))
+        .collect();
+    format!("http://{}.{NODE_HOST_SUFFIX}{path_and_query}", labels.join("."))
+        .parse()
+        .ok()
+}
+
+/// Inverse of the authority encoding in [`node_uri`].
+fn node_id_from_uri(uri: &Uri) -> Option<String> {
+    let host = uri.host()?.strip_suffix(NODE_HOST_SUFFIX)?.strip_suffix('.')?;
+    let hex: String = host.split('.').collect();
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Connects the HTTP client to a node by opening a tunnel to the service.
+#[derive(Clone)]
+struct TunnelConnector {
+    service_name: String,
+    state: Arc<SharedState>,
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl tower_service::Service<Uri> for TunnelConnector {
+    type Response = TunnelIo;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<TunnelIo, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let service_name = self.service_name.clone();
+        let state = self.state.clone();
+        Box::pin(async move {
+            let node_id = node_id_from_uri(&uri).ok_or("invalid upstream node address")?;
+            let node = state
+                .known_nodes
+                .load()
+                .get(&node_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown node {node_id}"))?;
+            let tunnel = establish_tunnel(&node, service_name, &state).await?;
+            Ok(TunnelIo(TokioIo::new(tunnel)))
+        })
+    }
+}
+
+/// A tunnel adapted to hyper's I/O traits.
+struct TunnelIo(TokioIo<Tunnel>);
+
+impl hyper::rt::Read for TunnelIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl hyper::rt::Write for TunnelIo {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
+impl Connection for TunnelIo {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn node_uri_round_trips_any_node_id() {
+        for id in ["n1", "host-2.example.com", "a_b", &"x".repeat(100), "ünïcode"] {
+            let uri = node_uri(id, "/a/b?c=d").expect("valid uri");
+            assert_eq!(uri.path_and_query().unwrap().as_str(), "/a/b?c=d");
+            assert_eq!(node_id_from_uri(&uri).as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn strips_hop_by_hop_and_connection_named_headers() {
+        let mut h = headers(&[
+            ("connection", "keep-alive, x-secret"),
+            ("keep-alive", "timeout=5"),
+            ("x-secret", "1"),
+            ("transfer-encoding", "chunked"),
+            ("host", "api"),
+            ("x-keep", "1"),
+        ]);
+        strip_hop_by_hop(&mut h, false);
+        let mut names: Vec<&str> = h.keys().map(|k| k.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["host", "x-keep"]);
+    }
+
+    #[test]
+    fn upgrade_requests_keep_upgrade_headers() {
+        let mut h = headers(&[("connection", "Upgrade"), ("upgrade", "websocket"), ("te", "x")]);
+        assert!(is_upgrade(&h));
+        strip_hop_by_hop(&mut h, true);
+        assert_eq!(h["upgrade"], "websocket");
+        assert_eq!(h["connection"], "upgrade");
+        assert!(!h.contains_key("te"));
+    }
+
+    #[test]
+    fn not_an_upgrade_without_connection_token() {
+        assert!(!is_upgrade(&headers(&[("upgrade", "websocket")])));
+    }
+
+    #[test]
+    fn traceparent_parse_and_propagate() {
+        let h = headers(&[("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")]);
+        let tc = TraceContext::from_headers(&h).unwrap();
+        assert_eq!(tc.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        let child = tc.child();
+        assert_eq!(child.trace_id, tc.trace_id);
+        assert_eq!(child.flags, "01");
+        assert_ne!(child.span_id, tc.span_id);
+        let header = child.to_header();
+        assert!(header.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+        assert!(header.ends_with("-01"));
+        assert_eq!(header.len(), 55);
+    }
+
+    #[test]
+    fn invalid_traceparent_rejected() {
+        for bad in [
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "00-4bf92f-00f067aa0ba902b7-01",
+            "garbage",
+        ] {
+            let h = headers(&[("traceparent", bad)]);
+            assert!(TraceContext::from_headers(&h).is_none(), "{bad}");
+        }
+        // A future version may carry extra fields.
+        let h = headers(&[("traceparent", "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra")]);
+        assert!(TraceContext::from_headers(&h).is_some());
+    }
+
+    #[test]
+    fn new_root_is_valid() {
+        let tc = TraceContext::new_root();
+        let h = headers(&[("traceparent", &tc.to_header())]);
+        assert_eq!(TraceContext::from_headers(&h), Some(tc));
+    }
+}

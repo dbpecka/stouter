@@ -21,11 +21,10 @@ service mesh. Grouped by area, not prioritized.
   gossips a versioned health report, so subscribers skip a dead backend
   before any client connection reaches it.
 
-## Architectural prerequisite
-The data plane is L4 only: tunnels copy raw bytes and never parse HTTP. L7
-routing, per-request retries/timeouts, tracing, and per-route RED metrics all
-need an HTTP-aware proxy path (e.g. hyper) first. That is the next major
-milestone and should be designed on its own.
+- HTTP-aware proxying (opt-in `protocol: http`, milestone 1 of
+  `docs/http-proxy.md`): per-request balancing over pooled tunnels, timeouts,
+  connect-failure retries, upgrade passthrough, W3C trace propagation, access
+  logs, and per-service request metrics.
 
 ## Security (identity & policy)
 - Certificate rotation without a restart, and revocation (a CRL or short-lived
@@ -35,16 +34,20 @@ milestone and should be designed on its own.
 - Finer-grained admin RBAC (per-group or per-operation rather than one allowlist).
 
 ## Traffic management
-- L7 routing: header/path/method matching, not just SNI/host.
+- L7 routing: header/path/method route rules sending to instance subsets,
+  with per-route weights (M2 in `docs/http-proxy.md`).
 - Further load-balancing policies on top of weighted round-robin: P2C /
   least-connections and consistent-hash (sticky sessions).
-- Retries with budgets, timeouts, and request hedging.
+- Retries on 5xx for idempotent methods under a retry budget, request
+  hedging, and buffering small bodies so POSTs can be retried on connect
+  failure (today only body-less requests are).
 - Cluster-wide connection limits (today each subscriber enforces
   `maxConnections` on its own) and a bounded pending queue instead of
   immediate rejection.
 - Fault injection (delay/abort) for chaos testing.
 - Rate limiting per route/client.
-- Explicit HTTP/2 + gRPC support, WebSocket upgrade handling, HTTP/3/QUIC.
+- HTTP/2 (h2c downstream, h2 over tunnels) and gRPC as `http` services
+  (M4); HTTP/3/QUIC.
 
 ## Ingress polish
 - TLS termination with SNI at the edge.
@@ -52,10 +55,10 @@ milestone and should be designed on its own.
 - HTTP redirect, rewrites, CORS, compression.
 
 ## Observability
-- W3C TraceContext / OpenTelemetry propagation + span emission (metrics exist;
-  tracing is the gap).
-- Structured access logs with trace IDs.
-- RED metrics per service/route (current metrics are mostly infrastructure-level).
+- OpenTelemetry span export over OTLP (M3); trace context is already
+  propagated and logged for `http` services.
+- Per-route metrics once route rules exist (per-service request metrics exist
+  for `http` services).
 - A metrics endpoint for pure `node`-mode daemons (only subscribers serve
   `/metrics` today, so tunnel metrics recorded on nodes can't be scraped).
 - Service-topology endpoint / UI showing live nodes, services, and request flow.
@@ -63,8 +66,8 @@ milestone and should be designed on its own.
 
 ## Reliability & topology
 - Locality-aware routing (prefer same-zone/region before cross-WAN).
-- HTTP health checks (`healthPath` per service) once the proxy speaks HTTP;
-  current checks only confirm the port accepts connections.
+- HTTP health checks (`healthPath` per service); current checks only confirm
+  the port accepts connections.
 - Cross-cluster failover / federation of gossip rings.
 
 ## Config & DX
@@ -76,8 +79,11 @@ milestone and should be designed on its own.
 - Separate control-plane vs data-plane binaries once config grows.
 
 ## Next up
-1. **HTTP-aware data plane** — the prerequisite for L7 routing, per-request
-   retries/timeouts, OpenTelemetry tracing, per-route RED metrics, and HTTP
-   health checks. Needs a design doc first.
-2. **Workload identity + L7 authorization** — builds on the existing mTLS once
-   the proxy understands requests.
+Following `docs/http-proxy.md`:
+1. **M2 — L7 routing + HTTP health checks** — route rules (path/header →
+   instance subsets with weights), `healthPath` probes, 5xx retries under a
+   budget.
+2. **M3 — OTLP span export** — turns the propagated trace context into real
+   distributed traces.
+3. **M5 — Workload identity + L7 authorization** — per-service identities in
+   certs, enforced on hosting nodes.

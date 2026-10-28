@@ -238,6 +238,33 @@ minutes, and a successful tunnel resets it. Every filter fails open: if it would
 exclude all nodes, it is ignored. Ejections are counted in
 `stouter_outlier_ejections_total{service,node_id}`.
 
+### HTTP Services
+
+Set `"protocol": "http"` on every instance of a service (CLI: `--protocol http`)
+to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
+
+- **Per-request load balancing** over pooled keep-alive connections to each
+  node, so one long-lived client connection is still spread across instances,
+  and tunnels are reused instead of opened per request.
+- **Timeouts:** optional `requestTimeoutMs` per instance (time allowed for
+  response headers); expiry returns `504`.
+- **Retries:** a request without a body is retried on another node (up to 3)
+  when a connection to the chosen node can't be established.
+- **Errors** from the proxy itself carry an `x-stouter-error` header:
+  `502 no_backend_reachable`, `503 circuit_open` (`maxConnections` then caps
+  in-flight requests), `504 timeout`.
+- **WebSocket and other upgrades** are passed through.
+- **Tracing:** W3C `traceparent` is propagated (with a new span id per hop),
+  or started when absent.
+- **Access log** per request (target `stouter::access`, with trace id), and
+  `stouter_http_requests_total{service,method,code}` /
+  `stouter_http_request_duration_seconds{service}` metrics.
+
+A service is proxied as HTTP only if every instance says `http`, and the
+setting is read for each new connection, so it can be switched without a
+restart. HTTP/2 and gRPC services should stay `tcp` for now. See
+[`docs/http-proxy.md`](docs/http-proxy.md) for the design and roadmap.
+
 ### Health Checks
 
 Every node probes each service it hosts every 5s by opening a TCP connection to

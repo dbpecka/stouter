@@ -27,8 +27,11 @@ const MAX_EJECTION: Duration = Duration::from_secs(120);
 pub struct Backend {
     pub node: NodeInfo,
     pub weight: u32,
-    /// Maximum concurrent connections from this proxy; `None` is unlimited.
+    /// Maximum concurrent connections (HTTP: in-flight requests) from this
+    /// proxy; `None` is unlimited.
     pub max_connections: Option<u32>,
+    /// HTTP only: time allowed for response headers.
+    pub request_timeout: Option<Duration>,
 }
 
 /// Outcome of [`Balancer::pick`].
@@ -210,6 +213,7 @@ mod tests {
             node: NodeInfo { id: id.into(), addr: String::new(), relay: None, last_seen: None, health: Default::default() },
             weight,
             max_connections: None,
+            request_timeout: None,
         }
     }
 

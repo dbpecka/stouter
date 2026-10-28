@@ -223,7 +223,17 @@ async fn handle_admin_request(
     let outcome: Result<(u64, crate::config::DynamicConfig), MutateErr> = {
         let mut dc = state.dynamic_config.write().await;
         let result = match op {
-            AdminOp::ServiceAdd { group, name, owner_node_id, port, domains, weight, max_connections } => {
+            AdminOp::ServiceAdd {
+                group,
+                name,
+                owner_node_id,
+                port,
+                domains,
+                weight,
+                max_connections,
+                protocol,
+                request_timeout_ms,
+            } => {
                 let svc = Service {
                     name,
                     node_id: owner_node_id,
@@ -231,6 +241,8 @@ async fn handle_admin_request(
                     domains,
                     weight,
                     max_connections,
+                    protocol,
+                    request_timeout_ms,
                 };
                 Ok(dc.upsert_service(&group, svc))
             }

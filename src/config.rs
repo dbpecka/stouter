@@ -38,6 +38,30 @@ pub struct Service {
     /// rather than queued. `None` means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
+    /// How subscribers proxy this service. A service is proxied as HTTP only
+    /// when every instance says `http`.
+    #[serde(default, skip_serializing_if = "Protocol::is_tcp")]
+    pub protocol: Protocol,
+    /// HTTP only: time allowed for this instance to send response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+}
+
+/// Wire protocol a service speaks, which decides how subscribers proxy it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "camelCase")]
+pub enum Protocol {
+    /// Opaque byte stream: one backend per client connection.
+    #[default]
+    Tcp,
+    /// HTTP/1.1: requests are balanced, timed, retried and logged individually.
+    Http,
+}
+
+impl Protocol {
+    pub fn is_tcp(&self) -> bool {
+        *self == Protocol::Tcp
+    }
 }
 
 /// Weight assigned to a service instance when none is configured.
@@ -625,6 +649,8 @@ mod tests {
                 domains: vec![],
                 weight: 1,
                 max_connections: None,
+                protocol: crate::config::Protocol::Tcp,
+                request_timeout_ms: None,
             },
         );
         assert_eq!(v, 1);
@@ -639,11 +665,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let v = dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups.len(), 1);
@@ -655,7 +681,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let v = dc.upsert_service(
             "web",
@@ -666,6 +692,8 @@ mod tests {
                 domains: vec!["x.example".into()],
                 weight: 1,
                 max_connections: None,
+                protocol: crate::config::Protocol::Tcp,
+                request_timeout_ms: None,
             },
         );
         assert_eq!(v, 2);
@@ -679,11 +707,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         assert_eq!(dc.service_groups[0].services.len(), 2);
     }
@@ -693,7 +721,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let v = dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(v, 2);
@@ -712,7 +740,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let err = dc.remove_service("web", "n1", "api").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -723,11 +751,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 1);
@@ -739,7 +767,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
         assert_eq!(v, 2);
@@ -758,7 +786,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -769,11 +797,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None },
+            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::DuplicateService { .. }));
@@ -848,6 +876,8 @@ mod tests {
                         domains: vec!["api.example.com".into(), "www.api.example.com".into()],
                         weight: 1,
                         max_connections: None,
+                        protocol: crate::config::Protocol::Tcp,
+                        request_timeout_ms: None,
                     }],
                 }],
             },

@@ -11,7 +11,8 @@ use tracing::info;
 use crate::tls::MeshStream;
 
 use super::balancer::{Backend, Balancer, Pick};
-use crate::config::NodeInfo;
+use super::http::HttpProxy;
+use crate::config::{NodeInfo, Protocol};
 use crate::gossip;
 use crate::gossip::messages::Message;
 use crate::state::SharedState;
@@ -22,7 +23,7 @@ const REVERSE_POOL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of distinct nodes to try for a single client connection
 /// before giving up. Bounds retry amplification during a hosting outage.
-const MAX_TUNNEL_ATTEMPTS: usize = 3;
+pub(super) const MAX_TUNNEL_ATTEMPTS: usize = 3;
 
 /// A node not confirmed reachable within this window is treated as unhealthy
 /// and excluded from load balancing. The gossip sync loop probes every peer
@@ -53,14 +54,22 @@ pub async fn run_proxy(
     info!("Proxy for {} on 127.0.0.1:{}", service_name, local_port);
 
     let balancer = Arc::new(Balancer::new());
+    let http = HttpProxy::new(service_name.clone(), state.clone(), balancer.clone());
 
     loop {
         let (client, _) = listener.accept().await.context("proxy accept")?;
         client.set_nodelay(true).ok();
+
+        // Checked per connection so a protocol change in the config applies
+        // to new connections without restarting the proxy.
+        if service_is_http(&service_name, &state) {
+            tokio::spawn(http.clone().serve_connection(client));
+            continue;
+        }
+
         let service_name = service_name.clone();
         let state = state.clone();
         let balancer = balancer.clone();
-
         tokio::spawn(async move {
             serve_client(client, service_name, state, balancer).await;
         });
@@ -112,24 +121,14 @@ async fn serve_client(
             Ok(tunnel) => tunnel,
             Err(e) => {
                 tracing::debug!("tunnel to node {} failed, trying another node: {e}", node.id);
-                if let Some(duration) = balancer.record_failure(&node.id, Instant::now()) {
-                    metrics::counter!("stouter_outlier_ejections_total", "service" => service_name.clone(), "node_id" => node.id.clone()).increment(1);
-                    tracing::warn!(
-                        "ejecting node {} from service {service_name} for {}s after repeated tunnel failures: {e}",
-                        node.id,
-                        duration.as_secs()
-                    );
-                }
+                note_tunnel_failure(&balancer, &service_name, &node.id, &e);
                 last_err = Some(e);
                 continue;
             }
         };
         balancer.record_success(&node.id);
 
-        let result = match tunnel {
-            Tunnel::Mux(stream) => crate::io::proxy_bidirectional(client, stream).await,
-            Tunnel::Mesh(stream) => crate::io::proxy_bidirectional(client, stream).await,
-        };
+        let result = crate::io::proxy_bidirectional(client, tunnel).await;
         match result {
             Ok(()) => {
                 metrics::histogram!("stouter_proxy_duration_seconds", "service" => service_name.clone())
@@ -153,6 +152,31 @@ async fn serve_client(
     }
 }
 
+/// Record a failed tunnel setup with the balancer, logging and counting an
+/// ejection if it caused one.
+pub(super) fn note_tunnel_failure(
+    balancer: &Balancer,
+    service_name: &str,
+    node_id: &str,
+    err: &dyn std::fmt::Display,
+) {
+    if let Some(duration) = balancer.record_failure(node_id, Instant::now()) {
+        metrics::counter!("stouter_outlier_ejections_total", "service" => service_name.to_string(), "node_id" => node_id.to_string()).increment(1);
+        tracing::warn!(
+            "ejecting node {node_id} from service {service_name} for {}s after repeated tunnel failures: {err}",
+            duration.as_secs()
+        );
+    }
+}
+
+/// Whether `service_name` should be proxied as HTTP: every instance must say
+/// so, so a half-migrated service falls back to byte forwarding.
+pub(super) fn service_is_http(service_name: &str, state: &SharedState) -> bool {
+    let idx = state.service_index.load();
+    let mut instances = idx.iter().filter(|((_, svc), _)| svc == service_name).peekable();
+    instances.peek().is_some() && instances.all(|(_, svc)| svc.protocol == Protocol::Http)
+}
+
 /// Find the nodes hosting a given service, ordered and health-filtered.
 ///
 /// Scans the service index for entries matching `service_name`, resolves each
@@ -164,7 +188,7 @@ async fn serve_client(
 /// Each filter fails open: if it would drop every node (e.g. a cluster-wide
 /// gossip hiccup, or a health check misconfigured everywhere), it is skipped
 /// so per-connection retry can still find a working backend.
-fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
+pub(super) fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
     let idx = state.service_index.load();
     let kn = state.known_nodes.load();
 
@@ -176,6 +200,7 @@ fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
                 node: node.clone(),
                 weight: svc.weight,
                 max_connections: svc.max_connections,
+                request_timeout: svc.request_timeout_ms.map(Duration::from_millis),
             })
         })
         .collect();
@@ -235,7 +260,7 @@ async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// An established tunnel to a remote node, ready for proxying.
-enum Tunnel {
+pub(super) enum Tunnel {
     /// A stream on a pooled yamux session.
     Mux(Compat<yamux::Stream>),
     /// A dedicated mTLS connection (boxed: a TLS stream is large).
@@ -249,7 +274,53 @@ enum Tunnel {
 /// 2. Reverse pool (instant check — free path to NAT'd nodes)
 /// 3. Reverse pool with wait (for NAT-only nodes with no address)
 /// 4. Cold TCP connect as last resort
-async fn establish_tunnel(
+impl AsyncRead for Tunnel {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Tunnel {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+pub(super) async fn establish_tunnel(
     node: &NodeInfo,
     service_name: String,
     state: &Arc<SharedState>,
@@ -331,6 +402,8 @@ mod tests {
                 domains: vec![],
                 weight: 1,
                 max_connections: None,
+                protocol: crate::config::Protocol::Tcp,
+                request_timeout_ms: None,
             })
             .collect();
         let cfg = Config {

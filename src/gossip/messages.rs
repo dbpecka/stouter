@@ -63,6 +63,10 @@ pub enum AdminOp {
         weight: u32,
         #[serde(default)]
         max_connections: Option<u32>,
+        #[serde(default)]
+        protocol: crate::config::Protocol,
+        #[serde(default)]
+        request_timeout_ms: Option<u64>,
     },
     ServiceRename {
         group: String,
@@ -148,6 +152,8 @@ mod tests {
                         domains: Vec::new(),
                         weight: 4,
                         max_connections: None,
+                        protocol: crate::config::Protocol::Tcp,
+                        request_timeout_ms: None,
                     }],
                 }],
             },
@@ -249,6 +255,8 @@ mod tests {
                         domains: Vec::new(),
                         weight: 1,
                         max_connections: None,
+                        protocol: crate::config::Protocol::Tcp,
+                        request_timeout_ms: None,
                     }],
                 }],
             },
@@ -380,11 +388,24 @@ mod tests {
                 domains: vec!["api.example.com".into()],
                 weight: 5,
                 max_connections: Some(50),
+                protocol: crate::config::Protocol::Http,
+                request_timeout_ms: Some(1500),
             },
         };
         match msgpack_round_trip(&msg) {
             Message::AdminRequest {
-                op: AdminOp::ServiceAdd { group, name, owner_node_id, port, domains, weight, max_connections },
+                op:
+                    AdminOp::ServiceAdd {
+                        group,
+                        name,
+                        owner_node_id,
+                        port,
+                        domains,
+                        weight,
+                        max_connections,
+                        protocol,
+                        request_timeout_ms,
+                    },
             } => {
                 assert_eq!(group, "web");
                 assert_eq!(name, "api");
@@ -393,6 +414,8 @@ mod tests {
                 assert_eq!(domains, vec!["api.example.com"]);
                 assert_eq!(weight, 5);
                 assert_eq!(max_connections, Some(50));
+                assert_eq!(protocol, crate::config::Protocol::Http);
+                assert_eq!(request_timeout_ms, Some(1500));
             }
             other => panic!("wrong variant: {other:?}"),
         }
