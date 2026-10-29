@@ -372,30 +372,39 @@ impl Config {
     /// - domain names are globally unique across all services
     pub fn validate(&self) -> Result<()> {
         let mut group_names = HashSet::new();
-        let mut domains = HashSet::new();
+        // A domain may be shared by instances of one service, but not
+        // claimed by two different services.
+        let mut domain_owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
 
         for group in &self.dynamic_config.service_groups {
             if !group_names.insert(group.name.as_str()) {
                 return Err(anyhow!("duplicate service group name: '{}'", group.name));
             }
 
-            let mut service_names = HashSet::new();
+            // The same name on several nodes is one service with several
+            // instances; only the same name twice on one node is a duplicate.
+            let mut instances = HashSet::new();
             for svc in &group.services {
-                if !service_names.insert(svc.name.as_str()) {
+                if !instances.insert((svc.node_id.as_str(), svc.name.as_str())) {
                     return Err(anyhow!(
-                        "duplicate service name '{}' in group '{}'",
+                        "duplicate service '{}' on node '{}' in group '{}'",
                         svc.name,
+                        svc.node_id,
                         group.name
                     ));
                 }
                 for domain in &svc.domains {
-                    if !domains.insert(domain.as_str()) {
-                        return Err(anyhow!(
-                            "duplicate domain '{}' (service '{}/{}')",
-                            domain,
-                            group.name,
-                            svc.name
-                        ));
+                    match domain_owner.insert(domain.as_str(), svc.name.as_str()) {
+                        Some(owner) if owner != svc.name => {
+                            return Err(anyhow!(
+                                "domain '{}' is claimed by both '{}' and '{}/{}'",
+                                domain,
+                                owner,
+                                group.name,
+                                svc.name
+                            ));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -575,6 +584,47 @@ mod tests {
             }),
             ..Config::default()
         };
+        assert!(cfg.validate().is_err());
+    }
+
+    fn group_of(services: Vec<Service>) -> Config {
+        Config {
+            dynamic_config: DynamicConfig {
+                version: 1,
+                service_groups: vec![ServiceGroup { name: "web".into(), services }],
+            },
+            ..Config::default()
+        }
+    }
+
+    fn instance(name: &str, node: &str, domains: &[&str]) -> Service {
+        let json = serde_json::json!({
+            "name": name, "nodeId": node, "nodePort": 3000, "domains": domains,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_multi_instance_services_sharing_a_domain() {
+        let cfg = group_of(vec![
+            instance("api", "n1", &["api.example.com"]),
+            instance("api", "n2", &["api.example.com"]),
+        ]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_same_service_twice_on_one_node() {
+        let cfg = group_of(vec![instance("api", "n1", &[]), instance("api", "n1", &[])]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_domain_claimed_by_two_services() {
+        let cfg = group_of(vec![
+            instance("api", "n1", &["x.example.com"]),
+            instance("web", "n2", &["x.example.com"]),
+        ]);
         assert!(cfg.validate().is_err());
     }
 
