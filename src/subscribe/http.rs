@@ -5,6 +5,7 @@
 //! over ordinary tunnels, so hosting nodes need no HTTP awareness. See
 //! `docs/http-proxy.md` for the design and the semantics below.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -27,7 +28,10 @@ use tokio::net::TcpStream;
 use tracing::{debug, info};
 
 use super::balancer::{Balancer, Pick};
-use super::proxy::{establish_tunnel, find_service_nodes, note_tunnel_failure, Tunnel, MAX_TUNNEL_ATTEMPTS};
+use super::proxy::{
+    establish_tunnel, note_tunnel_failure, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
+};
+use crate::config::{labels_match, Route};
 use crate::state::SharedState;
 
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -105,6 +109,15 @@ impl HttpProxy {
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
 
+        let routes = self.state.routes.load();
+        let routed = select_route(
+            routes.get(&self.service_name).map(Vec::as_slice).unwrap_or_default(),
+            &method,
+            &path,
+            &parts.headers,
+        );
+        let route_label = routed.as_ref().map_or_else(|| "default".to_string(), |r| r.label.clone());
+
         self.retry_budget.deposit();
         let mut tried: Vec<String> = Vec::new();
         let mut last_err: Option<String> = None;
@@ -115,7 +128,8 @@ impl HttpProxy {
                 Outcome::Error(StatusCode::BAD_REQUEST, "bad_request_body")
             }
             Ok(body) => {
-                self.attempt(&parts, &path_and_query, body, &mut tried, &mut last_err)
+                let subset = routed.as_ref().map(|r| &r.labels);
+                self.attempt(&parts, &path_and_query, body, subset, &mut tried, &mut last_err)
                     .await
             }
         };
@@ -167,7 +181,8 @@ impl HttpProxy {
             "stouter_http_requests_total",
             "service" => self.service_name.clone(),
             "method" => method_label(&method),
-            "code" => format!("{}xx", status / 100)
+            "code" => format!("{}xx", status / 100),
+            "route" => route_label.clone()
         )
         .increment(1);
         metrics::histogram!("stouter_http_request_duration_seconds", "service" => self.service_name.clone())
@@ -177,6 +192,7 @@ impl HttpProxy {
             service = %self.service_name,
             method = %method,
             path = %path,
+            route = %route_label,
             status,
             node = node.as_deref().unwrap_or("-"),
             attempts = tried.len(),
@@ -201,10 +217,22 @@ impl HttpProxy {
         parts: &http::request::Parts,
         path_and_query: &str,
         mut body: RequestBody,
+        subset: Option<&BTreeMap<String, String>>,
         tried: &mut Vec<String>,
         last_err: &mut Option<String>,
     ) -> Outcome {
-        let backends = find_service_nodes(&self.service_name, &self.state);
+        let all = service_backends(&self.service_name, &self.state);
+        self.balancer.retain_nodes(&all);
+        // A matched route narrows the candidates to its label subset; health
+        // filtering then fails open within that subset, not across it.
+        let candidates: Vec<_> = match subset {
+            Some(labels) => all.into_iter().filter(|b| labels_match(&b.labels, labels)).collect(),
+            None => all,
+        };
+        if candidates.is_empty() && subset.is_some() {
+            return Outcome::Error(StatusCode::SERVICE_UNAVAILABLE, "no_route_backend");
+        }
+        let backends = prefer_healthy(candidates, &self.service_name, &self.state);
         let max_attempts = backends.len().min(MAX_TUNNEL_ATTEMPTS);
         // A retryable status from an earlier node, returned if no later
         // attempt does better.
@@ -292,6 +320,41 @@ impl HttpProxy {
             (outcome, _) => outcome,
         }
     }
+}
+
+/// The outcome of route selection for one request.
+#[derive(Debug, PartialEq)]
+struct RoutedTo {
+    /// Route name (or position) for logs and metrics.
+    label: String,
+    /// Labels an instance must carry to serve the request.
+    labels: BTreeMap<String, String>,
+}
+
+/// Find the first route matching the request and pick one of its backend
+/// subsets by weight. `None` means no route matched: use every instance.
+fn select_route(routes: &[Route], method: &Method, path: &str, headers: &HeaderMap) -> Option<RoutedTo> {
+    let (index, route) = routes.iter().enumerate().find(|(_, r)| {
+        r.matches
+            .matches(method.as_str(), path, |name| headers.get(name).and_then(|v| v.to_str().ok()))
+    })?;
+    let total: u64 = route.backends.iter().map(|b| u64::from(b.weight)).sum();
+    // Validation guarantees a non-zero total; fall back to the first subset.
+    let mut ticket = if total == 0 { 0 } else { rand::random_range(0..total) };
+    let backend = route
+        .backends
+        .iter()
+        .find(|b| {
+            let w = u64::from(b.weight);
+            if ticket < w {
+                true
+            } else {
+                ticket -= w;
+                false
+            }
+        })
+        .unwrap_or(&route.backends[0]);
+    Some(RoutedTo { label: route.label(index), labels: backend.labels.clone() })
 }
 
 /// Request bodies up to this size (with a declared length) are buffered so
@@ -768,6 +831,50 @@ mod tests {
         assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(!is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+    }
+
+    fn routes(json: serde_json::Value) -> Vec<Route> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn first_matching_route_wins_and_unmatched_uses_default() {
+        let rs = routes(serde_json::json!([
+            {"name": "canary", "service": "api", "match": {"headers": {"x-canary": "true"}},
+             "backends": [{"labels": {"version": "v2"}}]},
+            {"name": "v2-path", "service": "api", "match": {"pathPrefix": "/v2"},
+             "backends": [{"labels": {"version": "v2"}}]},
+            {"name": "v1-path", "service": "api", "match": {"pathPrefix": "/v2/legacy"},
+             "backends": [{"labels": {"version": "v1"}}]},
+        ]));
+        let get = Method::GET;
+        let canary = headers(&[("x-canary", "true")]);
+        assert_eq!(select_route(&rs, &get, "/x", &canary).unwrap().label, "canary");
+        let none = HeaderMap::new();
+        assert_eq!(select_route(&rs, &get, "/v2/legacy/a", &none).unwrap().label, "v2-path");
+        assert!(select_route(&rs, &get, "/other", &none).is_none());
+    }
+
+    #[test]
+    fn route_backends_split_by_weight() {
+        let rs = routes(serde_json::json!([
+            {"service": "api", "backends": [
+                {"labels": {"version": "v1"}, "weight": 9},
+                {"labels": {"version": "v2"}, "weight": 1},
+                {"labels": {"version": "v3"}, "weight": 0}
+            ]}
+        ]));
+        let mut v2 = 0;
+        for _ in 0..10_000 {
+            let picked = select_route(&rs, &Method::GET, "/", &HeaderMap::new()).unwrap();
+            assert_eq!(picked.label, "#0");
+            match picked.labels["version"].as_str() {
+                "v2" => v2 += 1,
+                "v1" => {}
+                other => panic!("weight-0 subset {other} picked"),
+            }
+        }
+        assert!((800..1200).contains(&v2), "{v2}");
     }
 
     #[test]

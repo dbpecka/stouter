@@ -28,6 +28,9 @@ service mesh. Grouped by area, not prioritized.
   idempotent methods under a retry budget, and buffering of small bodies so
   they can be replayed.
 - HTTP health checks: optional `healthPath` per instance, requiring a 2xx.
+- L7 routing for `http` services: instance `labels` and ordered `routes`
+  (path prefix / method / header matches → weighted label subsets), managed
+  with `stouter route set|clear|list`.
 
 ## Security (identity & policy)
 - Certificate rotation without a restart, and revocation (a CRL or short-lived
@@ -37,8 +40,8 @@ service mesh. Grouped by area, not prioritized.
 - Finer-grained admin RBAC (per-group or per-operation rather than one allowlist).
 
 ## Traffic management
-- L7 routing: header/path/method route rules sending to instance subsets,
-  with per-route weights (M2 in `docs/http-proxy.md`).
+- Route actions beyond subset selection: path rewrites, header injection,
+  regex and presence-only header matches.
 - Further load-balancing policies on top of weighted round-robin: P2C /
   least-connections and consistent-hash (sticky sessions).
 - Request hedging, and counting 5xx responses toward outlier ejection
@@ -79,11 +82,9 @@ service mesh. Grouped by area, not prioritized.
 - Separate control-plane vs data-plane binaries once config grows.
 
 ## Next up
-Following `docs/http-proxy.md`:
-1. **M2 — L7 routing** — route rules (path/header → instance subsets with
-   weights). Needs a config-schema decision first: instance `labels` plus a
-   service-level `routes` list is the current proposal.
-2. **M3 — OTLP span export** — turns the propagated trace context into real
-   distributed traces.
-3. **M5 — Workload identity + L7 authorization** — per-service identities in
+1. **M3 — OTLP span export** — turns the trace context `http` services
+   already propagate into real distributed traces.
+2. **M5 — Workload identity + L7 authorization** — per-service identities in
    certs, enforced on hosting nodes.
+3. **A `/metrics` endpoint for `node`-mode daemons** — small, but tunnel
+   metrics recorded on nodes can't be scraped today.

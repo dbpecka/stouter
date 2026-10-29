@@ -276,6 +276,30 @@ setting is read for each new connection, so it can be switched without a
 restart. HTTP/2 and gRPC services should stay `tcp` for now. See
 [`docs/http-proxy.md`](docs/http-proxy.md) for the design and roadmap.
 
+### L7 Routing
+
+`http` services can be routed by path, method or header to labeled subsets of
+their instances, with weights — for example canary by header, or a 90/10
+version split:
+
+```bash
+stouter service add --group web --name api --port 3000 --protocol http --label version=v1
+stouter service add --group web --name api --port 3000 --protocol http --label version=v2 --node host2
+stouter route set --service api --routes '[
+  {"name": "canary", "match": {"headers": {"x-canary": "true"}},
+   "backends": [{"labels": {"version": "v2"}}]},
+  {"name": "split", "backends": [{"labels": {"version": "v1"}, "weight": 9},
+                                 {"labels": {"version": "v2"}, "weight": 1}]}
+]'
+```
+
+The first matching route wins. Requests that match no route use every
+instance. Retries stay inside the chosen subset, and a subset with no
+instances returns `503 no_route_backend`. `stouter route list` and
+`route clear` complete the set, all with `--remote` support. See
+[`docs/http-proxy.md`](docs/http-proxy.md#milestone-2-l7-routing-implemented)
+for the full semantics.
+
 ### Health Checks
 
 Every node probes each service it hosts every 5s by opening a TCP connection to

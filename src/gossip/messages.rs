@@ -69,6 +69,13 @@ pub enum AdminOp {
         request_timeout_ms: Option<u64>,
         #[serde(default)]
         health_path: Option<String>,
+        #[serde(default)]
+        labels: std::collections::BTreeMap<String, String>,
+    },
+    /// Replace every route for `service` (an empty list clears them).
+    RoutesSet {
+        service: String,
+        routes: Vec<crate::config::Route>,
     },
     ServiceRename {
         group: String,
@@ -145,6 +152,7 @@ mod tests {
         Message::ConfigUpdate {
             config: DynamicConfig {
                 version: 7,
+                routes: vec![],
                 service_groups: vec![ServiceGroup {
                     name: "web".into(),
                     services: vec![Service {
@@ -157,6 +165,7 @@ mod tests {
                         protocol: crate::config::Protocol::Tcp,
                         request_timeout_ms: None,
                         health_path: None,
+                        labels: Default::default(),
                     }],
                 }],
             },
@@ -249,6 +258,7 @@ mod tests {
         let msg = Message::ConfigUpdate {
             config: DynamicConfig {
                 version: 42,
+                routes: vec![],
                 service_groups: vec![ServiceGroup {
                     name: "web".into(),
                     services: vec![Service {
@@ -261,6 +271,7 @@ mod tests {
                         protocol: crate::config::Protocol::Tcp,
                         request_timeout_ms: None,
                         health_path: None,
+                        labels: Default::default(),
                     }],
                 }],
             },
@@ -277,7 +288,7 @@ mod tests {
     #[test]
     fn sync_round_trip() {
         let msg = Message::Sync {
-            config: DynamicConfig { version: 1, service_groups: vec![] },
+            config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![] },
             nodes: vec![NodeInfo {
                 id: "n1".into(),
                 addr: "10.0.0.1:8080".into(),
@@ -363,7 +374,7 @@ mod tests {
             mode: "node".into(),
             node_id: "host1".into(),
             bind: "0.0.0.0:8080".into(),
-            dynamic_config: DynamicConfig { version: 1, service_groups: vec![] },
+            dynamic_config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![] },
             known_nodes: vec![],
         };
         match msgpack_round_trip(&msg) {
@@ -395,6 +406,7 @@ mod tests {
                 protocol: crate::config::Protocol::Http,
                 request_timeout_ms: Some(1500),
                 health_path: Some("/healthz".into()),
+                labels: [("version".to_string(), "v2".to_string())].into(),
             },
         };
         match msgpack_round_trip(&msg) {
@@ -411,6 +423,7 @@ mod tests {
                         protocol,
                         request_timeout_ms,
                         health_path,
+                        labels,
                     },
             } => {
                 assert_eq!(group, "web");
@@ -423,6 +436,7 @@ mod tests {
                 assert_eq!(protocol, crate::config::Protocol::Http);
                 assert_eq!(request_timeout_ms, Some(1500));
                 assert_eq!(health_path.as_deref(), Some("/healthz"));
+                assert_eq!(labels["version"], "v2");
             }
             other => panic!("wrong variant: {other:?}"),
         }

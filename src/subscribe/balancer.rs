@@ -32,6 +32,8 @@ pub struct Backend {
     pub max_connections: Option<u32>,
     /// HTTP only: time allowed for response headers.
     pub request_timeout: Option<Duration>,
+    /// The instance's labels, for L7 route subsets.
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Outcome of [`Balancer::pick`].
@@ -106,10 +108,6 @@ impl Balancer {
     pub fn pick(self: &Arc<Self>, candidates: &[Backend], tried: &[String], now: Instant) -> Pick {
         let mut inner = self.inner.lock().unwrap();
 
-        // Forget nodes no longer hosting the service so the maps stay bounded.
-        inner.current.retain(|id, _| candidates.iter().any(|b| &b.node.id == id));
-        inner.outliers.retain(|id, _| candidates.iter().any(|b| &b.node.id == id));
-
         let untried: Vec<usize> = (0..candidates.len())
             .filter(|&i| !tried.contains(&candidates[i].node.id))
             .collect();
@@ -160,6 +158,15 @@ impl Balancer {
             index: chosen,
             slot: Slot { balancer: Arc::clone(self), node_id },
         }
+    }
+
+    /// Forget state for nodes no longer hosting the service, so the maps stay
+    /// bounded. Takes the service's full instance set: `pick` may be given a
+    /// subset (an L7 route), which must not erase other nodes' ejection state.
+    pub fn retain_nodes(&self, all: &[Backend]) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.current.retain(|id, _| all.iter().any(|b| &b.node.id == id));
+        inner.outliers.retain(|id, _| all.iter().any(|b| &b.node.id == id));
     }
 
     /// Record that a tunnel to `node_id` was established.
@@ -214,6 +221,7 @@ mod tests {
             weight,
             max_connections: None,
             request_timeout: None,
+            labels: Default::default(),
         }
     }
 
@@ -392,10 +400,26 @@ mod tests {
         for _ in 0..EJECT_AFTER_FAILURES {
             b.record_failure("gone", now);
         }
-        let _ = b.pick(&[backend("a", 1)], &[], now);
+        b.retain_nodes(&[backend("a", 1)]);
         let inner = b.inner.lock().unwrap();
         assert!(!inner.outliers.contains_key("gone"));
         assert!(!inner.current.contains_key("gone"));
+    }
+
+    #[test]
+    fn picking_from_a_subset_keeps_other_nodes_ejection_state() {
+        let b = Arc::new(Balancer::new());
+        let now = Instant::now();
+        for _ in 0..EJECT_AFTER_FAILURES {
+            b.record_failure("a", now);
+        }
+        // Requests routed to a subset without `a`...
+        for _ in 0..5 {
+            let _ = b.pick(&[backend("b", 1)], &[], now);
+        }
+        // ...must not have reset `a`'s ejection.
+        let backends = [backend("a", 1), backend("c", 1)];
+        assert_eq!(picks(&b, &backends, 4, now), ["c", "c", "c", "c"]);
     }
 
     #[test]
@@ -446,7 +470,7 @@ mod tests {
         let now = Instant::now();
         let (_, held) = pick_one(&b, &[limited("a", 1)], &[], now).unwrap();
         // a disappears from the candidate set while its connection is open...
-        let _ = b.pick(&[backend("b", 1)], &[], now);
+        b.retain_nodes(&[backend("b", 1)]);
         // ...and comes back: its open connection still counts.
         assert!(matches!(b.pick(&[limited("a", 1)], &[], now), Pick::AtCapacity));
         drop(held);

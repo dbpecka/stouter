@@ -55,6 +55,11 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Manage L7 routes for HTTP services
+    Route {
+        #[command(subcommand)]
+        action: RouteAction,
+    },
     /// Manage TLS certificates
     Cert {
         #[command(subcommand)]
@@ -107,6 +112,10 @@ enum ServiceAction {
         /// failure). Unset: TCP connect check only.
         #[arg(long)]
         health_path: Option<String>,
+        /// Label for routes to select this instance by, as `key=value`.
+        /// Repeatable.
+        #[arg(long = "label", value_parser = parse_label)]
+        labels: Vec<(String, String)>,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -183,6 +192,36 @@ enum ServiceAction {
         node: Option<String>,
         /// Address `host:port` of a remote daemon to mutate via admin RPC.
         /// When set, no local config file is read or written.
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouteAction {
+    /// Replace all routes for a service
+    Set {
+        /// Service the routes apply to
+        #[arg(long)]
+        service: String,
+        /// JSON array of routes, or `@path` to read it from a file. The
+        /// `service` field of each route may be omitted.
+        #[arg(long)]
+        routes: String,
+        /// Address `host:port` of a remote daemon to mutate via admin RPC.
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Remove all routes for a service
+    Clear {
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// List routes
+    List {
+        /// Address `host:port` of a remote daemon to query.
         #[arg(long)]
         remote: Option<String>,
     },
@@ -329,6 +368,7 @@ async fn main() -> Result<()> {
                     protocol,
                     request_timeout_ms,
                     health_path,
+                    labels,
                     node,
                     remote,
                 },
@@ -336,6 +376,7 @@ async fn main() -> Result<()> {
             if let Some(path) = &health_path {
                 config::validate_health_path(path).map_err(anyhow::Error::msg)?;
             }
+            let labels: std::collections::BTreeMap<String, String> = labels.into_iter().collect();
             if let Some(target) = remote {
                 let cfg = Config::load(&cli.config).unwrap_or_default();
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
@@ -352,6 +393,7 @@ async fn main() -> Result<()> {
                         protocol,
                         request_timeout_ms,
                         health_path,
+                        labels,
                     },
                     &cfg,
                     cli.cert_dir.as_deref(),
@@ -374,6 +416,7 @@ async fn main() -> Result<()> {
                     protocol,
                     request_timeout_ms,
                     health_path,
+                    labels,
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -560,6 +603,76 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
+        // route set / clear
+        // -----------------------------------------------------------------
+        Some(Commands::Route {
+            action: action @ (RouteAction::Set { .. } | RouteAction::Clear { .. }),
+        }) => {
+            let (service, routes, remote) = match action {
+                RouteAction::Set { service, routes, remote } => {
+                    let routes = parse_routes(&service, &routes)?;
+                    (service, routes, remote)
+                }
+                RouteAction::Clear { service, remote } => (service, Vec::new(), remote),
+                RouteAction::List { .. } => unreachable!("matched above"),
+            };
+            let count = routes.len();
+            let version = if let Some(target) = &remote {
+                let cfg = Config::load(&cli.config).unwrap_or_default();
+                run_admin_rpc(
+                    target,
+                    AdminOp::RoutesSet { service: service.clone(), routes },
+                    &cfg,
+                    cli.cert_dir.as_deref(),
+                )
+                .await?
+            } else {
+                let mut cfg = Config::load(&cli.config)?;
+                let version = cfg
+                    .dynamic_config
+                    .set_routes(&service, routes)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                cfg.save(&cli.config)?;
+                broadcast_config(&cfg, &cli.config).await?;
+                version
+            };
+            println!("Set {count} route(s) for '{service}' (version {version})");
+        }
+
+        // -----------------------------------------------------------------
+        // route list
+        // -----------------------------------------------------------------
+        Some(Commands::Route { action: RouteAction::List { remote } }) => {
+            let dc = if let Some(target) = remote {
+                let cfg = Config::load(&cli.config).unwrap_or_default();
+                fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?
+            } else {
+                Config::load(&cli.config)?.dynamic_config
+            };
+            if dc.routes.is_empty() {
+                println!("No routes configured");
+            }
+            for (i, route) in dc.routes.iter().enumerate() {
+                let backends: Vec<String> = route
+                    .backends
+                    .iter()
+                    .map(|b| {
+                        let labels: Vec<String> = b.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                        let labels = if labels.is_empty() { "*".to_string() } else { labels.join(",") };
+                        format!("{labels} weight={}", b.weight)
+                    })
+                    .collect();
+                println!(
+                    "{} {:<10} match={} -> {}",
+                    route.service,
+                    route.label(i),
+                    serde_json::to_string(&route.matches)?,
+                    backends.join(" | ")
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------
         // service move (cross-cluster)
         // -----------------------------------------------------------------
         Some(Commands::Service {
@@ -590,7 +703,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains, weight, max_connections, protocol, request_timeout_ms, health_path) = src_dc
+            let (port, domains, weight, max_connections, protocol, request_timeout_ms, health_path, labels) = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -608,6 +721,7 @@ async fn main() -> Result<()> {
                         s.protocol,
                         s.request_timeout_ms,
                         s.health_path.clone(),
+                        s.labels.clone(),
                     )
                 })
                 .ok_or_else(|| {
@@ -634,6 +748,7 @@ async fn main() -> Result<()> {
                     protocol,
                     request_timeout_ms,
                     health_path,
+                    labels,
                 },
                 &cfg,
                 to_certs,
@@ -874,5 +989,64 @@ fn print_status(
                 node.health.unhealthy.join(", ")
             );
         }
+    }
+}
+
+/// Parse a `key=value` label argument.
+fn parse_label(arg: &str) -> std::result::Result<(String, String), String> {
+    match arg.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("label '{arg}' must look like key=value")),
+    }
+}
+
+/// Parse `--routes` (inline JSON or `@file`) for `service`. Each route's
+/// `service` may be omitted and defaults to `service`.
+fn parse_routes(service: &str, arg: &str) -> Result<Vec<config::Route>> {
+    let text = match arg.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path).with_context(|| format!("read {path}"))?,
+        None => arg.to_string(),
+    };
+    let mut raw: Vec<serde_json::Value> = serde_json::from_str(&text).context("routes must be a JSON array")?;
+    for route in &mut raw {
+        if let Some(obj) = route.as_object_mut() {
+            obj.entry("service").or_insert_with(|| service.into());
+        }
+    }
+    let routes: Vec<config::Route> = serde_json::from_value(raw.into()).context("invalid route")?;
+    config::validate_routes(service, &routes).map_err(anyhow::Error::msg)?;
+    Ok(routes)
+}
+
+/// Push a locally changed config to the cluster.
+async fn broadcast_config(cfg: &Config, path: &str) -> Result<()> {
+    let tls_ctx = match &cfg.tls_dir {
+        Some(dir) => Some(tls::TlsContext::new(&pki::load_or_create(dir, &cfg.node_id)?)?),
+        None => None,
+    };
+    let state = SharedState::new(cfg.clone(), path.to_string(), CancellationToken::new(), tls_ctx);
+    gossip::broadcast_message(&state, Message::ConfigUpdate { config: cfg.dynamic_config.clone() }).await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_routes_fills_in_service_and_validates() {
+        let routes = parse_routes("api", r#"[{"match": {"pathPrefix": "/v2"}, "backends": [{"labels": {"version": "v2"}}]}]"#).unwrap();
+        assert_eq!(routes[0].service, "api");
+        assert!(parse_routes("api", r#"[{"service": "web", "backends": [{}]}]"#).is_err());
+        assert!(parse_routes("api", r#"{"not": "an array"}"#).is_err());
+        assert!(parse_routes("api", r#"[{"backends": []}]"#).is_err());
+    }
+
+    #[test]
+    fn parse_label_requires_key() {
+        assert_eq!(parse_label("version=v2").unwrap(), ("version".into(), "v2".into()));
+        assert_eq!(parse_label("empty=").unwrap(), ("empty".into(), String::new()));
+        assert!(parse_label("=v2").is_err());
+        assert!(parse_label("novalue").is_err());
     }
 }

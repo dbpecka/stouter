@@ -9,7 +9,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, DynamicConfig, NodeInfo, Service, ServiceHealth};
+use crate::config::{Config, DynamicConfig, NodeInfo, Route, Service, ServiceHealth};
 use crate::tls::{MeshStream, TlsContext};
 
 /// Pool of idle connections keyed by a string identifier.
@@ -155,6 +155,9 @@ pub struct SharedState {
     pub known_nodes: ArcSwap<HashMap<String, NodeInfo>>,
     known_nodes_write: tokio::sync::Mutex<()>,
     pub service_index: ArcSwap<HashMap<(String, String), Service>>,
+    /// Routes per service name, in evaluation order. Rebuilt with
+    /// `service_index` so request handling never takes the config lock.
+    pub routes: ArcSwap<HashMap<String, Vec<Route>>>,
     /// Health of the services this node hosts, maintained by the local
     /// health checker and gossiped in this node's own `NodeInfo`.
     pub local_health: ArcSwap<ServiceHealth>,
@@ -181,6 +184,7 @@ impl SharedState {
         let dynamic_config = config.dynamic_config.clone();
         let bootstrap_peers = config.known_nodes.clone();
         let service_index = build_service_index(&dynamic_config);
+        let routes = build_route_index(&dynamic_config);
 
         Arc::new(Self {
             config: Arc::new(config),
@@ -188,6 +192,7 @@ impl SharedState {
             known_nodes: ArcSwap::from_pointee(HashMap::new()),
             known_nodes_write: tokio::sync::Mutex::new(()),
             service_index: ArcSwap::from_pointee(service_index),
+            routes: ArcSwap::from_pointee(routes),
             local_health: ArcSwap::from_pointee(ServiceHealth::default()),
             bootstrap_peers,
             config_path,
@@ -220,6 +225,7 @@ impl SharedState {
         let dc = self.dynamic_config.read().await;
         let idx = build_service_index(&dc);
         self.service_index.store(Arc::new(idx));
+        self.routes.store(Arc::new(build_route_index(&dc)));
     }
 
     /// Whether `node_id` reports `service_name` as failing its health check.
@@ -254,6 +260,14 @@ fn build_service_index(dc: &DynamicConfig) -> HashMap<(String, String), Service>
         for svc in &group.services {
             idx.insert((svc.node_id.clone(), svc.name.clone()), svc.clone());
         }
+    }
+    idx
+}
+
+fn build_route_index(dc: &DynamicConfig) -> HashMap<String, Vec<Route>> {
+    let mut idx: HashMap<String, Vec<Route>> = HashMap::new();
+    for route in &dc.routes {
+        idx.entry(route.service.clone()).or_default().push(route.clone());
     }
     idx
 }

@@ -1,8 +1,7 @@
 # Design: HTTP-aware data plane
 
-Status: milestone 1 implemented, plus the resilience half of M2 (HTTP
-health checks, status retries under a budget, body buffering); L7 routing and
-later milestones proposed.
+Status: milestones 1 and 2 implemented (M2: L7 routing, HTTP health checks,
+status retries under a budget, body buffering); M3–M5 proposed.
 
 ## Problem
 
@@ -86,17 +85,84 @@ Request flow for an `http` service:
 - **Downstream HTTP/2 (h2c) and gRPC.** gRPC services should stay `tcp` for now.
 - **TLS from the application to the local proxy.** It listens on loopback.
 
+## Milestone 2: L7 routing (implemented)
+
+### Schema
+
+Instances carry free-form `labels`. Routes live at the top level of
+`dynamicConfig` (so they're gossiped and versioned with the rest of the
+config), each naming the service it applies to:
+
+```json
+{
+  "dynamicConfig": {
+    "serviceGroups": [{ "name": "web", "services": [
+      { "name": "api", "nodeId": "n1", "nodePort": 3000, "protocol": "http", "labels": { "version": "v1" } },
+      { "name": "api", "nodeId": "n2", "nodePort": 3000, "protocol": "http", "labels": { "version": "v2" } }
+    ]}],
+    "routes": [
+      { "name": "canary", "service": "api",
+        "match": { "headers": { "x-canary": "true" } },
+        "backends": [{ "labels": { "version": "v2" } }] },
+      { "name": "split", "service": "api",
+        "backends": [{ "labels": { "version": "v1" }, "weight": 9 },
+                     { "labels": { "version": "v2" }, "weight": 1 }] }
+    ]
+  }
+}
+```
+
+Why this shape:
+
+- **Labels on instances, not named subsets.** Whoever adds an instance tags it,
+  and routes select by label. There's no separate subset registry to keep in
+  sync.
+- **Routes at the top level, keyed by service.** Instances of one service can
+  sit in different groups, and subscribers already address services by bare
+  name, so a route belongs to the service rather than to a group.
+- **An ordered list, first match wins.** This is easy to predict, and it's how
+  most proxies (Envoy, nginx `location`) behave.
+
+### Semantics
+
+| Concern | Behaviour |
+|---|---|
+| Evaluation | A service's routes are tried in order; the first whose `match` fits wins. No match → every instance, as without routes. |
+| `match` | `pathPrefix` (on segment boundaries: `/v2` matches `/v2` and `/v2/x`, not `/v20`), `method` (exact), `headers` (exact values, case-insensitive names). All present conditions must hold; an empty `match` matches everything. |
+| `backends` | Weighted instance subsets. Each request picks one subset by weight (random), then the balancer picks an instance inside it as usual. An empty `labels` selects every instance. |
+| Retries | Stay inside the chosen subset: a canary request is never retried onto stable instances. |
+| Health | Health filtering fails open **within** the subset, just as it does service-wide. A subset whose instances are all unhealthy still gets its share, which matches Envoy's panic mode. Drain an instance with weight 0, or remove it from the route. |
+| Empty subset | If no instance carries the labels → `503` with `x-stouter-error: no_route_backend`. |
+| Observability | The route name (or `#index`, or `default`) appears in the access log as `route=` and as the `route` label on `stouter_http_requests_total`. |
+| Validation | A routed service must exist and be `http` on every instance; backends must be non-empty with a non-zero total weight; `pathPrefix` must start with `/`, `method` must be uppercase, header names must be valid. This is checked by `stouter check`, the CLI and the admin RPC alike. |
+
+### Managing routes
+
+```bash
+stouter service add --group web --name api --port 3000 --protocol http --label version=v2
+stouter route set   --service api --routes @routes.json   # replaces all of api's routes
+stouter route clear --service api
+stouter route list
+```
+
+`set` and `clear` take `--remote host:port` for the admin RPC, like `service`.
+The `service` field may be left out of routes passed to `route set`.
+
+### Mixed versions
+
+Older nodes ignore `routes` and `labels`, so they route by plain balancing.
+An older node that *mutates* the config (for example with `service add`)
+writes it back without the fields it doesn't know. That means `routes`,
+`labels`, and every other field added since (`weight`, `maxConnections`,
+`protocol`, `requestTimeoutMs`, `healthPath`). The new version then
+propagates cluster-wide with those fields gone. Upgrade every node that runs
+admin mutations before relying on any of them.
+
 ## Later milestones
 
-**M2 — L7 routing and HTTP health.**
-- Route rules per service: match on path prefix, method or header, and send
-  to a subset of instances (selected by labels), with weights per route. Canary
-  by header becomes possible. *(Proposed; needs a config-schema decision.)*
-- `healthPath` health checks, probed by the hosting node through the existing
-  health gossip. They report an unhealthy *status*, not just a closed port.
-  *(Done.)*
-- Retries on `502/503/504` for idempotent methods, limited by a retry budget,
-  and small-body buffering so requests with bodies can be replayed. *(Done.)*
+**M2 follow-ups.** Path rewriting and header injection on routes; regex and
+presence-only header matches; cross-cluster `service move` carrying the
+service's routes.
 
 **M3 — Span export.** Each proxy hop emits an OpenTelemetry span over OTLP
 (optional collector endpoint in config), using the trace ids M1 already

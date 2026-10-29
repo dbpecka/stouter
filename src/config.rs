@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
@@ -49,6 +49,137 @@ pub struct Service {
     /// status counts as a failure. Unset: a TCP connect check only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_path: Option<String>,
+    /// Free-form key/value labels that routes select instances by
+    /// (e.g. `version: v2`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}
+
+/// True if `labels` include every key/value in `selector`.
+pub fn labels_match(labels: &BTreeMap<String, String>, selector: &BTreeMap<String, String>) -> bool {
+    selector.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
+/// An L7 routing rule for an `http` service.
+///
+/// A service's routes are tried in order; the first whose `match` fits the
+/// request decides which instances may serve it. Requests matching no route
+/// go to all instances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Route {
+    /// Optional name, shown in access logs and metrics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Service this route applies to.
+    pub service: String,
+    /// Conditions a request must meet; all must hold. Empty matches all.
+    #[serde(default, rename = "match")]
+    pub matches: RouteMatch,
+    /// Instance subsets to send matching requests to, split by weight.
+    pub backends: Vec<RouteBackend>,
+}
+
+impl Route {
+    /// Label for logs and metrics: the name, or the route's position.
+    pub fn label(&self, index: usize) -> String {
+        self.name.clone().unwrap_or_else(|| format!("#{index}"))
+    }
+}
+
+/// Request conditions for a [`Route`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteMatch {
+    /// Path prefix, matched on segment boundaries: `/v2` matches `/v2` and
+    /// `/v2/users` but not `/v20`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// Exact request method, e.g. `GET`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Headers that must be present with exactly these values (names are
+    /// case-insensitive).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl RouteMatch {
+    /// Whether a request with this method, path and headers matches.
+    /// `header` looks up a header value by (lowercase) name.
+    pub fn matches<'a>(
+        &self,
+        method: &str,
+        path: &str,
+        header: impl Fn(&str) -> Option<&'a str>,
+    ) -> bool {
+        if let Some(prefix) = &self.path_prefix {
+            if !path_has_prefix(path, prefix) {
+                return false;
+            }
+        }
+        if let Some(m) = &self.method {
+            if m != method {
+                return false;
+            }
+        }
+        self.headers
+            .iter()
+            .all(|(name, value)| header(&name.to_ascii_lowercase()) == Some(value.as_str()))
+    }
+}
+
+/// Segment-aware prefix match: `/v2` matches `/v2` and `/v2/x`, not `/v20`.
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// One weighted instance subset of a [`Route`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteBackend {
+    /// Instances carrying all of these labels form the subset. Empty selects
+    /// every instance.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Share of matching requests sent to this subset.
+    #[serde(default = "default_weight", skip_serializing_if = "is_default_weight")]
+    pub weight: u32,
+}
+
+/// Check a service's route list for mistakes that would make it misbehave.
+pub fn validate_routes(service: &str, routes: &[Route]) -> std::result::Result<(), String> {
+    for (i, route) in routes.iter().enumerate() {
+        let at = format!("route {} of service '{service}'", route.label(i));
+        if route.service != service {
+            return Err(format!("{at} names service '{}'", route.service));
+        }
+        if route.backends.is_empty() {
+            return Err(format!("{at} has no backends"));
+        }
+        if route.backends.iter().all(|b| b.weight == 0) {
+            return Err(format!("{at} has no backend with a non-zero weight"));
+        }
+        if let Some(prefix) = &route.matches.path_prefix {
+            if !prefix.starts_with('/') {
+                return Err(format!("{at}: pathPrefix '{prefix}' must start with '/'"));
+            }
+        }
+        if let Some(method) = &route.matches.method {
+            if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+                return Err(format!("{at}: method '{method}' must be an uppercase token like GET"));
+            }
+        }
+        for name in route.matches.headers.keys() {
+            if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(format!("{at}: '{name}' is not a valid header name"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Check that `path` can be sent verbatim as an HTTP request target.
@@ -129,6 +260,9 @@ impl SubscribeFilter {
 pub struct DynamicConfig {
     pub version: u64,
     pub service_groups: Vec<ServiceGroup>,
+    /// L7 routing rules for `http` services, in evaluation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<Route>,
 }
 
 impl Default for DynamicConfig {
@@ -136,6 +270,7 @@ impl Default for DynamicConfig {
         Self {
             version: 0,
             service_groups: Vec::new(),
+            routes: Vec::new(),
         }
     }
 }
@@ -194,6 +329,40 @@ impl DynamicConfig {
         }
         self.version += 1;
         self.version
+    }
+
+    /// Check that `service` can carry routes: it exists and every instance
+    /// speaks HTTP.
+    pub fn validate_route_target(&self, service: &str) -> std::result::Result<(), String> {
+        let instances: Vec<&Service> = self
+            .service_groups
+            .iter()
+            .flat_map(|g| &g.services)
+            .filter(|s| s.name == service)
+            .collect();
+        if instances.is_empty() {
+            return Err(format!("routes reference unknown service '{service}'"));
+        }
+        if instances.iter().any(|s| s.protocol != Protocol::Http) {
+            return Err(format!("routes for '{service}' require every instance to have protocol: http"));
+        }
+        Ok(())
+    }
+
+    /// Replace all routes for `service` with `routes` (empty clears them).
+    /// Bumps `version` and returns the new version.
+    pub fn set_routes(&mut self, service: &str, routes: Vec<Route>) -> Result<u64, MutateErr> {
+        if !routes.is_empty() {
+            self.validate_route_target(service).map_err(MutateErr::Invalid)?;
+        }
+        validate_routes(service, &routes).map_err(MutateErr::Invalid)?;
+        // Keep other services' routes where they were.
+        let insert_at = self.routes.iter().position(|r| r.service == service);
+        self.routes.retain(|r| r.service != service);
+        let at = insert_at.unwrap_or(self.routes.len()).min(self.routes.len());
+        self.routes.splice(at..at, routes);
+        self.version += 1;
+        Ok(self.version)
     }
 
     /// Remove the service identified by `(group, owner_node_id, name)`.
@@ -431,6 +600,21 @@ impl Config {
             }
         }
 
+        let mut routed: Vec<&str> = self.dynamic_config.routes.iter().map(|r| r.service.as_str()).collect();
+        routed.sort();
+        routed.dedup();
+        for service in routed {
+            self.dynamic_config.validate_route_target(service).map_err(|e| anyhow!(e))?;
+            let routes: Vec<Route> = self
+                .dynamic_config
+                .routes
+                .iter()
+                .filter(|r| r.service == service)
+                .cloned()
+                .collect();
+            validate_routes(service, &routes).map_err(|e| anyhow!(e))?;
+        }
+
         if self.subscribe_filter.is_some()
             && !matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe)
         {
@@ -612,6 +796,7 @@ mod tests {
         Config {
             dynamic_config: DynamicConfig {
                 version: 1,
+                routes: vec![],
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
             },
             ..Config::default()
@@ -632,6 +817,125 @@ mod tests {
             instance("api", "n2", &["api.example.com"]),
         ]);
         cfg.validate().unwrap();
+    }
+
+    fn http_instance(name: &str, node: &str, labels: &[(&str, &str)]) -> Service {
+        let mut svc = instance(name, node, &[]);
+        svc.protocol = Protocol::Http;
+        svc.labels = labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        svc
+    }
+
+    fn route(json: serde_json::Value) -> Route {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn route_json_schema() {
+        let r = route(serde_json::json!({
+            "name": "canary",
+            "service": "api",
+            "match": {"pathPrefix": "/v2", "method": "GET", "headers": {"X-Canary": "true"}},
+            "backends": [{"labels": {"version": "v2"}, "weight": 9}, {"labels": {"version": "v1"}}]
+        }));
+        assert_eq!(r.matches.path_prefix.as_deref(), Some("/v2"));
+        assert_eq!(r.backends[1].weight, DEFAULT_WEIGHT);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"match\":{"), "{json}");
+        assert_eq!(route(serde_json::from_str(&json).unwrap()), r);
+        // Routes are omitted from config JSON when there are none.
+        assert!(!serde_json::to_string(&DynamicConfig::default()).unwrap().contains("routes"));
+    }
+
+    #[test]
+    fn path_prefix_matches_on_segment_boundaries() {
+        assert!(path_has_prefix("/v2", "/v2"));
+        assert!(path_has_prefix("/v2/users", "/v2"));
+        assert!(!path_has_prefix("/v20", "/v2"));
+        assert!(path_has_prefix("/v2/users", "/v2/"));
+        assert!(!path_has_prefix("/v2", "/v2/"));
+        assert!(path_has_prefix("/anything", "/"));
+    }
+
+    #[test]
+    fn route_match_requires_all_conditions() {
+        let m = RouteMatch {
+            path_prefix: Some("/api".into()),
+            method: Some("POST".into()),
+            headers: [("X-Canary".to_string(), "true".to_string())].into(),
+        };
+        let canary = |name: &str| (name == "x-canary").then_some("true");
+        let none = |_: &str| None;
+        assert!(m.matches("POST", "/api/x", canary));
+        assert!(!m.matches("GET", "/api/x", canary));
+        assert!(!m.matches("POST", "/other", canary));
+        assert!(!m.matches("POST", "/api/x", none));
+        assert!(RouteMatch::default().matches("GET", "/", none));
+    }
+
+    #[test]
+    fn route_validation_errors() {
+        let ok = serde_json::json!({"service": "api", "backends": [{"labels": {"v": "1"}}]});
+        assert!(validate_routes("api", &[route(ok.clone())]).is_ok());
+        let cases = [
+            serde_json::json!({"service": "web", "backends": [{}]}),
+            serde_json::json!({"service": "api", "backends": []}),
+            serde_json::json!({"service": "api", "backends": [{"weight": 0}]}),
+            serde_json::json!({"service": "api", "match": {"pathPrefix": "v2"}, "backends": [{}]}),
+            serde_json::json!({"service": "api", "match": {"method": "get"}, "backends": [{}]}),
+            serde_json::json!({"service": "api", "match": {"headers": {"bad header": "x"}}, "backends": [{}]}),
+        ];
+        for case in cases {
+            assert!(validate_routes("api", &[route(case.clone())]).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn set_routes_replaces_one_service_in_place() {
+        let mut dc = DynamicConfig::default();
+        for name in ["api", "web"] {
+            dc.upsert_service("g", http_instance(name, "n1", &[]));
+        }
+        let r = |svc: &str, name: &str| route(serde_json::json!({"name": name, "service": svc, "backends": [{}]}));
+        dc.set_routes("api", vec![r("api", "a1"), r("api", "a2")]).unwrap();
+        dc.set_routes("web", vec![r("web", "w1")]).unwrap();
+        dc.set_routes("api", vec![r("api", "a3")]).unwrap();
+        let names: Vec<_> = dc.routes.iter().map(|r| r.name.clone().unwrap()).collect();
+        assert_eq!(names, ["a3", "w1"]);
+        dc.set_routes("api", vec![]).unwrap();
+        assert_eq!(dc.routes.len(), 1);
+    }
+
+    #[test]
+    fn routes_require_existing_http_service() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service("g", instance("tcp-svc", "n1", &[]));
+        let r = |svc: &str| route(serde_json::json!({"service": svc, "backends": [{}]}));
+        assert!(matches!(dc.set_routes("missing", vec![r("missing")]), Err(MutateErr::Invalid(_))));
+        assert!(matches!(dc.set_routes("tcp-svc", vec![r("tcp-svc")]), Err(MutateErr::Invalid(_))));
+        // Clearing never needs the service to exist.
+        assert!(dc.set_routes("missing", vec![]).is_ok());
+
+        let mut cfg = group_of(vec![http_instance("api", "n1", &[]), instance("api", "n2", &[])]);
+        cfg.dynamic_config.routes = vec![r("api")];
+        assert!(cfg.validate().is_err(), "a tcp instance must reject routes");
+        cfg.dynamic_config.service_groups[0].services[1].protocol = Protocol::Http;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn labels_match_requires_every_selector_pair() {
+        let have: BTreeMap<String, String> = [("version", "v2"), ("zone", "a")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let want = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        assert!(labels_match(&have, &want(&[])));
+        assert!(labels_match(&have, &want(&[("version", "v2")])));
+        assert!(!labels_match(&have, &want(&[("version", "v1")])));
+        assert!(!labels_match(&have, &want(&[("version", "v2"), ("tier", "x")])));
     }
 
     #[test]
@@ -734,6 +1038,7 @@ mod tests {
                 protocol: crate::config::Protocol::Tcp,
                 request_timeout_ms: None,
                 health_path: None,
+                labels: Default::default(),
             },
         );
         assert_eq!(v, 1);
@@ -748,11 +1053,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let v = dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups.len(), 1);
@@ -764,7 +1069,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let v = dc.upsert_service(
             "web",
@@ -778,6 +1083,7 @@ mod tests {
                 protocol: crate::config::Protocol::Http,
                 request_timeout_ms: Some(100),
                 health_path: Some("/h".into()),
+                labels: [("version".to_string(), "v2".to_string())].into(),
             },
         );
         assert_eq!(v, 2);
@@ -791,6 +1097,7 @@ mod tests {
         assert_eq!(svc.protocol, Protocol::Http);
         assert_eq!(svc.request_timeout_ms, Some(100));
         assert_eq!(svc.health_path.as_deref(), Some("/h"));
+        assert_eq!(svc.labels["version"], "v2");
     }
 
     #[test]
@@ -798,11 +1105,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         assert_eq!(dc.service_groups[0].services.len(), 2);
     }
@@ -812,7 +1119,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let v = dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(v, 2);
@@ -831,7 +1138,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let err = dc.remove_service("web", "n1", "api").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -842,11 +1149,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 1);
@@ -858,7 +1165,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
         assert_eq!(v, 2);
@@ -877,7 +1184,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -888,11 +1195,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None },
+            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default() },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::DuplicateService { .. }));
@@ -958,6 +1265,7 @@ mod tests {
             node_id: "host1".into(),
             dynamic_config: DynamicConfig {
                 version: 5,
+                routes: vec![],
                 service_groups: vec![ServiceGroup {
                     name: "web".into(),
                     services: vec![Service {
@@ -970,6 +1278,7 @@ mod tests {
                         protocol: crate::config::Protocol::Tcp,
                         request_timeout_ms: None,
                         health_path: None,
+                        labels: Default::default(),
                     }],
                 }],
             },

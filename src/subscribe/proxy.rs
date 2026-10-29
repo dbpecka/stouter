@@ -84,7 +84,9 @@ async fn serve_client(
     state: Arc<SharedState>,
     balancer: Arc<Balancer>,
 ) {
-    let backends = find_service_nodes(&service_name, &state);
+    let all = service_backends(&service_name, &state);
+    balancer.retain_nodes(&all);
+    let backends = prefer_healthy(all, &service_name, &state);
     if backends.is_empty() {
         metrics::counter!("stouter_tunnel_errors_total", "service" => service_name.clone(), "reason" => "no_nodes").increment(1);
         tracing::warn!("no nodes available for service {service_name}");
@@ -178,17 +180,14 @@ pub(super) fn service_is_http(service_name: &str, state: &SharedState) -> bool {
 }
 
 /// Find the nodes hosting a given service, ordered and health-filtered.
-///
-/// Scans the service index for entries matching `service_name`, resolves each
-/// node_id to its current `NodeInfo`, sorts by node id so balancer state maps
-/// to a stable node across connections, then drops nodes whose gossip
-/// liveness marker is stale and nodes whose health check reports the service
-/// down.
-///
-/// Each filter fails open: if it would drop every node (e.g. a cluster-wide
-/// gossip hiccup, or a health check misconfigured everywhere), it is skipped
-/// so per-connection retry can still find a working backend.
-pub(super) fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
+#[cfg(test)]
+fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec<Backend> {
+    prefer_healthy(service_backends(service_name, state), service_name, state)
+}
+
+/// Every known node hosting `service_name`, sorted by node id so balancer
+/// state maps to a stable node across connections. Unfiltered.
+pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<Backend> {
     let idx = state.service_index.load();
     let kn = state.known_nodes.load();
 
@@ -201,12 +200,22 @@ pub(super) fn find_service_nodes(service_name: &str, state: &SharedState) -> Vec
                 weight: svc.weight,
                 max_connections: svc.max_connections,
                 request_timeout: svc.request_timeout_ms.map(Duration::from_millis),
+                labels: svc.labels.clone(),
             })
         })
         .collect();
 
     backends.sort_by(|a, b| a.node.id.cmp(&b.node.id));
+    backends
+}
 
+/// Drop nodes whose gossip liveness marker is stale, then nodes whose health
+/// check reports the service down.
+///
+/// Each filter fails open: if it would drop every node (e.g. a cluster-wide
+/// gossip hiccup, or a health check misconfigured everywhere), it is skipped
+/// so per-connection retry can still find a working backend.
+pub(super) fn prefer_healthy(backends: Vec<Backend>, service_name: &str, state: &SharedState) -> Vec<Backend> {
     let now = Instant::now();
     let live = prefer(backends, |b| {
         b.node
@@ -405,12 +414,14 @@ mod tests {
                 protocol: crate::config::Protocol::Tcp,
                 request_timeout_ms: None,
                 health_path: None,
+                labels: Default::default(),
             })
             .collect();
         let cfg = Config {
             node_id: "sub".into(),
             dynamic_config: DynamicConfig {
                 version: 1,
+                routes: vec![],
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
             },
             ..Config::default()

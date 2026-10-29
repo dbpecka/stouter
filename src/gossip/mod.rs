@@ -234,6 +234,7 @@ async fn handle_admin_request(
                 protocol,
                 request_timeout_ms,
                 health_path,
+                labels,
             } => {
                 let svc = Service {
                     name,
@@ -245,12 +246,14 @@ async fn handle_admin_request(
                     protocol,
                     request_timeout_ms,
                     health_path,
+                    labels,
                 };
                 match svc.health_path.as_deref().map(crate::config::validate_health_path) {
                     Some(Err(msg)) => Err(MutateErr::Invalid(msg)),
                     _ => Ok(dc.upsert_service(&group, svc)),
                 }
             }
+            AdminOp::RoutesSet { service, routes } => dc.set_routes(&service, routes),
             AdminOp::ServiceRename { group, owner_node_id, from, to } => {
                 dc.rename_service(&group, &owner_node_id, &from, &to)
             }
