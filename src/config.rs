@@ -522,6 +522,62 @@ pub struct Config {
     /// on the same host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_port: Option<u16>,
+    /// OpenTelemetry span export for `http` services. Unset: no export
+    /// (trace context is still propagated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracing: Option<TracingConfig>,
+}
+
+/// Where and how much to export as OpenTelemetry spans.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TracingConfig {
+    /// OTLP/HTTP collector base URL, e.g. `http://127.0.0.1:4318`; spans are
+    /// POSTed as JSON to `{otlpEndpoint}/v1/traces`. Plain HTTP only: point it
+    /// at a local OpenTelemetry Collector to reach TLS backends.
+    pub otlp_endpoint: String,
+    /// Fraction of new traces (requests arriving without a `traceparent`)
+    /// to sample, from 0.0 to 1.0. Requests that carry a `traceparent` follow
+    /// its sampled flag instead.
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    /// `service.name` resource attribute on exported spans.
+    #[serde(default = "default_tracing_service_name")]
+    pub service_name: String,
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
+fn default_tracing_service_name() -> String {
+    "stouter".to_string()
+}
+
+impl TracingConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let uri: http::Uri = self
+            .otlp_endpoint
+            .parse()
+            .map_err(|e| format!("tracing.otlpEndpoint '{}' is not a URL: {e}", self.otlp_endpoint))?;
+        match uri.scheme_str() {
+            Some("http") => {}
+            Some("https") => {
+                return Err(format!(
+                    "tracing.otlpEndpoint '{}': https is not supported; send to a local OpenTelemetry Collector over http and let it forward over TLS",
+                    self.otlp_endpoint
+                ))
+            }
+            _ => return Err(format!("tracing.otlpEndpoint '{}' must start with http://", self.otlp_endpoint)),
+        }
+        if uri.host().is_none() {
+            return Err(format!("tracing.otlpEndpoint '{}' has no host", self.otlp_endpoint));
+        }
+        if !(0.0..=1.0).contains(&self.sample_ratio) {
+            return Err(format!("tracing.sampleRatio {} must be between 0.0 and 1.0", self.sample_ratio));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Config {
@@ -539,6 +595,7 @@ impl Default for Config {
             tls_dir: None,
             admin_cns: Vec::new(),
             api_port: None,
+            tracing: None,
         }
     }
 }
@@ -613,6 +670,10 @@ impl Config {
                 .cloned()
                 .collect();
             validate_routes(service, &routes).map_err(|e| anyhow!(e))?;
+        }
+
+        if let Some(tracing) = &self.tracing {
+            tracing.validate().map_err(|e| anyhow!(e))?;
         }
 
         if self.subscribe_filter.is_some()
@@ -936,6 +997,26 @@ mod tests {
         assert!(labels_match(&have, &want(&[("version", "v2")])));
         assert!(!labels_match(&have, &want(&[("version", "v1")])));
         assert!(!labels_match(&have, &want(&[("version", "v2"), ("tier", "x")])));
+    }
+
+    #[test]
+    fn tracing_config_defaults_and_validation() {
+        let tc: TracingConfig = serde_json::from_str(r#"{"otlpEndpoint": "http://127.0.0.1:4318"}"#).unwrap();
+        assert_eq!(tc.sample_ratio, 1.0);
+        assert_eq!(tc.service_name, "stouter");
+        tc.validate().unwrap();
+        for (endpoint, ratio) in [
+            ("https://collector:4318", 1.0),
+            ("127.0.0.1:4318", 1.0),
+            ("not a url", 1.0),
+            ("http://127.0.0.1:4318", 1.5),
+            ("http://127.0.0.1:4318", -0.1),
+        ] {
+            let bad = TracingConfig { otlp_endpoint: endpoint.into(), sample_ratio: ratio, ..tc.clone() };
+            assert!(bad.validate().is_err(), "{endpoint} {ratio}");
+        }
+        let cfg = Config { tracing: Some(TracingConfig { sample_ratio: 2.0, ..tc }), ..Config::default() };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

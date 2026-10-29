@@ -11,7 +11,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -32,6 +32,7 @@ use super::proxy::{
     establish_tunnel, note_tunnel_failure, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
 };
 use crate::config::{labels_match, Route};
+use crate::telemetry::{Attributes, SpanEvent, SpanKind, SpanRecord};
 use crate::state::SharedState;
 
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -83,10 +84,17 @@ impl HttpProxy {
 
     async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
         let start = Instant::now();
+        let start_wall = SystemTime::now();
         let method = req.method().clone();
         let path = req.uri().path().to_string();
 
-        let trace = TraceContext::from_headers(req.headers()).unwrap_or_else(TraceContext::new_root);
+        // An incoming trace keeps its sampling decision; a new one is sampled
+        // at the configured ratio (always, when nothing is exported).
+        let tracer = self.state.tracer.get();
+        let incoming = TraceContext::from_headers(req.headers());
+        let trace = incoming
+            .clone()
+            .unwrap_or_else(|| TraceContext::new_root(tracer.is_none_or(|t| t.sample_new_trace())));
         let upstream_trace = trace.child();
 
         let upgrade = is_upgrade(req.headers());
@@ -119,21 +127,21 @@ impl HttpProxy {
         let route_label = routed.as_ref().map_or_else(|| "default".to_string(), |r| r.label.clone());
 
         self.retry_budget.deposit();
-        let mut tried: Vec<String> = Vec::new();
-        let mut last_err: Option<String> = None;
+        let mut log = AttemptLog::default();
 
         let outcome = match RequestBody::prepare(body).await {
             Err(e) => {
-                last_err = Some(e.to_string());
+                log.last_err = Some(e.to_string());
                 Outcome::Error(StatusCode::BAD_REQUEST, "bad_request_body")
             }
             Ok(body) => {
                 let subset = routed.as_ref().map(|r| &r.labels);
-                self.attempt(&parts, &path_and_query, body, subset, &mut tried, &mut last_err)
+                self.attempt(&parts, &path_and_query, body, subset, &mut log)
                     .await
             }
         };
 
+        let mut proxy_error: Option<&'static str> = None;
         let (response, node) = match outcome {
             Outcome::Response { mut resp, slot, node_id } => {
                 if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -168,10 +176,11 @@ impl HttpProxy {
                 }
             }
             Outcome::Error(status, reason) => {
-                if let Some(e) = &last_err {
+                if let Some(e) = &log.last_err {
                     debug!("{} {} for {}: {reason}: {e}", status.as_u16(), path, self.service_name);
                 }
-                (error_response(status, reason), tried.last().cloned())
+                proxy_error = Some(reason);
+                (error_response(status, reason), log.tried.last().cloned())
             }
         };
 
@@ -195,11 +204,46 @@ impl HttpProxy {
             route = %route_label,
             status,
             node = node.as_deref().unwrap_or("-"),
-            attempts = tried.len(),
+            attempts = log.tried.len(),
             duration_ms = elapsed.as_millis() as u64,
             trace_id = %trace.trace_id,
             "request"
         );
+
+        if let Some(tracer) = tracer.filter(|_| trace.is_sampled()) {
+            let mut attributes: Attributes = vec![
+                ("http.request.method", method.as_str().into()),
+                ("url.path", path.clone().into()),
+                ("url.scheme", "http".into()),
+                ("network.protocol.version", "1.1".into()),
+                ("http.response.status_code", i64::from(status).into()),
+                ("stouter.service", self.service_name.clone().into()),
+                ("stouter.route", route_label.clone().into()),
+                ("stouter.attempts", (log.tried.len() as i64).into()),
+            ];
+            if let Some(node) = &node {
+                attributes.push(("server.address", node.clone().into()));
+            }
+            // Client spans treat 4xx as errors too (OTel HTTP conventions).
+            let error_type = proxy_error.map(str::to_string).or_else(|| (status >= 400).then(|| status.to_string()));
+            if let Some(error_type) = &error_type {
+                attributes.push(("error.type", error_type.clone().into()));
+            }
+            tracer.record(SpanRecord {
+                trace_id: trace.trace_id.clone(),
+                // The id sent upstream in `traceparent`, so the backend's
+                // server span is this span's child.
+                span_id: upstream_trace.span_id.clone(),
+                parent_span_id: incoming.map(|t| t.span_id),
+                name: format!("{} {}", method, self.service_name),
+                kind: SpanKind::Client,
+                start: start_wall,
+                end: start_wall + elapsed,
+                attributes,
+                events: log.events,
+                error: error_type,
+            });
+        }
 
         response
     }
@@ -218,8 +262,7 @@ impl HttpProxy {
         path_and_query: &str,
         mut body: RequestBody,
         subset: Option<&BTreeMap<String, String>>,
-        tried: &mut Vec<String>,
-        last_err: &mut Option<String>,
+        log: &mut AttemptLog,
     ) -> Outcome {
         let all = service_backends(&self.service_name, &self.state);
         self.balancer.retain_nodes(&all);
@@ -239,20 +282,20 @@ impl HttpProxy {
         let mut fallback: Option<Outcome> = None;
 
         let outcome = loop {
-            if tried.len() >= max_attempts {
+            if log.tried.len() >= max_attempts {
                 break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
             }
-            let (idx, slot) = match self.balancer.pick(&backends, tried, Instant::now()) {
+            let (idx, slot) = match self.balancer.pick(&backends, &log.tried, Instant::now()) {
                 Pick::Chosen { index, slot } => (index, slot),
                 Pick::AllTried => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
-                Pick::AtCapacity if tried.is_empty() => {
+                Pick::AtCapacity if log.tried.is_empty() => {
                     break Outcome::Error(StatusCode::SERVICE_UNAVAILABLE, "circuit_open")
                 }
                 Pick::AtCapacity => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
             };
             let backend = &backends[idx];
             let node_id = backend.node.id.clone();
-            tried.push(node_id.clone());
+            log.tried.push(node_id.clone());
 
             let Some(uri) = node_uri(&node_id, path_and_query) else {
                 break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
@@ -283,7 +326,7 @@ impl HttpProxy {
                     if !is_retryable_status(status)
                         || !is_idempotent(&parts.method)
                         || !body.is_replayable()
-                        || tried.len() >= max_attempts
+                        || log.tried.len() >= max_attempts
                     {
                         break outcome;
                     }
@@ -292,13 +335,29 @@ impl HttpProxy {
                         break outcome;
                     }
                     metrics::counter!("stouter_http_retries_total", "service" => self.service_name.clone(), "reason" => "status").increment(1);
-                    debug!("{} from node {} for {}; retrying on another node", status.as_u16(), tried.last().unwrap(), self.service_name);
+                    debug!("{} from node {} for {}; retrying on another node", status.as_u16(), log.tried.last().unwrap(), self.service_name);
+                    log.events.push(SpanEvent {
+                        time: SystemTime::now(),
+                        name: "attempt_failed",
+                        attributes: vec![
+                            ("stouter.node", log.tried.last().unwrap().clone().into()),
+                            ("http.response.status_code", i64::from(status.as_u16()).into()),
+                        ],
+                    });
                     fallback = Some(outcome);
                 }
                 Err(e) if e.is_connect() => {
                     debug!("connect to node {node_id} for {} failed: {e:?}", self.service_name);
                     note_tunnel_failure(&self.balancer, &self.service_name, &node_id, &e);
-                    *last_err = Some(e.to_string());
+                    log.events.push(SpanEvent {
+                        time: SystemTime::now(),
+                        name: "attempt_failed",
+                        attributes: vec![
+                            ("stouter.node", node_id.clone().into()),
+                            ("error.type", "connect_failed".into()),
+                        ],
+                    });
+                    log.last_err = Some(e.to_string());
                     if !body.is_replayable() {
                         break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
                     }
@@ -308,7 +367,7 @@ impl HttpProxy {
                 Err(e) => {
                     // The request may have reached the backend: don't retry.
                     debug!("request to node {node_id} for {} failed: {e:?}", self.service_name);
-                    *last_err = Some(e.to_string());
+                    log.last_err = Some(e.to_string());
                     break Outcome::Error(StatusCode::BAD_GATEWAY, "upstream_error");
                 }
             }
@@ -449,6 +508,17 @@ impl RetryBudget {
     }
 }
 
+/// What happened across a request's attempts, for errors, logs and spans.
+#[derive(Default)]
+struct AttemptLog {
+    /// Node ids tried, in order.
+    tried: Vec<String>,
+    /// The most recent failure, for debug logging.
+    last_err: Option<String>,
+    /// One `attempt_failed` event per failed attempt.
+    events: Vec<SpanEvent>,
+}
+
 enum Outcome {
     Response {
         resp: Response<Incoming>,
@@ -576,13 +646,18 @@ impl TraceContext {
         })
     }
 
-    /// Start a new, sampled trace.
-    fn new_root() -> Self {
+    /// Start a new trace, flagged sampled or not.
+    fn new_root(sampled: bool) -> Self {
         Self {
             trace_id: random_hex(16),
             span_id: random_hex(8),
-            flags: "01".to_string(),
+            flags: if sampled { "01" } else { "00" }.to_string(),
         }
+    }
+
+    /// The W3C `sampled` flag (bit 0 of trace-flags).
+    fn is_sampled(&self) -> bool {
+        u8::from_str_radix(&self.flags, 16).is_ok_and(|f| f & 1 == 1)
     }
 
     /// Same trace, new span id: the proxy's hop to the upstream.
@@ -878,8 +953,20 @@ mod tests {
     }
 
     #[test]
+    fn sampled_flag_follows_trace_flags() {
+        assert!(TraceContext::new_root(true).is_sampled());
+        let unsampled = TraceContext::new_root(false);
+        assert!(!unsampled.is_sampled());
+        assert!(unsampled.to_header().ends_with("-00"));
+        // Other flag bits don't affect sampling; children keep the decision.
+        let tc = TraceContext { flags: "03".into(), ..unsampled.clone() };
+        assert!(tc.is_sampled());
+        assert!(!unsampled.child().is_sampled());
+    }
+
+    #[test]
     fn new_root_is_valid() {
-        let tc = TraceContext::new_root();
+        let tc = TraceContext::new_root(true);
         let h = headers(&[("traceparent", &tc.to_header())]);
         assert_eq!(TraceContext::from_headers(&h), Some(tc));
     }

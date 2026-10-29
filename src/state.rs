@@ -172,6 +172,8 @@ pub struct SharedState {
     pub tls: Option<Arc<TlsContext>>,
     pub shutdown: CancellationToken,
     pub in_flight: Arc<InFlightTracker>,
+    /// Span exporter, set at daemon start when `tracing` is configured.
+    pub tracer: std::sync::OnceLock<Arc<crate::telemetry::Tracer>>,
 }
 
 impl SharedState {
@@ -202,6 +204,7 @@ impl SharedState {
             tls: tls.map(Arc::new),
             shutdown,
             in_flight: InFlightTracker::new(),
+            tracer: std::sync::OnceLock::new(),
         })
     }
 

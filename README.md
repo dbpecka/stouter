@@ -266,7 +266,17 @@ to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
   in-flight requests), `504 timeout`.
 - **WebSocket and other upgrades** are passed through.
 - **Tracing:** W3C `traceparent` is propagated (with a new span id per hop),
-  or started when absent.
+  or started when absent. With a `tracing` section in the daemon's config,
+  each request is also exported as an OpenTelemetry span:
+
+  ```json
+  "tracing": { "otlpEndpoint": "http://127.0.0.1:4318", "sampleRatio": 0.1 }
+  ```
+
+  Spans go over OTLP/HTTP (JSON) to `{otlpEndpoint}/v1/traces`, typically a
+  local OpenTelemetry Collector (plain `http://` only). Sampling is
+  parent-based: an incoming `traceparent` keeps its decision, and new traces
+  are sampled at `sampleRatio`. The backend's own spans nest under stouter's.
 - **Access log** per request (target `stouter::access`, with trace id), and
   `stouter_http_requests_total{service,method,code}` /
   `stouter_http_request_duration_seconds{service}` metrics.

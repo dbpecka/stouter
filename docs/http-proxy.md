@@ -1,7 +1,8 @@
 # Design: HTTP-aware data plane
 
-Status: milestones 1 and 2 implemented (M2: L7 routing, HTTP health checks,
-status retries under a budget, body buffering); M3–M5 proposed.
+Status: milestones 1–3 implemented (M2: L7 routing, HTTP health checks,
+status retries under a budget, body buffering; M3: OpenTelemetry span
+export); M4–M5 proposed.
 
 ## Problem
 
@@ -158,15 +159,41 @@ writes it back without the fields it doesn't know. That means `routes`,
 propagates cluster-wide with those fields gone. Upgrade every node that runs
 admin mutations before relying on any of them.
 
+## Milestone 3: span export (implemented)
+
+Configured per daemon in the static config (not gossiped, since each daemon
+usually sends to its own local collector):
+
+```json
+"tracing": { "otlpEndpoint": "http://127.0.0.1:4318", "sampleRatio": 0.1, "serviceName": "stouter" }
+```
+
+| Concern | Behaviour |
+|---|---|
+| What's exported | One `CLIENT` span per request to an `http` service, from the subscriber. TCP services and hosting nodes emit none (there's no trace context at the byte level). |
+| Span ids | The span's id is the one sent upstream in `traceparent`, so the backend's own server span nests directly under it. Its parent is the caller's span from the incoming `traceparent`, or none for a new trace. |
+| Sampling | Parent-based. An incoming `traceparent` keeps its sampled flag. A new trace is sampled with probability `sampleRatio` (default 1.0), and the decision is propagated in the flags (`01`/`00`) so downstream services agree. Unsampled requests cost nothing extra. |
+| Contents | Name `{METHOD} {service}`. Attributes follow the OTel HTTP conventions (`http.request.method`, `url.path`, `http.response.status_code`, `server.address` = node, `error.type`), plus `stouter.service`, `stouter.route`, `stouter.attempts`. Each failed attempt is an `attempt_failed` event naming the node and the reason. Status is `ERROR` for 4xx/5xx and proxy errors (client-span convention). Resource: `service.name`, `service.instance.id` = node id. |
+| Duration | Until response headers arrive, matching the request-duration metric. A streamed body doesn't keep a span open. |
+| Transport | OTLP/HTTP with the spec's JSON encoding, `POST {otlpEndpoint}/v1/traces`, in batches of up to 512 spans or every 5s. Plain `http://` only: to reach a TLS or SaaS backend, run an OpenTelemetry Collector locally and let it forward. |
+| Back-pressure | Spans go into a bounded queue (4096) and are never awaited by requests. When the queue is full, or an export fails, spans are dropped and counted in `stouter_tracing_spans_dropped_total{reason}`. An export outage logs one warning, then one "recovered" line. Exported spans are counted in `stouter_tracing_spans_exported_total`. |
+| Shutdown | After draining connections, queued spans are flushed (up to 5s). |
+
+**Why not the `opentelemetry` crates?** The SDK plus an OTLP exporter brings
+in tonic/prost or reqwest, a large dependency tree for a single span type.
+OTLP's JSON encoding is a stable part of the spec, and the exporter is about
+200 lines on the hyper/serde already in the tree. If stouter later needs
+more (metrics/logs over OTLP, gRPC transport, TLS), switching to the SDK is
+a contained change to `src/telemetry.rs`.
+
 ## Later milestones
 
 **M2 follow-ups.** Path rewriting and header injection on routes; regex and
 presence-only header matches; cross-cluster `service move` carrying the
 service's routes.
 
-**M3 — Span export.** Each proxy hop emits an OpenTelemetry span over OTLP
-(optional collector endpoint in config), using the trace ids M1 already
-propagates. Turns the access-log correlation into real traces.
+**M3 follow-ups.** `https://` collector endpoints (needs a root-certificate
+source); OTLP metrics export; spans for tunnel setup on hosting nodes.
 
 **M4 — HTTP/2 end to end.** h2c from the application, h2 over the tunnel
 (one multiplexed connection per node instead of a pool), making gRPC a

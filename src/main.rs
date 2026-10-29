@@ -8,6 +8,7 @@ mod node;
 mod pki;
 mod state;
 mod subscribe;
+mod telemetry;
 mod tls;
 
 use std::time::Duration;
@@ -254,6 +255,11 @@ async fn main() -> Result<()> {
             let tls_ctx = tls::TlsContext::new(&material)?;
 
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
+
+            if let Some(tracing_cfg) = &cfg.tracing {
+                tracing_cfg.validate().map_err(anyhow::Error::msg)?;
+                let _ = state.tracer.set(telemetry::Tracer::start(tracing_cfg, &cfg.node_id));
+            }
 
             let metrics_handle = metrics::install();
             tokio::spawn(metrics::run_gauge_loop(state.clone()));
@@ -857,6 +863,11 @@ async fn graceful_drain(state: std::sync::Arc<SharedState>) {
         info!("all connections drained");
     } else {
         info!("drain timeout reached, shutting down with connections still active");
+    }
+
+    // Export spans still queued, so the last requests' traces aren't lost.
+    if let Some(tracer) = state.tracer.get() {
+        tracer.flush(Duration::from_secs(5)).await;
     }
 }
 

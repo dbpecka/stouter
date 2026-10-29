@@ -28,6 +28,8 @@ service mesh. Grouped by area, not prioritized.
   idempotent methods under a retry budget, and buffering of small bodies so
   they can be replayed.
 - HTTP health checks: optional `healthPath` per instance, requiring a 2xx.
+- OpenTelemetry span export (OTLP/HTTP JSON) for `http` services, with
+  parent-based sampling and spans the backend's own spans nest under.
 - L7 routing for `http` services: instance `labels` and ordered `routes`
   (path prefix / method / header matches → weighted label subsets), managed
   with `stouter route set|clear|list`.
@@ -60,8 +62,10 @@ service mesh. Grouped by area, not prioritized.
 - HTTP redirect, rewrites, CORS, compression.
 
 ## Observability
-- OpenTelemetry span export over OTLP (M3); trace context is already
-  propagated and logged for `http` services.
+- `https://` OTLP endpoints and OTLP metrics export; spans for tunnel
+  setup on hosting nodes.
+- Faster graceful shutdown: long-lived peer mux sessions count as
+  in-flight, so a drain always waits the full 30s timeout.
 - Per-route metrics once route rules exist (per-service request metrics exist
   for `http` services).
 - A metrics endpoint for pure `node`-mode daemons (only subscribers serve
@@ -82,9 +86,8 @@ service mesh. Grouped by area, not prioritized.
 - Separate control-plane vs data-plane binaries once config grows.
 
 ## Next up
-1. **M3 — OTLP span export** — turns the trace context `http` services
-   already propagate into real distributed traces.
-2. **M5 — Workload identity + L7 authorization** — per-service identities in
+1. **M5 — Workload identity + L7 authorization** — per-service identities in
    certs, enforced on hosting nodes.
-3. **A `/metrics` endpoint for `node`-mode daemons** — small, but tunnel
+2. **A `/metrics` endpoint for `node`-mode daemons** — small, but tunnel
    metrics recorded on nodes can't be scraped today.
+3. **Graceful shutdown that doesn't wait on idle mux sessions.**
