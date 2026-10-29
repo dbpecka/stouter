@@ -182,8 +182,7 @@ impl DynamicConfig {
                 .iter_mut()
                 .find(|s| s.name == service.name && s.node_id == service.node_id)
             {
-                existing.node_port = service.node_port;
-                existing.domains = service.domains;
+                *existing = service;
             } else {
                 g.services.push(service);
             }
@@ -774,17 +773,24 @@ mod tests {
                 node_id: "n1".into(),
                 node_port: 9999,
                 domains: vec!["x.example".into()],
-                weight: 1,
-                max_connections: None,
-                protocol: crate::config::Protocol::Tcp,
-                request_timeout_ms: None,
-                health_path: None,
+                weight: 9,
+                max_connections: Some(5),
+                protocol: crate::config::Protocol::Http,
+                request_timeout_ms: Some(100),
+                health_path: Some("/h".into()),
             },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups[0].services.len(), 1);
-        assert_eq!(dc.service_groups[0].services[0].node_port, 9999);
-        assert_eq!(dc.service_groups[0].services[0].domains, vec!["x.example".to_string()]);
+        let svc = &dc.service_groups[0].services[0];
+        assert_eq!(svc.node_port, 9999);
+        assert_eq!(svc.domains, vec!["x.example".to_string()]);
+        // Every field is replaced, not just port and domains.
+        assert_eq!(svc.weight, 9);
+        assert_eq!(svc.max_connections, Some(5));
+        assert_eq!(svc.protocol, Protocol::Http);
+        assert_eq!(svc.request_timeout_ms, Some(100));
+        assert_eq!(svc.health_path.as_deref(), Some("/h"));
     }
 
     #[test]
