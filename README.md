@@ -86,6 +86,9 @@ stouter status
 # Register a service
 stouter service add --group web --name api --port 3000 --domains api.example.com
 
+# Give host1's instance of api 9x the connections of others (e.g. a 90/10 canary split)
+stouter service add --group web --name api --port 3000 --node host1 --weight 9
+
 # List all services in the cluster
 stouter service list
 
@@ -117,6 +120,20 @@ Services are organized into groups. Each service entry maps a name to a local po
   }
 }
 ```
+
+When the same service name is registered on several nodes, subscribers spread
+connections across them. An optional `weight` (default `1`) sets each
+instance's relative share, e.g. `9` and `1` for a 90/10 canary split. A weight
+of `0` drains an instance: it gets no new connections unless every instance is
+drained.
+
+An optional `maxConnections` caps how many concurrent connections each
+subscriber opens to an instance (a circuit breaker). Instances at their limit
+are skipped; if every instance is full, new connections are closed immediately
+rather than queued, and counted in
+`stouter_tunnel_errors_total{reason="circuit_open"}`. The limit is enforced by
+each subscriber independently, so an instance's total load can reach
+`maxConnections` × the number of subscribers.
 
 Subscribe nodes can filter which service groups they proxy:
 
@@ -200,8 +217,10 @@ All gossip messages are MessagePack-encoded with a 4-byte big-endian length pref
 
 When a subscribe proxy needs to reach service `api` on node `host2`:
 
-1. Look up all nodes hosting `api` in the service index.
-2. Select a node via round-robin.
+1. Look up all nodes hosting `api` in the service index, dropping nodes whose
+   gossip liveness is stale and nodes whose health check reports `api` down.
+2. Select a node by smooth weighted round-robin, skipping drained (weight `0`)
+   and ejected nodes, and nodes at their `maxConnections` limit.
 3. Acquire a connection (in priority order):
    - **Mux session** — open a new yamux stream on an existing multiplexed connection (fastest)
    - **Reverse pool** — take an idle reverse connection (for NAT'd target nodes)
@@ -210,6 +229,105 @@ When a subscribe proxy needs to reach service `api` on node `host2`:
 4. Send a `TunnelRequest{node_id, service_name, timestamp_ms}`.
 5. Read a status byte: `0x00` = success.
 6. Proxy bytes bidirectionally between the local client and the remote service.
+
+If steps 3–5 fail, the client connection is untouched, so the proxy retries on
+another node (up to 3 distinct nodes). A node whose tunnel setup fails 3 times
+in a row (unreachable, or its backend refuses connections) is **ejected**: it
+is left out of rotation for 10s, doubling on each repeat ejection up to 2
+minutes, and a successful tunnel resets it. Every filter fails open: if it would
+exclude all nodes, it is ignored. Ejections are counted in
+`stouter_outlier_ejections_total{service,node_id}`.
+
+### HTTP Services
+
+Set `"protocol": "http"` on every instance of a service (CLI: `--protocol http`)
+to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
+
+- **Per-request load balancing** over pooled keep-alive connections to each
+  node, so one long-lived client connection is still spread across instances,
+  and tunnels are reused instead of opened per request.
+- **Timeouts:** optional `requestTimeoutMs` per instance (time allowed for
+  response headers); expiry returns `504`.
+- **Retries** go to a different node (up to 3 nodes in total):
+  - when a connection to the chosen node can't be established (the request
+    was never sent), for any method;
+  - when a node answers `502`, `503` or `504`, for idempotent methods only
+    (GET, HEAD, OPTIONS, PUT, DELETE, TRACE). These retries are capped by a
+    per-service budget of about 20% of request volume plus a burst of 20, so
+    they can't multiply load on a failing service. If every attempt fails, the
+    client gets the last real backend response.
+
+  Bodies with a declared length up to 64 KiB are buffered so they can be
+  re-sent; larger or chunked bodies are streamed and sent only once.
+  Retries are counted in `stouter_http_retries_total{service,reason}`, and
+  ones skipped for lack of budget in `stouter_http_retry_budget_exhausted_total`.
+- **Errors** from the proxy itself carry an `x-stouter-error` header:
+  `502 no_backend_reachable`, `503 circuit_open` (`maxConnections` then caps
+  in-flight requests), `504 timeout`.
+- **WebSocket and other upgrades** are passed through.
+- **Tracing:** W3C `traceparent` is propagated (with a new span id per hop),
+  or started when absent. With a `tracing` section in the daemon's config,
+  each request is also exported as an OpenTelemetry span:
+
+  ```json
+  "tracing": { "otlpEndpoint": "http://127.0.0.1:4318", "sampleRatio": 0.1 }
+  ```
+
+  Spans go over OTLP/HTTP (JSON) to `{otlpEndpoint}/v1/traces`, typically a
+  local OpenTelemetry Collector (plain `http://` only). Sampling is
+  parent-based: an incoming `traceparent` keeps its decision, and new traces
+  are sampled at `sampleRatio`. The backend's own spans nest under stouter's.
+- **Access log** per request (target `stouter::access`, with trace id), and
+  `stouter_http_requests_total{service,method,code}` /
+  `stouter_http_request_duration_seconds{service}` metrics.
+
+A service is proxied as HTTP only if every instance says `http`, and the
+setting is read for each new connection, so it can be switched without a
+restart. HTTP/2 and gRPC services should stay `tcp` for now. See
+[`docs/http-proxy.md`](docs/http-proxy.md) for the design and roadmap.
+
+### L7 Routing
+
+`http` services can be routed by path, method or header to labeled subsets of
+their instances, with weights — for example canary by header, or a 90/10
+version split:
+
+```bash
+stouter service add --group web --name api --port 3000 --protocol http --label version=v1
+stouter service add --group web --name api --port 3000 --protocol http --label version=v2 --node host2
+stouter route set --service api --routes '[
+  {"name": "canary", "match": {"headers": {"x-canary": "true"}},
+   "backends": [{"labels": {"version": "v2"}}]},
+  {"name": "split", "backends": [{"labels": {"version": "v1"}, "weight": 9},
+                                 {"labels": {"version": "v2"}, "weight": 1}]}
+]'
+```
+
+The first matching route wins. Requests that match no route use every
+instance. Retries stay inside the chosen subset, and a subset with no
+instances returns `503 no_route_backend`. `stouter route list` and
+`route clear` complete the set, all with `--remote` support. See
+[`docs/http-proxy.md`](docs/http-proxy.md#milestone-2-l7-routing-implemented)
+for the full semantics.
+
+### Health Checks
+
+Every node probes each service it hosts every 5s by opening a TCP connection to
+`127.0.0.1:{nodePort}` (2s timeout). If the instance sets `healthPath` (CLI:
+`--health-path /healthz`), the node also sends `GET {healthPath}` and requires a
+`2xx` status, so a backend that accepts connections but is failing is caught
+too. This works for `tcp` and `http` services alike. Two failures in a row mark the service
+unhealthy; one success marks it healthy again. The node publishes the result in
+its own gossip entry and pushes it to peers as soon as it changes, so
+subscribers stop routing to a dead backend within about 10s of it going down,
+before any client connection has to fail. Reports carry a version (wall-clock
+milliseconds), so a relayed copy never overwrites a newer one and a restarted
+node's first report replaces anything peers held from before.
+
+Health shows up in `stouter status` (an `UNHEALTHY` marker per service) and in
+the `stouter_service_healthy{service,node_id}` gauge (1 or 0), which every
+subscriber exports for the whole cluster. Outlier ejection still applies to
+failures health checks can't see, such as a node being unreachable.
 
 ### NAT Traversal via Reverse Connections
 

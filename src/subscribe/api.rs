@@ -330,6 +330,7 @@ mod tests {
                         addr: "10.0.0.1:8080".into(),
                         relay: None,
                         last_seen: None,
+                        health: Default::default(),
                     },
                 );
             })

@@ -66,6 +66,7 @@ pub async fn handle_reverse_registration(
                             addr: String::new(),
                             relay: Some(our_addr),
                             last_seen: Some(Instant::now()),
+                            health: Default::default(),
                         },
                     );
                 }

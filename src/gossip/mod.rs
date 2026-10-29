@@ -28,7 +28,7 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
     stream: &mut W,
     msg: &Message,
 ) -> Result<()> {
-    let payload = rmp_serde::to_vec(msg).context("serialize Message")?;
+    let payload = encode_message(msg)?;
     let len = u32::try_from(payload.len()).context("message too large")?;
     stream
         .write_all(&len.to_be_bytes())
@@ -40,6 +40,16 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
         .context("write payload")?;
     stream.flush().await.context("flush message")?;
     Ok(())
+}
+
+/// Encode `msg` as MessagePack with structs written as field-name maps.
+///
+/// Named encoding keeps the wire format compatible across versions: a reader
+/// ignores fields it does not know and fills defaults for ones the sender
+/// omitted. Positional (array) encoding would break both whenever a field is
+/// added or skipped via `skip_serializing_if`. Readers accept either form.
+pub(crate) fn encode_message(msg: &Message) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(msg).context("serialize Message")
 }
 
 /// Read a binary-framed message from `stream` and deserialize the MessagePack payload.
@@ -213,15 +223,37 @@ async fn handle_admin_request(
     let outcome: Result<(u64, crate::config::DynamicConfig), MutateErr> = {
         let mut dc = state.dynamic_config.write().await;
         let result = match op {
-            AdminOp::ServiceAdd { group, name, owner_node_id, port, domains } => {
+            AdminOp::ServiceAdd {
+                group,
+                name,
+                owner_node_id,
+                port,
+                domains,
+                weight,
+                max_connections,
+                protocol,
+                request_timeout_ms,
+                health_path,
+                labels,
+            } => {
                 let svc = Service {
                     name,
                     node_id: owner_node_id,
                     node_port: port,
                     domains,
+                    weight,
+                    max_connections,
+                    protocol,
+                    request_timeout_ms,
+                    health_path,
+                    labels,
                 };
-                Ok(dc.upsert_service(&group, svc))
+                match svc.health_path.as_deref().map(crate::config::validate_health_path) {
+                    Some(Err(msg)) => Err(MutateErr::Invalid(msg)),
+                    _ => Ok(dc.upsert_service(&group, svc)),
+                }
             }
+            AdminOp::RoutesSet { service, routes } => dc.set_routes(&service, routes),
             AdminOp::ServiceRename { group, owner_node_id, from, to } => {
                 dc.rename_service(&group, &owner_node_id, &from, &to)
             }
@@ -249,7 +281,7 @@ async fn handle_admin_request(
                 MutateErr::GroupNotFound { .. } | MutateErr::ServiceNotFound { .. } => {
                     AdminErrCode::NotFound
                 }
-                MutateErr::DuplicateService { .. } => AdminErrCode::Validation,
+                MutateErr::DuplicateService { .. } | MutateErr::Invalid(_) => AdminErrCode::Validation,
             };
             Msg::AdminResponse {
                 result: AdminResult::Err { code, message: err.to_string() },
@@ -268,7 +300,7 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
         node_id: state.config.node_id.clone(),
         bind: state.config.bind.clone(),
         dynamic_config: state.dynamic_config.read().await.clone(),
-        known_nodes: state.known_nodes.load().values().cloned().collect(),
+        known_nodes: snapshot_nodes(&state),
     };
 
     if let Err(e) = send_message(&mut stream, &response).await {
@@ -434,6 +466,12 @@ fn fix_unroutable_addrs(nodes: &mut [NodeInfo], connected_addr: &str) {
 // Broadcast
 // ---------------------------------------------------------------------------
 
+/// Push our current state to every peer without waiting for the sync loop.
+pub(crate) async fn broadcast_sync(state: &Arc<SharedState>) {
+    let msg = build_sync_msg(state).await;
+    broadcast_message(state, msg).await;
+}
+
 pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     let peers = peer_addrs(state).await;
 
@@ -541,6 +579,7 @@ async fn merge_sync(
         persist_state(state).await;
     }
 
+    let own_id = state.config.node_id.as_str();
     let nodes_changed = state.update_known_nodes(|kn| {
         let mut changed = false;
         for mut node in nodes {
@@ -548,6 +587,14 @@ async fn merge_sync(
                 debug!("ignoring node with invalid id: {:?}", node.id);
                 continue;
             }
+            // We are the only authority on our own health; relayed copies of
+            // it are stale by definition.
+            if node.id == own_id {
+                node.health = Default::default();
+            }
+            // Health changes are not `changed`: that flag drives persisting
+            // config, and health is runtime-only state.
+            merge_health(kn.get_mut(&node.id), &node);
             if let Some(existing) = kn.get_mut(&node.id) {
                 let has_addr = !node.addr.is_empty();
                 if existing.addr != node.addr {
@@ -588,6 +635,21 @@ async fn merge_sync(
     if nodes_changed {
         persist_state(state).await;
     }
+}
+
+/// Adopt `incoming`'s health report if it is newer than what `existing` holds.
+fn merge_health(existing: Option<&mut NodeInfo>, incoming: &NodeInfo) {
+    let Some(existing) = existing else { return };
+    if incoming.health.version <= existing.health.version {
+        return;
+    }
+    if existing.health.unhealthy != incoming.health.unhealthy {
+        info!(
+            "node {} health updated: unhealthy services {:?} -> {:?}",
+            incoming.id, existing.health.unhealthy, incoming.health.unhealthy
+        );
+    }
+    existing.health = incoming.health.clone();
 }
 
 /// Apply a non-Sync gossip message to local state.
@@ -636,6 +698,7 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
                             addr,
                             relay: None,
                             last_seen: Some(Instant::now()),
+                            health: Default::default(),
                         },
                     );
                     true
@@ -683,6 +746,12 @@ pub async fn run_member_log(state: Arc<SharedState>) {
 /// to match services (which store `node_id = hostname`) to connectable peers.
 async fn build_sync_msg(state: &Arc<SharedState>) -> Message {
     let config = state.dynamic_config.read().await.clone();
+    let nodes = snapshot_nodes(state);
+    Message::Sync { config, nodes }
+}
+
+/// Known nodes plus an up-to-date entry for ourselves (address and health).
+fn snapshot_nodes(state: &SharedState) -> Vec<NodeInfo> {
     let mut nodes: Vec<NodeInfo> = state.known_nodes.load().values().cloned().collect();
 
     if !state.config.node_id.is_empty() {
@@ -692,17 +761,85 @@ async fn build_sync_msg(state: &Arc<SharedState>) -> Message {
             state.config.peer_addr().to_owned()
         };
 
+        let health = (**state.local_health.load()).clone();
         if let Some(existing) = nodes.iter_mut().find(|n| n.id == state.config.node_id) {
             existing.addr = self_addr;
+            existing.health = health;
         } else {
             nodes.push(NodeInfo {
                 id: state.config.node_id.clone(),
                 addr: self_addr,
                 relay: None,
                 last_seen: None,
+                health,
             });
         }
     }
 
-    Message::Sync { config, nodes }
+    nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, DynamicConfig, ServiceHealth};
+    use tokio_util::sync::CancellationToken;
+
+    fn node(id: &str, version: u64, unhealthy: &[&str]) -> NodeInfo {
+        NodeInfo {
+            id: id.into(),
+            addr: format!("{id}:1"),
+            relay: None,
+            last_seen: None,
+            health: ServiceHealth {
+                version,
+                unhealthy: unhealthy.iter().map(|s| s.to_string()).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn merge_health_takes_only_newer_reports() {
+        let mut existing = node("a", 5, &["api"]);
+        merge_health(Some(&mut existing), &node("a", 4, &[]));
+        assert_eq!(existing.health.unhealthy, ["api"]);
+        merge_health(Some(&mut existing), &node("a", 5, &[]));
+        assert_eq!(existing.health.unhealthy, ["api"]);
+        merge_health(Some(&mut existing), &node("a", 6, &[]));
+        assert!(existing.health.unhealthy.is_empty());
+        assert_eq!(existing.health.version, 6);
+    }
+
+    #[test]
+    fn merge_health_ignores_unreported_relay() {
+        // An old-version peer relays NodeInfo without health (version 0).
+        let mut existing = node("a", 5, &["api"]);
+        merge_health(Some(&mut existing), &node("a", 0, &[]));
+        assert_eq!(existing.health.version, 5);
+    }
+
+    #[tokio::test]
+    async fn merge_sync_applies_peer_health_but_never_our_own() {
+        let cfg = Config { node_id: "me".into(), ..Config::default() };
+        let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+        let config = DynamicConfig::default();
+
+        merge_sync(&state, config.clone(), vec![node("a", 1, &[]), node("me", 1, &["x"])], None).await;
+        merge_sync(&state, config, vec![node("a", 2, &["api"]), node("me", 9, &["x"])], None).await;
+
+        let kn = state.known_nodes.load();
+        assert_eq!(kn["a"].health.unhealthy, ["api"]);
+        assert!(kn["me"].health.is_unset());
+        assert!(!state.service_unhealthy("me", "x"));
+    }
+
+    #[test]
+    fn snapshot_carries_fresh_local_health() {
+        let cfg = Config { node_id: "me".into(), ..Config::default() };
+        let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+        state.local_health.store(Arc::new(ServiceHealth { version: 3, unhealthy: vec!["api".into()] }));
+        let nodes = snapshot_nodes(&state);
+        let me = nodes.iter().find(|n| n.id == "me").unwrap();
+        assert_eq!(me.health.unhealthy, ["api"]);
+    }
 }
