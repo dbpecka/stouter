@@ -67,6 +67,8 @@ pub enum AdminOp {
         protocol: crate::config::Protocol,
         #[serde(default)]
         request_timeout_ms: Option<u64>,
+        #[serde(default)]
+        health_path: Option<String>,
     },
     ServiceRename {
         group: String,
@@ -154,6 +156,7 @@ mod tests {
                         max_connections: None,
                         protocol: crate::config::Protocol::Tcp,
                         request_timeout_ms: None,
+                        health_path: None,
                     }],
                 }],
             },
@@ -257,6 +260,7 @@ mod tests {
                         max_connections: None,
                         protocol: crate::config::Protocol::Tcp,
                         request_timeout_ms: None,
+                        health_path: None,
                     }],
                 }],
             },
@@ -390,6 +394,7 @@ mod tests {
                 max_connections: Some(50),
                 protocol: crate::config::Protocol::Http,
                 request_timeout_ms: Some(1500),
+                health_path: Some("/healthz".into()),
             },
         };
         match msgpack_round_trip(&msg) {
@@ -405,6 +410,7 @@ mod tests {
                         max_connections,
                         protocol,
                         request_timeout_ms,
+                        health_path,
                     },
             } => {
                 assert_eq!(group, "web");
@@ -416,6 +422,7 @@ mod tests {
                 assert_eq!(max_connections, Some(50));
                 assert_eq!(protocol, crate::config::Protocol::Http);
                 assert_eq!(request_timeout_ms, Some(1500));
+                assert_eq!(health_path.as_deref(), Some("/healthz"));
             }
             other => panic!("wrong variant: {other:?}"),
         }

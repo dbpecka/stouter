@@ -404,6 +404,7 @@ mod tests {
                 max_connections: None,
                 protocol: crate::config::Protocol::Tcp,
                 request_timeout_ms: None,
+                health_path: None,
             })
             .collect();
         let cfg = Config {

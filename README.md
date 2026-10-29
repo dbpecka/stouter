@@ -248,8 +248,19 @@ to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
   and tunnels are reused instead of opened per request.
 - **Timeouts:** optional `requestTimeoutMs` per instance (time allowed for
   response headers); expiry returns `504`.
-- **Retries:** a request without a body is retried on another node (up to 3)
-  when a connection to the chosen node can't be established.
+- **Retries** go to a different node (up to 3 nodes in total):
+  - when a connection to the chosen node can't be established (the request
+    was never sent), for any method;
+  - when a node answers `502`, `503` or `504`, for idempotent methods only
+    (GET, HEAD, OPTIONS, PUT, DELETE, TRACE). These retries are capped by a
+    per-service budget of about 20% of request volume plus a burst of 20, so
+    they can't multiply load on a failing service. If every attempt fails, the
+    client gets the last real backend response.
+
+  Bodies with a declared length up to 64 KiB are buffered so they can be
+  re-sent; larger or chunked bodies are streamed and sent only once.
+  Retries are counted in `stouter_http_retries_total{service,reason}`, and
+  ones skipped for lack of budget in `stouter_http_retry_budget_exhausted_total`.
 - **Errors** from the proxy itself carry an `x-stouter-error` header:
   `502 no_backend_reachable`, `503 circuit_open` (`maxConnections` then caps
   in-flight requests), `504 timeout`.
@@ -268,7 +279,10 @@ restart. HTTP/2 and gRPC services should stay `tcp` for now. See
 ### Health Checks
 
 Every node probes each service it hosts every 5s by opening a TCP connection to
-`127.0.0.1:{nodePort}` (2s timeout). Two failures in a row mark the service
+`127.0.0.1:{nodePort}` (2s timeout). If the instance sets `healthPath` (CLI:
+`--health-path /healthz`), the node also sends `GET {healthPath}` and requires a
+`2xx` status, so a backend that accepts connections but is failing is caught
+too. This works for `tcp` and `http` services alike. Two failures in a row mark the service
 unhealthy; one success marks it healthy again. The node publishes the result in
 its own gossip entry and pushes it to peers as soon as it changes, so
 subscribers stop routing to a dead backend within about 10s of it going down,

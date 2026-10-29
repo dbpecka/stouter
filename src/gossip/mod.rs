@@ -233,6 +233,7 @@ async fn handle_admin_request(
                 max_connections,
                 protocol,
                 request_timeout_ms,
+                health_path,
             } => {
                 let svc = Service {
                     name,
@@ -243,8 +244,12 @@ async fn handle_admin_request(
                     max_connections,
                     protocol,
                     request_timeout_ms,
+                    health_path,
                 };
-                Ok(dc.upsert_service(&group, svc))
+                match svc.health_path.as_deref().map(crate::config::validate_health_path) {
+                    Some(Err(msg)) => Err(MutateErr::Invalid(msg)),
+                    _ => Ok(dc.upsert_service(&group, svc)),
+                }
             }
             AdminOp::ServiceRename { group, owner_node_id, from, to } => {
                 dc.rename_service(&group, &owner_node_id, &from, &to)
@@ -273,7 +278,7 @@ async fn handle_admin_request(
                 MutateErr::GroupNotFound { .. } | MutateErr::ServiceNotFound { .. } => {
                     AdminErrCode::NotFound
                 }
-                MutateErr::DuplicateService { .. } => AdminErrCode::Validation,
+                MutateErr::DuplicateService { .. } | MutateErr::Invalid(_) => AdminErrCode::Validation,
             };
             Msg::AdminResponse {
                 result: AdminResult::Err { code, message: err.to_string() },

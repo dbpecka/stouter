@@ -103,6 +103,10 @@ enum ServiceAction {
         /// HTTP only: time allowed for this instance to send response headers.
         #[arg(long)]
         request_timeout_ms: Option<u64>,
+        /// Path to GET when health-checking this instance (any non-2xx is a
+        /// failure). Unset: TCP connect check only.
+        #[arg(long)]
+        health_path: Option<String>,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -324,10 +328,14 @@ async fn main() -> Result<()> {
                     max_connections,
                     protocol,
                     request_timeout_ms,
+                    health_path,
                     node,
                     remote,
                 },
         }) => {
+            if let Some(path) = &health_path {
+                config::validate_health_path(path).map_err(anyhow::Error::msg)?;
+            }
             if let Some(target) = remote {
                 let cfg = Config::load(&cli.config).unwrap_or_default();
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
@@ -343,6 +351,7 @@ async fn main() -> Result<()> {
                         max_connections,
                         protocol,
                         request_timeout_ms,
+                        health_path,
                     },
                     &cfg,
                     cli.cert_dir.as_deref(),
@@ -364,6 +373,7 @@ async fn main() -> Result<()> {
                     max_connections,
                     protocol,
                     request_timeout_ms,
+                    health_path,
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -580,7 +590,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains, weight, max_connections, protocol, request_timeout_ms) = src_dc
+            let (port, domains, weight, max_connections, protocol, request_timeout_ms, health_path) = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -597,6 +607,7 @@ async fn main() -> Result<()> {
                         s.max_connections,
                         s.protocol,
                         s.request_timeout_ms,
+                        s.health_path.clone(),
                     )
                 })
                 .ok_or_else(|| {
@@ -622,6 +633,7 @@ async fn main() -> Result<()> {
                     max_connections,
                     protocol,
                     request_timeout_ms,
+                    health_path,
                 },
                 &cfg,
                 to_certs,

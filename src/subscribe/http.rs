@@ -16,7 +16,7 @@ use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -44,6 +44,7 @@ pub(super) struct HttpProxy {
     state: Arc<SharedState>,
     balancer: Arc<Balancer>,
     client: Client<TunnelConnector, ProxyBody>,
+    retry_budget: RetryBudget,
 }
 
 impl HttpProxy {
@@ -58,7 +59,7 @@ impl HttpProxy {
             // client's own Host header is forwarded instead.
             .set_host(false)
             .build(connector);
-        Arc::new(Self { service_name, state, balancer, client })
+        Arc::new(Self { service_name, state, balancer, client, retry_budget: RetryBudget::new() })
     }
 
     /// Serve HTTP/1.1 on one accepted client connection.
@@ -104,77 +105,18 @@ impl HttpProxy {
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
 
-        // A request with no body can be re-sent to another node if a
-        // connection can't be established; a streamed body cannot.
-        let replayable = body.is_end_stream();
-        let mut body = Some(body);
-
-        let backends = find_service_nodes(&self.service_name, &self.state);
-        let max_attempts = backends.len().min(MAX_TUNNEL_ATTEMPTS);
-        let mut tried: Vec<String> = Vec::with_capacity(max_attempts);
+        self.retry_budget.deposit();
+        let mut tried: Vec<String> = Vec::new();
         let mut last_err: Option<String> = None;
 
-        let outcome = loop {
-            if tried.len() >= max_attempts {
-                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+        let outcome = match RequestBody::prepare(body).await {
+            Err(e) => {
+                last_err = Some(e.to_string());
+                Outcome::Error(StatusCode::BAD_REQUEST, "bad_request_body")
             }
-            let (idx, slot) = match self.balancer.pick(&backends, &tried, Instant::now()) {
-                Pick::Chosen { index, slot } => (index, slot),
-                Pick::AllTried => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
-                Pick::AtCapacity if last_err.is_none() => {
-                    break Outcome::Error(StatusCode::SERVICE_UNAVAILABLE, "circuit_open")
-                }
-                Pick::AtCapacity => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
-            };
-            let backend = &backends[idx];
-            let node_id = backend.node.id.clone();
-            tried.push(node_id.clone());
-
-            let Some(uri) = node_uri(&node_id, &path_and_query) else {
-                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
-            };
-            let req_body = if replayable {
-                Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
-            } else {
-                match body.take() {
-                    Some(b) => b.boxed(),
-                    None => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
-                }
-            };
-            let mut upstream = Request::new(req_body);
-            *upstream.method_mut() = parts.method.clone();
-            *upstream.uri_mut() = uri;
-            *upstream.version_mut() = Version::HTTP_11;
-            *upstream.headers_mut() = parts.headers.clone();
-
-            let sent = self.client.request(upstream);
-            let result = match backend.request_timeout {
-                Some(limit) => match tokio::time::timeout(limit, sent).await {
-                    Ok(r) => r,
-                    Err(_) => break Outcome::Error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
-                },
-                None => sent.await,
-            };
-
-            match result {
-                Ok(resp) => {
-                    self.balancer.record_success(&node_id);
-                    break Outcome::Response { resp, slot, node_id };
-                }
-                Err(e) if e.is_connect() => {
-                    debug!("connect to node {node_id} for {} failed: {e:?}", self.service_name);
-                    note_tunnel_failure(&self.balancer, &self.service_name, &node_id, &e);
-                    last_err = Some(e.to_string());
-                    if !replayable {
-                        break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
-                    }
-                }
-                Err(e) => {
-                    // The request may have reached the backend: don't retry.
-                    debug!("request to node {node_id} for {} failed: {e:?}", self.service_name);
-                    last_err = Some(e.to_string());
-                    break Outcome::Error(StatusCode::BAD_GATEWAY, "upstream_error");
-                }
+            Ok(body) => {
+                self.attempt(&parts, &path_and_query, body, &mut tried, &mut last_err)
+                    .await
             }
         };
 
@@ -244,6 +186,203 @@ impl HttpProxy {
         );
 
         response
+    }
+}
+
+impl HttpProxy {
+    /// Send the request to up to [`MAX_TUNNEL_ATTEMPTS`] distinct nodes.
+    ///
+    /// Moves to another node when a connection can't be established (the
+    /// request was never sent), or, for idempotent methods and within the
+    /// retry budget, when a node answers 502/503/504. Only replayable bodies
+    /// can be re-sent.
+    async fn attempt(
+        &self,
+        parts: &http::request::Parts,
+        path_and_query: &str,
+        mut body: RequestBody,
+        tried: &mut Vec<String>,
+        last_err: &mut Option<String>,
+    ) -> Outcome {
+        let backends = find_service_nodes(&self.service_name, &self.state);
+        let max_attempts = backends.len().min(MAX_TUNNEL_ATTEMPTS);
+        // A retryable status from an earlier node, returned if no later
+        // attempt does better.
+        let mut fallback: Option<Outcome> = None;
+
+        let outcome = loop {
+            if tried.len() >= max_attempts {
+                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+            }
+            let (idx, slot) = match self.balancer.pick(&backends, tried, Instant::now()) {
+                Pick::Chosen { index, slot } => (index, slot),
+                Pick::AllTried => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
+                Pick::AtCapacity if tried.is_empty() => {
+                    break Outcome::Error(StatusCode::SERVICE_UNAVAILABLE, "circuit_open")
+                }
+                Pick::AtCapacity => break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable"),
+            };
+            let backend = &backends[idx];
+            let node_id = backend.node.id.clone();
+            tried.push(node_id.clone());
+
+            let Some(uri) = node_uri(&node_id, path_and_query) else {
+                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+            };
+            let Some(req_body) = body.for_attempt() else {
+                break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+            };
+            let mut upstream = Request::new(req_body);
+            *upstream.method_mut() = parts.method.clone();
+            *upstream.uri_mut() = uri;
+            *upstream.version_mut() = Version::HTTP_11;
+            *upstream.headers_mut() = parts.headers.clone();
+
+            let sent = self.client.request(upstream);
+            let result = match backend.request_timeout {
+                Some(limit) => match tokio::time::timeout(limit, sent).await {
+                    Ok(r) => r,
+                    Err(_) => break Outcome::Error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                },
+                None => sent.await,
+            };
+
+            match result {
+                Ok(resp) => {
+                    self.balancer.record_success(&node_id);
+                    let status = resp.status();
+                    let outcome = Outcome::Response { resp, slot, node_id };
+                    if !is_retryable_status(status)
+                        || !is_idempotent(&parts.method)
+                        || !body.is_replayable()
+                        || tried.len() >= max_attempts
+                    {
+                        break outcome;
+                    }
+                    if !self.retry_budget.try_withdraw() {
+                        metrics::counter!("stouter_http_retry_budget_exhausted_total", "service" => self.service_name.clone()).increment(1);
+                        break outcome;
+                    }
+                    metrics::counter!("stouter_http_retries_total", "service" => self.service_name.clone(), "reason" => "status").increment(1);
+                    debug!("{} from node {} for {}; retrying on another node", status.as_u16(), tried.last().unwrap(), self.service_name);
+                    fallback = Some(outcome);
+                }
+                Err(e) if e.is_connect() => {
+                    debug!("connect to node {node_id} for {} failed: {e:?}", self.service_name);
+                    note_tunnel_failure(&self.balancer, &self.service_name, &node_id, &e);
+                    *last_err = Some(e.to_string());
+                    if !body.is_replayable() {
+                        break Outcome::Error(StatusCode::BAD_GATEWAY, "no_backend_reachable");
+                    }
+                    // The request never left, so this retry doesn't spend budget.
+                    metrics::counter!("stouter_http_retries_total", "service" => self.service_name.clone(), "reason" => "connect").increment(1);
+                }
+                Err(e) => {
+                    // The request may have reached the backend: don't retry.
+                    debug!("request to node {node_id} for {} failed: {e:?}", self.service_name);
+                    *last_err = Some(e.to_string());
+                    break Outcome::Error(StatusCode::BAD_GATEWAY, "upstream_error");
+                }
+            }
+        };
+
+        // A real backend answer beats a proxy-generated error.
+        match (outcome, fallback) {
+            (Outcome::Error(..), Some(fallback)) => fallback,
+            (outcome, _) => outcome,
+        }
+    }
+}
+
+/// Request bodies up to this size (with a declared length) are buffered so
+/// the request can be re-sent to another node.
+const MAX_BUFFERED_BODY: u64 = 64 * 1024;
+
+/// A request body, buffered if it is small enough to be re-sent.
+enum RequestBody {
+    /// Fully buffered (possibly empty); can be sent any number of times.
+    Replayable(Bytes),
+    /// Streamed from the client; can be sent once.
+    Stream(Option<Incoming>),
+}
+
+impl RequestBody {
+    async fn prepare(body: Incoming) -> Result<Self, hyper::Error> {
+        if body.is_end_stream() {
+            return Ok(Self::Replayable(Bytes::new()));
+        }
+        if body.size_hint().upper().is_some_and(|n| n <= MAX_BUFFERED_BODY) {
+            return Ok(Self::Replayable(body.collect().await?.to_bytes()));
+        }
+        Ok(Self::Stream(Some(body)))
+    }
+
+    fn is_replayable(&self) -> bool {
+        matches!(self, Self::Replayable(_))
+    }
+
+    /// The body to send on the next attempt, or `None` if a streamed body
+    /// has already been used.
+    fn for_attempt(&mut self) -> Option<ProxyBody> {
+        match self {
+            Self::Replayable(bytes) => {
+                Some(Full::new(bytes.clone()).map_err(|never| match never {}).boxed())
+            }
+            Self::Stream(body) => body.take().map(|b| b.boxed()),
+        }
+    }
+}
+
+/// Statuses that mean "this node couldn't serve it, another might".
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Methods that are safe to send twice (RFC 9110 §9.2.2).
+fn is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE | Method::TRACE
+    )
+}
+
+/// Fraction of a retry each request earns.
+const RETRY_BUDGET_RATIO: f64 = 0.2;
+
+/// Most retries that can be banked; the budget starts full so a quiet
+/// service can still retry its first failures.
+const RETRY_BUDGET_MAX: f64 = 20.0;
+
+/// Caps status-driven retries at about [`RETRY_BUDGET_RATIO`] of request
+/// volume (plus a burst of [`RETRY_BUDGET_MAX`]), so retries can't multiply
+/// load on a backend that is already failing.
+struct RetryBudget {
+    tokens: std::sync::Mutex<f64>,
+}
+
+impl RetryBudget {
+    fn new() -> Self {
+        Self { tokens: std::sync::Mutex::new(RETRY_BUDGET_MAX) }
+    }
+
+    /// Credit one request.
+    fn deposit(&self) {
+        let mut t = self.tokens.lock().unwrap();
+        *t = (*t + RETRY_BUDGET_RATIO).min(RETRY_BUDGET_MAX);
+    }
+
+    /// Spend one retry, if the budget allows.
+    fn try_withdraw(&self) -> bool {
+        let mut t = self.tokens.lock().unwrap();
+        if *t >= 1.0 {
+            *t -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -591,6 +730,44 @@ mod tests {
         // A future version may carry extra fields.
         let h = headers(&[("traceparent", "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra")]);
         assert!(TraceContext::from_headers(&h).is_some());
+    }
+
+    #[test]
+    fn retry_budget_caps_retries_at_ratio_after_burst() {
+        let budget = RetryBudget::new();
+        // The initial burst allowance.
+        let burst = (0..100).take_while(|_| budget.try_withdraw()).count();
+        assert_eq!(burst, RETRY_BUDGET_MAX as usize);
+        // Then about one retry per 1/RATIO requests.
+        let mut retries = 0;
+        for _ in 0..1000 {
+            budget.deposit();
+            if budget.try_withdraw() {
+                retries += 1;
+            }
+        }
+        assert!((199..=200).contains(&retries), "{retries}");
+    }
+
+    #[test]
+    fn retry_budget_banks_at_most_max() {
+        let budget = RetryBudget::new();
+        for _ in 0..10_000 {
+            budget.deposit();
+        }
+        let banked = (0..1000).take_while(|_| budget.try_withdraw()).count();
+        assert_eq!(banked, RETRY_BUDGET_MAX as usize);
+    }
+
+    #[test]
+    fn only_idempotent_methods_and_gateway_statuses_retry() {
+        assert!(is_idempotent(&Method::GET));
+        assert!(is_idempotent(&Method::PUT));
+        assert!(!is_idempotent(&Method::POST));
+        assert!(!is_idempotent(&Method::PATCH));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
     }
 
     #[test]

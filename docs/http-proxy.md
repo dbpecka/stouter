@@ -1,6 +1,8 @@
 # Design: HTTP-aware data plane
 
-Status: milestone 1 implemented; later milestones proposed.
+Status: milestone 1 implemented, plus the resilience half of M2 (HTTP
+health checks, status retries under a budget, body buffering); L7 routing and
+later milestones proposed.
 
 ## Problem
 
@@ -69,7 +71,8 @@ Request flow for an `http` service:
 |---|---|
 | Load balancing | Per request. The pool is keyed by node, so per-request picks reuse that node's connections. |
 | `maxConnections` | Caps concurrent **in-flight requests** per instance (held until the response body finishes). Over the cap → `503`. |
-| Retries | Only when a new connection to the chosen node can't be established, so the request was never sent. Then the next node is tried, up to 3 nodes. This applies only to requests without a body, because a streamed body can't be replayed. 5xx responses are **not** retried yet. |
+| Retries | To a different node, up to 3 nodes. (a) When a connection can't be established (the request was never sent): any method, not budgeted. (b) On `502/503/504`: idempotent methods only, within the retry budget; if no later attempt does better, the last real response is returned. Bodies with a declared length ≤ 64 KiB are buffered so they can be re-sent; larger or chunked bodies go once. |
+| Retry budget | Per service: each request earns 0.2 retries, each status retry spends 1, up to 20 banked (and the budget starts full). Status retries therefore stay under ~20% of traffic in steady state. |
 | Timeouts | Optional per-instance `requestTimeoutMs`: time allowed to receive response headers from that instance. Expiry → `504`, and it is not retried (the backend may have acted on the request). |
 | Errors | No backend reachable → `502`, every instance at its limit → `503`, timeout → `504`. Each carries an `x-stouter-error` header saying which. |
 | Hop-by-hop headers | Stripped in both directions (RFC 9110 §7.6.1), including any listed in `Connection`. `Host` is preserved. |
@@ -82,18 +85,18 @@ Request flow for an `http` service:
 
 - **Downstream HTTP/2 (h2c) and gRPC.** gRPC services should stay `tcp` for now.
 - **TLS from the application to the local proxy.** It listens on loopback.
-- **Body buffering for retries.**
 
 ## Later milestones
 
 **M2 — L7 routing and HTTP health.**
 - Route rules per service: match on path prefix, method or header, and send
   to a subset of instances (selected by labels), with weights per route. Canary
-  by header becomes possible.
+  by header becomes possible. *(Proposed; needs a config-schema decision.)*
 - `healthPath` health checks, probed by the hosting node through the existing
   health gossip. They report an unhealthy *status*, not just a closed port.
-- Retries on `502/503/504` for idempotent methods, limited by a retry budget
-  (e.g. at most 20% extra load).
+  *(Done.)*
+- Retries on `502/503/504` for idempotent methods, limited by a retry budget,
+  and small-body buffering so requests with bodies can be replayed. *(Done.)*
 
 **M3 — Span export.** Each proxy hop emits an OpenTelemetry span over OTLP
 (optional collector endpoint in config), using the trace ids M1 already

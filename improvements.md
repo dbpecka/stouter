@@ -24,7 +24,10 @@ service mesh. Grouped by area, not prioritized.
 - HTTP-aware proxying (opt-in `protocol: http`, milestone 1 of
   `docs/http-proxy.md`): per-request balancing over pooled tunnels, timeouts,
   connect-failure retries, upgrade passthrough, W3C trace propagation, access
-  logs, and per-service request metrics.
+  logs, and per-service request metrics. Plus retries on 502/503/504 for
+  idempotent methods under a retry budget, and buffering of small bodies so
+  they can be replayed.
+- HTTP health checks: optional `healthPath` per instance, requiring a 2xx.
 
 ## Security (identity & policy)
 - Certificate rotation without a restart, and revocation (a CRL or short-lived
@@ -38,9 +41,8 @@ service mesh. Grouped by area, not prioritized.
   with per-route weights (M2 in `docs/http-proxy.md`).
 - Further load-balancing policies on top of weighted round-robin: P2C /
   least-connections and consistent-hash (sticky sessions).
-- Retries on 5xx for idempotent methods under a retry budget, request
-  hedging, and buffering small bodies so POSTs can be retried on connect
-  failure (today only body-less requests are).
+- Request hedging, and counting 5xx responses toward outlier ejection
+  (today only tunnel failures eject a node).
 - Cluster-wide connection limits (today each subscriber enforces
   `maxConnections` on its own) and a bounded pending queue instead of
   immediate rejection.
@@ -66,8 +68,6 @@ service mesh. Grouped by area, not prioritized.
 
 ## Reliability & topology
 - Locality-aware routing (prefer same-zone/region before cross-WAN).
-- HTTP health checks (`healthPath` per service); current checks only confirm
-  the port accepts connections.
 - Cross-cluster failover / federation of gossip rings.
 
 ## Config & DX
@@ -80,9 +80,9 @@ service mesh. Grouped by area, not prioritized.
 
 ## Next up
 Following `docs/http-proxy.md`:
-1. **M2 — L7 routing + HTTP health checks** — route rules (path/header →
-   instance subsets with weights), `healthPath` probes, 5xx retries under a
-   budget.
+1. **M2 — L7 routing** — route rules (path/header → instance subsets with
+   weights). Needs a config-schema decision first: instance `labels` plus a
+   service-level `routes` list is the current proposal.
 2. **M3 — OTLP span export** — turns the propagated trace context into real
    distributed traces.
 3. **M5 — Workload identity + L7 authorization** — per-service identities in
