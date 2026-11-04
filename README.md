@@ -396,3 +396,26 @@ GET /services/{name}   → one service
 Each entry has `name`, `port`, `address`, `domains` and `meta`.
 
 This lets local processes discover which `127.0.0.1` port to connect to for each service name without static configuration.
+
+### Calling Services from Another Node
+
+A process on a subscribe or `nodeSubscribe` host reaches a service on another
+node through a local proxy on `127.0.0.1`. By default each proxy gets a random
+port, which changes on restart and is found through `/services`.
+
+To use a fixed address instead, give the service a `localPort` (CLI:
+`--local-port 15002`). Every subscriber then opens that service's proxy on
+`127.0.0.1:15002`, so callers can hard-code it:
+
+```json
+{ "name": "inventory", "nodeId": "host2", "nodePort": 5000, "localPort": 15002 }
+```
+
+- Instances that set `localPort` must agree, and two services can't share one.
+  It also can't be the REST API's port or `httpListen`'s. `stouter check`
+  rejects all of these.
+- Changing it moves the proxy to the new port on every subscriber within a
+  couple of seconds, without a restart.
+- If the port is taken by another process, the subscriber logs one warning and
+  keeps retrying. Until the bind succeeds, the service isn't proxied and is
+  missing from `/services`.

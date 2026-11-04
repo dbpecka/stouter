@@ -52,7 +52,41 @@ pub(super) struct HttpProxy {
     retry_budget: RetryBudget,
 }
 
+/// The per-service HTTP proxies of this daemon, created on first use and
+/// shared by the per-service ports and the `httpListen` dispatcher.
+pub(super) struct HttpProxies {
+    state: Arc<SharedState>,
+    map: std::sync::Mutex<std::collections::HashMap<String, Arc<HttpProxy>>>,
+}
+
+impl HttpProxies {
+    pub fn new(state: Arc<SharedState>) -> Arc<Self> {
+        Arc::new(Self { state, map: Default::default() })
+    }
+
+    /// The proxy for `service_name`, creating it (with a fresh balancer) if
+    /// this is the first use.
+    pub fn get(&self, service_name: &str) -> Arc<HttpProxy> {
+        let mut map = self.map.lock().unwrap();
+        map.entry(service_name.to_string())
+            .or_insert_with(|| {
+                HttpProxy::new(service_name.to_string(), self.state.clone(), Arc::new(Balancer::new()))
+            })
+            .clone()
+    }
+
+    /// Drop proxies for services no longer in the config.
+    pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        self.map.lock().unwrap().retain(|name, _| keep(name));
+    }
+}
+
 impl HttpProxy {
+    /// The balancer this service's requests and connections are picked by.
+    pub fn balancer(&self) -> Arc<Balancer> {
+        self.balancer.clone()
+    }
+
     pub fn new(service_name: String, state: Arc<SharedState>, balancer: Arc<Balancer>) -> Arc<Self> {
         let connector = TunnelConnector {
             service_name: service_name.clone(),

@@ -236,6 +236,7 @@ async fn handle_admin_request(
                 health_path,
                 labels,
                 meta,
+                local_port,
             } => {
                 let svc = Service {
                     name,
@@ -249,6 +250,7 @@ async fn handle_admin_request(
                     health_path,
                     labels,
                     meta,
+                    local_port,
                 };
                 match svc.health_path.as_deref().map(crate::config::validate_health_path) {
                     Some(Err(msg)) => Err(MutateErr::Invalid(msg)),

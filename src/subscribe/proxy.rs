@@ -11,7 +11,7 @@ use tracing::info;
 use crate::tls::MeshStream;
 
 use super::balancer::{Backend, Balancer, Pick};
-use super::http::HttpProxy;
+use super::http::HttpProxies;
 use crate::config::{NodeInfo, Protocol};
 use crate::gossip;
 use crate::gossip::messages::Message;
@@ -32,7 +32,8 @@ const NODE_STALE_AFTER: Duration = Duration::from_secs(30);
 
 /// Run a local TCP proxy for a service, routing across all available nodes.
 ///
-/// Binds on `127.0.0.1:0`, sends the assigned port back through `port_tx`,
+/// Binds on `127.0.0.1:{port}` (a random port when `None`), sends the bound
+/// port, or the bind error, back through `port_tx`,
 /// then accepts connections and forwards each one through an authenticated
 /// tunnel to a node hosting the service. Nodes are selected by smooth
 /// weighted round-robin, nodes whose tunnel setup keeps failing are ejected
@@ -42,19 +43,27 @@ const NODE_STALE_AFTER: Duration = Duration::from_secs(30);
 pub async fn run_proxy(
     service_name: String,
     state: Arc<SharedState>,
-    port_tx: oneshot::Sender<u16>,
+    proxies: Arc<HttpProxies>,
+    port: Option<u16>,
+    port_tx: oneshot::Sender<std::result::Result<u16, String>>,
 ) -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("bind proxy listener")?;
+    let listener = match TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = port_tx.send(Err(format!("bind 127.0.0.1:{}: {e}", port.unwrap_or(0))));
+            return Ok(());
+        }
+    };
 
     let local_port = listener.local_addr()?.port();
-    let _ = port_tx.send(local_port);
+    let _ = port_tx.send(Ok(local_port));
 
     info!("Proxy for {} on 127.0.0.1:{}", service_name, local_port);
 
-    let balancer = Arc::new(Balancer::new());
-    let http = HttpProxy::new(service_name.clone(), state.clone(), balancer.clone());
+    // Shared with the httpListen dispatcher, so both entry points use one
+    // balancer (and one set of connection limits and ejections).
+    let http = proxies.get(&service_name);
+    let balancer = http.balancer();
 
     loop {
         let (client, _) = listener.accept().await.context("proxy accept")?;
@@ -416,6 +425,7 @@ mod tests {
                 health_path: None,
                 labels: Default::default(),
                 meta: Default::default(),
+                local_port: None,
             })
             .collect();
         let cfg = Config {
