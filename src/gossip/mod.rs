@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::NodeInfo;
 use crate::state::SharedState;
@@ -83,68 +83,81 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Mes
 
 /// Handle an inbound connection by reading the first message and dispatching
 /// to the appropriate handler based on its variant.
+///
+/// Only the handling of that message counts as in-flight work for a drain:
+/// until it arrives the connection is idle (subscribers keep warm ones open
+/// until they need a tunnel), and at shutdown an idle one is just closed.
 pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, state: Arc<SharedState>) {
-    match recv_message(&mut stream).await {
+    let first = tokio::select! {
+        result = recv_message(&mut stream) => result,
+        _ = state.shutdown.cancelled() => return,
+    };
+    let msg = match first {
+        Ok(msg) => msg,
         Err(e) => {
             debug!("failed to receive message from {peer_addr}: {e}");
+            return;
         }
-        Ok(msg) => match msg {
-            Message::Sync { .. }
-            | Message::ConfigUpdate { .. }
-            | Message::NodeJoin { .. }
-            | Message::NodeLeave { .. } => {
-                metrics::counter!("stouter_connections_total", "type" => "gossip").increment(1);
-                handle_gossip_message(stream, peer_addr, msg, state).await;
-            }
-            Message::TunnelRequest {
+    };
+    // A mux session lasts as long as the peer keeps it, mostly idle, so it
+    // isn't tracked as a whole; each of its streams is.
+    let _in_flight = (!matches!(msg, Message::MuxTunnel {})).then(|| state.in_flight.track());
+    match msg {
+        Message::Sync { .. }
+        | Message::ConfigUpdate { .. }
+        | Message::NodeJoin { .. }
+        | Message::NodeLeave { .. } => {
+            metrics::counter!("stouter_connections_total", "type" => "gossip").increment(1);
+            handle_gossip_message(stream, peer_addr, msg, state).await;
+        }
+        Message::TunnelRequest {
+            node_id,
+            service_name,
+            timestamp_ms,
+        } => {
+            metrics::counter!("stouter_connections_total", "type" => "tunnel").increment(1);
+            if let Err(e) = crate::node::tunnel::handle_tunnel(
+                stream,
                 node_id,
                 service_name,
                 timestamp_ms,
-            } => {
-                metrics::counter!("stouter_connections_total", "type" => "tunnel").increment(1);
-                if let Err(e) = crate::node::tunnel::handle_tunnel(
-                    stream,
-                    node_id,
-                    service_name,
-                    timestamp_ms,
-                    state,
-                )
-                .await
-                {
-                    error!("tunnel from {peer_addr}: {e}");
-                }
+                state,
+            )
+            .await
+            {
+                error!("tunnel from {peer_addr}: {e}");
             }
-            Message::ReverseRegistration {
-                node_id,
-                timestamp_ms,
-            } => {
-                metrics::counter!("stouter_connections_total", "type" => "reverse").increment(1);
-                if let Err(e) = crate::node::relay::handle_reverse_registration(
-                    stream, node_id, timestamp_ms, state,
-                )
-                .await
-                {
-                    debug!("reverse registration from {peer_addr} failed: {e}");
-                }
+        }
+        Message::ReverseRegistration {
+            node_id,
+            timestamp_ms,
+        } => {
+            metrics::counter!("stouter_connections_total", "type" => "reverse").increment(1);
+            if let Err(e) = crate::node::relay::handle_reverse_registration(
+                stream, node_id, timestamp_ms, state,
+            )
+            .await
+            {
+                debug!("reverse registration from {peer_addr} failed: {e}");
             }
-            Message::StatusRequest => {
-                handle_status_request(stream, state).await;
-            }
-            Message::StatusResponse { .. } => {
-                debug!("unexpected StatusResponse from {peer_addr}");
-            }
-            Message::MuxTunnel {} => {
-                metrics::counter!("stouter_connections_total", "type" => "mux").increment(1);
-                crate::mux::handle_mux_session(stream, state).await;
-            }
-            Message::AdminRequest { op } => {
-                metrics::counter!("stouter_connections_total", "type" => "admin").increment(1);
-                handle_admin_request(stream, op, state).await;
-            }
-            Message::AdminResponse { .. } => {
-                debug!("unexpected AdminResponse from {peer_addr}");
-            }
-        },
+        }
+        Message::StatusRequest => {
+            handle_status_request(stream, state).await;
+        }
+        Message::StatusResponse { .. } => {
+            debug!("unexpected StatusResponse from {peer_addr}");
+        }
+        Message::MuxTunnel {} => {
+            metrics::counter!("stouter_connections_total", "type" => "mux").increment(1);
+            crate::mux::handle_mux_session(stream, state).await;
+        }
+        Message::AdminRequest { op } => {
+            metrics::counter!("stouter_connections_total", "type" => "admin").increment(1);
+            handle_admin_request(stream, op, state).await;
+        }
+        Message::AdminResponse { .. } => {
+            debug!("unexpected AdminResponse from {peer_addr}");
+        }
     }
 }
 
@@ -316,64 +329,79 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
 // Sync loop
 // ---------------------------------------------------------------------------
 
-/// Background task: periodically read the config file and, if `dynamic_config`
-/// has a higher version than what is in memory, update local state and
-/// broadcast a [`Message::ConfigUpdate`] to all peers.
+/// Background task: periodically read the config file and adopt its
+/// `dynamic_config` when it is newer than what is in memory, then broadcast a
+/// [`Message::ConfigUpdate`] to all peers.
+///
+/// The file counts as newer when its version is higher, or when it has the
+/// same version as memory but different services (a hand edit that didn't
+/// bump the version; it is bumped here). A file at a *lower* version is
+/// stale, not an edit: it is what's left when persisting failed (e.g. a
+/// read-only mount), and adopting it would roll back every change made since
+/// across the whole cluster.
 pub async fn run_config_poll_loop(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(10));
+    // The (file, memory) versions last warned about, so a file stuck behind
+    // memory is reported once per change rather than on every poll.
+    let mut warned_stale: Option<(u64, u64)> = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
             _ = state.shutdown.cancelled() => break,
         }
 
-        let new_cfg = match crate::config::Config::load(&state.config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("config poll: failed to read {}: {e}", state.config_path);
-                continue;
-            }
-        };
-
-        let (current_version, groups_match) = {
-            let dc = state.dynamic_config.read().await;
-            (
-                dc.version,
-                dc.service_groups == new_cfg.dynamic_config.service_groups,
-            )
-        };
-        debug!(
-            "config poll: file version={}, in-memory version={}, groups_match={}",
-            new_cfg.dynamic_config.version, current_version, groups_match
-        );
-
-        let mut new_dc = if new_cfg.dynamic_config.version > current_version {
-            info!(
-                "config file version advanced: {} -> {}",
-                current_version, new_cfg.dynamic_config.version
-            );
-            new_cfg.dynamic_config
-        } else if !groups_match {
-            let bumped = current_version + 1;
-            info!(
-                "manual config edit detected; auto-bumping version {} -> {}",
-                current_version, bumped
-            );
-            new_cfg.dynamic_config
-        } else {
-            continue;
-        };
-        // Ensure the version we store and broadcast is monotonic relative to
-        // in-memory state, so peers accept the update.
-        if new_dc.version <= current_version {
-            new_dc.version = current_version + 1;
-        }
-
-        {
+        // Read the file under the lock every persist also holds, so the file
+        // and memory are compared as one consistent snapshot.
+        let new_dc = {
             let mut dc = state.dynamic_config.write().await;
+            let file_dc = match crate::config::Config::load(&state.config_path) {
+                Ok(c) => c.dynamic_config,
+                Err(e) => {
+                    debug!("config poll: failed to read {}: {e}", state.config_path);
+                    continue;
+                }
+            };
+            let current_version = dc.version;
+            debug!(
+                "config poll: file version={}, in-memory version={}",
+                file_dc.version, current_version
+            );
+
+            let mut new_dc = if file_dc.version > current_version {
+                info!(
+                    "config file version advanced: {} -> {}",
+                    current_version, file_dc.version
+                );
+                file_dc
+            } else if file_dc.version == current_version && file_dc.service_groups != dc.service_groups {
+                info!(
+                    "manual config edit detected; auto-bumping version {} -> {}",
+                    current_version,
+                    current_version + 1
+                );
+                file_dc
+            } else {
+                if file_dc.version < current_version
+                    && warned_stale != Some((file_dc.version, current_version))
+                {
+                    warn!(
+                        "config file {} is at version {}, behind the running config (version {}); \
+                         ignoring it. Persisting may be failing; to apply a manual edit, set its \
+                         version above {}",
+                        state.config_path, file_dc.version, current_version, current_version
+                    );
+                    warned_stale = Some((file_dc.version, current_version));
+                }
+                continue;
+            };
+            // Keep the version monotonic so peers accept the update.
+            if new_dc.version <= current_version {
+                new_dc.version = current_version + 1;
+            }
             *dc = new_dc.clone();
-        }
-        persist_state(&state).await;
+            persist_state_with(&state, &dc);
+            new_dc
+        };
         state.rebuild_service_index().await;
         print_dynamic_config(&state).await;
         broadcast_message(
@@ -522,14 +550,18 @@ async fn print_dynamic_config(state: &Arc<SharedState>) {
 /// list in the config file is left untouched — it contains bootstrap peer
 /// addresses, not the gossip-discovered member list.
 async fn persist_state(state: &Arc<SharedState>) {
-    let dc = state.dynamic_config.read().await.clone();
+    // Hold the lock while writing: every change persists under the write
+    // lock, so this write can't land on top of a newer version's.
+    let dc = state.dynamic_config.read().await;
     persist_state_with(state, &dc);
 }
 
 /// Same as `persist_state`, but accepts the dynamic config directly so the
 /// caller can persist while still holding a write lock on
 /// `state.dynamic_config` — `persist_state` itself takes a read lock and would
-/// deadlock under such a caller.
+/// deadlock under such a caller. Every change to `state.dynamic_config`
+/// persists this way before releasing the lock, which keeps the file written
+/// in version order (the config poll loop relies on that).
 fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) {
     let mut cfg = match crate::config::Config::load(&state.config_path) {
         Ok(c) => c,
@@ -571,6 +603,7 @@ async fn merge_sync(
                 dc.version, config.version
             );
             *dc = config;
+            persist_state_with(state, &dc);
             true
         } else {
             false
@@ -580,7 +613,6 @@ async fn merge_sync(
     if updated {
         state.rebuild_service_index().await;
         print_dynamic_config(state).await;
-        persist_state(state).await;
     }
 
     let own_id = state.config.node_id.as_str();
@@ -668,6 +700,7 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
                         dc.version, config.version
                     );
                     *dc = config;
+                    persist_state_with(state, &dc);
                     true
                 } else {
                     false
@@ -676,7 +709,6 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
             if updated {
                 state.rebuild_service_index().await;
                 print_dynamic_config(state).await;
-                persist_state(state).await;
             }
         }
         Message::NodeJoin { id, addr } => {
@@ -845,5 +877,73 @@ mod tests {
         let nodes = snapshot_nodes(&state);
         let me = nodes.iter().find(|n| n.id == "me").unwrap();
         assert_eq!(me.health.unhealthy, ["api"]);
+    }
+
+    fn named_services(names: &[&str]) -> DynamicConfig {
+        let services = names
+            .iter()
+            .map(|n| serde_json::from_value(serde_json::json!({"name": n, "nodeId": "n1", "nodePort": 1})).unwrap())
+            .collect();
+        DynamicConfig {
+            version: 0,
+            service_groups: vec![crate::config::ServiceGroup { name: "g".into(), services }],
+            routes: vec![],
+        }
+    }
+
+    fn service_names(dc: &DynamicConfig) -> Vec<String> {
+        dc.service_groups[0].services.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Run the poll loop for one pass against a config file holding `file`
+    /// while memory holds `memory`. Returns memory and the file afterwards.
+    async fn poll_once(file: DynamicConfig, memory: DynamicConfig) -> (DynamicConfig, DynamicConfig) {
+        let path = std::env::temp_dir().join(format!(
+            "stouter_poll_{}_{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path_s = path.to_str().unwrap().to_string();
+        let cfg = Config { node_id: "me".into(), dynamic_config: file, ..Config::default() };
+        cfg.save(&path_s).unwrap();
+        let state = SharedState::new(cfg, path_s.clone(), CancellationToken::new(), None);
+        *state.dynamic_config.write().await = memory;
+
+        let poll = tokio::spawn(run_config_poll_loop(state.clone()));
+        // The first tick fires at once; give the pass time to finish.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        poll.abort();
+        let memory = state.dynamic_config.read().await.clone();
+        let file = Config::load(&path_s).unwrap().dynamic_config;
+        let _ = std::fs::remove_file(&path);
+        (memory, file)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_keeps_newer_memory_over_a_stale_file() {
+        // Persisting v6 failed (read-only mount, full disk), so the file is
+        // still at v5. That's not an edit: memory must stay at v6.
+        let file = DynamicConfig { version: 5, ..named_services(&["old"]) };
+        let memory = DynamicConfig { version: 6, ..named_services(&["old", "new"]) };
+        let (memory, file) = poll_once(file, memory).await;
+        assert_eq!(memory.version, 6);
+        assert_eq!(service_names(&memory), ["old", "new"]);
+        assert_eq!(file.version, 5, "a stale file is left alone, not overwritten");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_adopts_hand_edits_and_newer_files() {
+        // Edited without bumping the version: adopted, bumped and persisted.
+        let file = DynamicConfig { version: 5, ..named_services(&["old", "edited"]) };
+        let memory = DynamicConfig { version: 5, ..named_services(&["old"]) };
+        let (memory, file) = poll_once(file, memory).await;
+        assert_eq!((memory.version, service_names(&memory)), (6, vec!["old".into(), "edited".into()]));
+        assert_eq!(file, memory);
+
+        // A higher file version is adopted as-is.
+        let file = DynamicConfig { version: 9, ..named_services(&["cli-added"]) };
+        let memory = DynamicConfig { version: 5, ..named_services(&["old"]) };
+        let (memory, _) = poll_once(file, memory).await;
+        assert_eq!((memory.version, service_names(&memory)), (9, vec!["cli-added".into()]));
     }
 }

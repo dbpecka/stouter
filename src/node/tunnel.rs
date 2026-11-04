@@ -23,6 +23,18 @@ pub(crate) async fn send_tunnel_error<W: AsyncWrite + Unpin>(stream: &mut W, msg
     let _ = stream.flush().await;
 }
 
+/// Refuse a new tunnel once shutdown has begun, so a draining node only
+/// finishes the work it already has. The subscriber sees the error and tries
+/// another node.
+pub(crate) async fn refuse_if_draining<W: AsyncWrite + Unpin>(stream: &mut W, state: &SharedState) -> Result<()> {
+    if state.shutdown.is_cancelled() {
+        let msg = "node is shutting down";
+        send_tunnel_error(stream, msg).await;
+        bail!("{msg}");
+    }
+    Ok(())
+}
+
 /// Handle a tunnel request with already-parsed fields.
 ///
 /// Protocol (after the initial Message has been read by the dispatcher):
@@ -37,6 +49,8 @@ pub async fn handle_tunnel(
     timestamp_ms: u64,
     state: Arc<SharedState>,
 ) -> Result<()> {
+    refuse_if_draining(&mut client, &state).await?;
+
     // --- Verify timestamp ---
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

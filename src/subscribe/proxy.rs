@@ -66,7 +66,12 @@ pub async fn run_proxy(
     let balancer = http.balancer();
 
     loop {
-        let (client, _) = listener.accept().await.context("proxy accept")?;
+        // Stop accepting at shutdown; connections already accepted are
+        // tracked as in-flight and drained.
+        let (client, _) = tokio::select! {
+            accepted = listener.accept() => accepted.context("proxy accept")?,
+            _ = state.shutdown.cancelled() => return Ok(()),
+        };
         client.set_nodelay(true).ok();
 
         // Checked per connection so a protocol change in the config applies
@@ -79,7 +84,9 @@ pub async fn run_proxy(
         let service_name = service_name.clone();
         let state = state.clone();
         let balancer = balancer.clone();
+        let in_flight = state.in_flight.track();
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             serve_client(client, service_name, state, balancer).await;
         });
     }

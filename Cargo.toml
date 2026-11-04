@@ -40,6 +40,8 @@ rand = "0.9"
 
 [dev-dependencies]
 tower = "0.5"
+# Paused, manually advanced time for tests of timeouts.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

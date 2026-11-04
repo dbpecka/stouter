@@ -109,6 +109,11 @@ impl Drop for InFlightGuard {
 }
 
 /// Tracks the number of in-flight connections for graceful drain.
+///
+/// Counts work in progress only: tunnels being proxied, gossip and admin
+/// requests, and client connections on subscriber proxies. Idle pooled
+/// connections and idle mux sessions aren't counted, so a quiet node drains
+/// at once.
 pub struct InFlightTracker {
     count: AtomicUsize,
     zero: Notify,
@@ -132,15 +137,18 @@ impl InFlightTracker {
     }
 
     pub async fn wait_zero(&self, timeout: Duration) -> bool {
-        if self.count.load(Ordering::SeqCst) == 0 {
-            return true;
-        }
         tokio::time::timeout(timeout, async {
             loop {
-                self.zero.notified().await;
+                // Register for the wakeup before checking the count, so a
+                // drop to zero in between isn't missed (`notify_waiters`
+                // only wakes waiters that already exist).
+                let notified = self.zero.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.count.load(Ordering::SeqCst) == 0 {
                     break;
                 }
+                notified.await;
             }
         })
         .await
@@ -273,4 +281,34 @@ fn build_route_index(dc: &DynamicConfig) -> HashMap<String, Vec<Route>> {
         idx.entry(route.service.clone()).or_default().push(route.clone());
     }
     idx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_zero_returns_when_the_last_guard_drops() {
+        let tracker = InFlightTracker::new();
+        assert!(tracker.wait_zero(Duration::from_secs(30)).await, "nothing in flight");
+
+        let guards = vec![tracker.track(), tracker.track()];
+        let start = Instant::now();
+        let waiter = {
+            let tracker = tracker.clone();
+            tokio::spawn(async move { tracker.wait_zero(Duration::from_secs(30)).await })
+        };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(guards);
+        assert!(waiter.await.unwrap());
+        assert_eq!(start.elapsed().as_secs(), 2, "woken at the drop, not the timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_zero_times_out_while_work_remains() {
+        let tracker = InFlightTracker::new();
+        let _guard = tracker.track();
+        assert!(!tracker.wait_zero(Duration::from_secs(30)).await);
+        assert_eq!(tracker.current(), 1);
+    }
 }

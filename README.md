@@ -174,6 +174,10 @@ Copy the resulting files to the new node's `tlsDir` before starting it.
 2. `ca.crt` + `node.crt` + `node.key` present → use pre-issued cert
 3. Nothing present → generate new CA (written to disk) and node cert (memory only)
 
+Private keys (`ca.key`, and the `node.key` written by `cert issue`) are created
+readable by their owner only (`0600`); stouter warns at startup if an existing
+key is readable by other users.
+
 ### Docker
 
 ```sh
@@ -181,6 +185,13 @@ docker run -d --name stouter --network host \
   -v /srv/stouter/config/:/srv/stouter/config/ \
   stouter --config /srv/stouter/config/stouter.json
 ```
+
+On `SIGTERM` (what `docker stop` sends) or `SIGINT`, stouter broadcasts
+`NodeLeave`, stops accepting, refuses new tunnels (subscribers retry another
+node) and waits up to 30s for in-flight tunnels and requests to finish. Idle
+pooled connections and mux sessions don't count, so an idle daemon exits at
+once. Docker's default stop timeout is 10s; pass `-t 30` to `docker stop` (or
+`--stop-timeout 30` to `docker run`) to give long transfers the full window.
 
 ---
 

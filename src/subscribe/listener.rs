@@ -12,13 +12,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use http::{header, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
-use super::http::{error_response, HttpProxies, ProxyBody};
+use super::http::{error_response, serve_http1, HttpProxies, ProxyBody};
 use super::proxy::service_is_http;
 use crate::config::DynamicConfig;
 use crate::state::SharedState;
@@ -44,19 +42,18 @@ pub(super) async fn run_http_listener(
             _ = state.shutdown.cancelled() => return Ok(()),
         };
         client.set_nodelay(true).ok();
+        let in_flight = state.in_flight.track();
+        let shutdown = state.shutdown.clone();
         let state = state.clone();
         let proxies = proxies.clone();
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             let service = service_fn(move |req| {
                 let state = state.clone();
                 let proxies = proxies.clone();
                 async move { Ok::<_, std::convert::Infallible>(dispatch(req, &state, &proxies).await) }
             });
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(TokioIo::new(client), service)
-                .with_upgrades()
-                .await
-            {
+            if let Err(e) = serve_http1(client, service, &shutdown).await {
                 debug!("httpListen connection error: {e}");
             }
         });

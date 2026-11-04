@@ -47,7 +47,7 @@ The integration produces documents with this field structure:
 Key metric families ingested by the dashboards:
 
 - `stouter_known_nodes` — peer count (gauge)
-- `stouter_in_flight_connections` — active connections (gauge)
+- `stouter_in_flight_connections` — tunnels, requests and client connections in progress (gauge; idle pooled connections aren't counted)
 - `stouter_mux_sessions` — yamux sessions (gauge)
 - `stouter_config_version` — dynamic config version (gauge)
 - `stouter_gossip_syncs_total{result}` — gossip sync counter
@@ -94,7 +94,7 @@ Cluster health at a glance.
 | Panel | What it shows |
 |-------|--------------|
 | Known Nodes | Current peer count (latest gauge value) |
-| In-Flight Connections | Active connections right now |
+| In-Flight Connections | Tunnels, requests and client connections in progress right now |
 | Active Mux Sessions | Open yamux multiplexed sessions |
 | Config Version | Current dynamic config version across the cluster |
 | Known Nodes Over Time | Peer count trend — drops indicate nodes leaving |

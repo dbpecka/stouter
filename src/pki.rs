@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::info;
+use tracing::{info, warn};
 
 /// The fixed DNS SAN stamped into every node cert so WebPki hostname
 /// verification can be used without per-node cert customisation.
@@ -81,10 +81,59 @@ pub fn issue_cert_to_dir(tls_dir: &str, node_id: &str, out_dir: &str) -> Result<
         .with_context(|| format!("read {}", ca_cert_path.display()))?;
     std::fs::write(out.join("ca.crt"), &ca_pem).context("write ca.crt")?;
     std::fs::write(out.join("node.crt"), cert.pem()).context("write node.crt")?;
-    std::fs::write(out.join("node.key"), key.serialize_pem()).context("write node.key")?;
+    write_private_key(&out.join("node.key"), &key.serialize_pem()).context("write node.key")?;
 
     info!("issued certificate for '{node_id}' → {out_dir}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Private key files
+// ---------------------------------------------------------------------------
+
+/// Write a private key readable by its owner only (mode `0600` on Unix), so
+/// other local users can't copy it, or, for `ca.key`, mint certificates
+/// with any CN, `adminCns` included. An existing file is tightened before
+/// the new key goes in.
+fn write_private_key(path: &Path, pem: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // `mode` only applies when the file is created.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(pem.as_bytes())?;
+    file.sync_all()
+}
+
+/// Warn when a private key file can be read by users other than its owner,
+/// e.g. one written by an earlier version with the default `0644`.
+fn warn_if_readable_by_others(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                warn!(
+                    "{} is readable by other users (mode {mode:03o}); restrict it with `chmod 600 {}`",
+                    path.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +159,7 @@ fn generate_ca(
 
     std::fs::write(cert_path, cert.pem())
         .with_context(|| format!("write {}", cert_path.display()))?;
-    std::fs::write(key_path, key.serialize_pem())
+    write_private_key(key_path, &key.serialize_pem())
         .with_context(|| format!("write {}", key_path.display()))?;
 
     info!("generated CA certificate → {}", cert_path.display());
@@ -123,6 +172,7 @@ fn load_ca(
 ) -> Result<(CertificateDer<'static>, rcgen::Certificate, KeyPair)> {
     let cert_pem = std::fs::read_to_string(cert_path)
         .with_context(|| format!("read {}", cert_path.display()))?;
+    warn_if_readable_by_others(key_path);
     let key_pem = std::fs::read_to_string(key_path)
         .with_context(|| format!("read {}", key_path.display()))?;
 
@@ -175,6 +225,7 @@ fn load_issued(
         .with_context(|| format!("read {}", ca_cert_path.display()))?;
     let node_cert_pem = std::fs::read_to_string(node_cert_path)
         .with_context(|| format!("read {}", node_cert_path.display()))?;
+    warn_if_readable_by_others(node_key_path);
     let node_key_pem = std::fs::read_to_string(node_key_path)
         .with_context(|| format!("read {}", node_key_path.display()))?;
 
@@ -204,4 +255,36 @@ fn pem_to_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader)
         .context("parse private key PEM")?
         .context("no private key in PEM")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn private_keys_are_owner_only() {
+        let base = std::env::temp_dir().join(format!("stouter_pki_{}_{}", std::process::id(), rand::random::<u64>()));
+        let tls = base.join("tls");
+        let tls_s = tls.to_str().unwrap();
+        load_or_create(tls_s, "n1").unwrap();
+        assert_eq!(mode(&tls.join("ca.key")), 0o600);
+
+        // Issuing over an existing, world-readable node.key tightens it.
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("node.key"), "old").unwrap();
+        std::fs::set_permissions(out.join("node.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        issue_cert_to_dir(tls_s, "n2", out.to_str().unwrap()).unwrap();
+        assert_eq!(mode(&out.join("node.key")), 0o600);
+        assert!(std::fs::read_to_string(out.join("node.key")).unwrap().contains("PRIVATE KEY"));
+
+        // The issued material still loads.
+        load_or_create(out.to_str().unwrap(), "n2").unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

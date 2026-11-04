@@ -283,7 +283,8 @@ async fn main() -> Result<()> {
 
             tokio::select! {
                 result = daemon => result?,
-                _ = tokio::signal::ctrl_c() => {
+                signal = shutdown_signal() => {
+                    info!("received {signal}");
                     graceful_drain(state).await;
                 }
             }
@@ -834,6 +835,43 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
+/// SIGTERM, which is what `docker stop`, systemd and Kubernetes send. Returns
+/// the signal's name.
+///
+/// Without a SIGTERM handler the process dies at once on SIGTERM, or, as PID
+/// 1 in a container, ignores it until it is SIGKILLed; either way peers get
+/// no NodeLeave and in-flight connections are cut.
+async fn shutdown_signal() -> &'static str {
+    let interrupt = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("cannot listen for SIGINT: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => "SIGINT",
+        () = terminate => "SIGTERM",
+    }
 }
 
 /// Graceful shutdown: broadcast NodeLeave, stop accepting, drain in-flight.

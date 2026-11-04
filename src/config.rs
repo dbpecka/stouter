@@ -771,9 +771,13 @@ impl Config {
     }
 
     /// Persist configuration as pretty-printed JSON to `path`.
+    ///
+    /// The file is replaced atomically (see [`write_atomic`]), so a crash, a
+    /// kill or a full disk mid-write leaves the previous config in place
+    /// rather than a truncated file the daemon can't start from.
     pub fn save(&self, path: &str) -> Result<()> {
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        write_atomic(std::path::Path::new(path), data.as_bytes())?;
         Ok(())
     }
 
@@ -813,6 +817,82 @@ impl Config {
             _ => self.bind.clone(),
         }
     }
+}
+
+/// Replace the contents of `path` with `data` atomically: write a temporary
+/// file beside it, flush it to disk, then rename it over `path`. Readers and
+/// a restarted daemon see the old contents or the new, never a partial file.
+///
+/// A symlinked `path` is followed, so the link survives and its target is
+/// replaced. The file keeps its permissions and, where allowed, its owner,
+/// so a daemon running as root doesn't take over a config a user edits.
+///
+/// Falls back to writing in place (not atomic, as before) where a rename
+/// can't work: the directory isn't writable, or `path` is itself a mount
+/// point, as with a single-file `docker run -v stouter.json:...` bind mount.
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = target.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    // A rename would replace even a file we may not write to; keep refusing
+    // those, as a plain write would. (Opening without truncating changes
+    // nothing.)
+    if target.exists() {
+        std::fs::OpenOptions::new().write(true).open(&target)?;
+    }
+    // Random, so concurrent writers (and a leftover from a crash) don't clash.
+    let tmp = dir.join(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
+
+    let file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        Ok(file) => file,
+        Err(_) => return std::fs::write(&target, data),
+    };
+    match write_then_rename(file, &tmp, &target, data) {
+        Ok(()) => {
+            // Make the rename itself durable; best effort (not on Windows).
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            match e.kind() {
+                ErrorKind::ResourceBusy | ErrorKind::CrossesDevices | ErrorKind::PermissionDenied => {
+                    std::fs::write(&target, data)
+                }
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+/// The steps of [`write_atomic`] after the temporary file is created.
+fn write_then_rename(
+    mut file: std::fs::File,
+    tmp: &std::path::Path,
+    target: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::metadata(target) {
+        file.set_permissions(meta.permissions())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Only root may give a file to someone else; otherwise it's ours anyway.
+            let _ = std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()));
+        }
+    }
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, target)
 }
 
 /// Retrieve the system hostname via syscall, falling back to `"unknown"` on error.
@@ -1518,5 +1598,39 @@ mod tests {
         assert_eq!(loaded.dynamic_config.service_groups[0].services[0].meta["traefik.scheme"], "h2c");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_through_a_symlink_keeping_mode_and_leaving_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("stouter_save_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        let link = dir.join("stouter.json");
+        Config { node_id: "before".into(), ..Config::default() }.save(real.to_str().unwrap()).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        Config { node_id: "after".into(), ..Config::default() }.save(link.to_str().unwrap()).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link kept");
+        assert_eq!(Config::load(real.to_str().unwrap()).unwrap().node_id, "after");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["real.json", "stouter.json"], "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_creates_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("stouter_new_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        Config { node_id: "n1".into(), ..Config::default() }.save(path.to_str().unwrap()).unwrap();
+        assert_eq!(Config::load(path.to_str().unwrap()).unwrap().node_id, "n1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
