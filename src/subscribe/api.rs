@@ -65,6 +65,10 @@ pub async fn run_api(
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let nodes = state.shared.known_nodes.load();
     let node_count = nodes.len();
+    let now = std::time::Instant::now();
+    // Healthy only if some peer was actually reachable recently: known but
+    // dead nodes don't count.
+    let live_count = nodes.values().filter(|n| crate::state::node_is_live(n, now)).count();
 
     let connected_nodes: Vec<serde_json::Value> = nodes
         .values()
@@ -74,6 +78,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
                 "id": node.id,
                 "addr": node.addr,
                 "relay": node.relay,
+                "live": crate::state::node_is_live(node, now),
                 "tunnel_pool": state.shared.tunnel_pool.count(connect_addr),
                 "reverse_pool": state.shared.reverse_pool.count(&node.id),
             })
@@ -94,7 +99,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
 
-    let healthy = node_count > 0;
+    let healthy = live_count > 0;
     let status = if healthy {
         StatusCode::OK
     } else {
@@ -108,6 +113,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
             "node_id": state.shared.config.node_id,
             "nodes": {
                 "count": node_count,
+                "live": live_count,
                 "peers": connected_nodes,
             },
             "proxies": {
@@ -354,8 +360,9 @@ mod tests {
         assert_eq!(body["proxies"]["services"][0]["name"], "web");
     }
 
-    #[tokio::test]
-    async fn health_check_healthy_with_nodes() {
+    /// `/__health` for a subscriber knowing one peer, last confirmed
+    /// reachable at `last_seen`.
+    async fn health_with_peer(last_seen: Option<std::time::Instant>) -> (StatusCode, serde_json::Value) {
         use crate::config::NodeInfo;
 
         let service_ports: ServicePorts = Arc::new(RwLock::new(HashMap::new()));
@@ -364,13 +371,7 @@ mod tests {
             .update_known_nodes(|nodes| {
                 nodes.insert(
                     "peer1".into(),
-                    NodeInfo {
-                        id: "peer1".into(),
-                        addr: "10.0.0.1:8080".into(),
-                        relay: None,
-                        last_seen: None,
-                        health: Default::default(),
-                    },
+                    NodeInfo { id: "peer1".into(), addr: "10.0.0.1:8080".into(), last_seen, ..Default::default() },
                 );
             })
             .await;
@@ -382,11 +383,27 @@ mod tests {
         let app = Router::new()
             .route("/__health", get(health_check))
             .with_state(state);
+        do_request(app, "GET", "/__health").await
+    }
 
-        let (status, body) = do_request(app, "GET", "/__health").await;
+    #[tokio::test]
+    async fn health_check_healthy_with_nodes() {
+        let (status, body) = health_with_peer(Some(std::time::Instant::now())).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "healthy");
         assert_eq!(body["nodes"]["count"], 1);
+        assert_eq!(body["nodes"]["live"], 1);
         assert_eq!(body["nodes"]["peers"][0]["id"], "peer1");
+        assert_eq!(body["nodes"]["peers"][0]["live"], true);
+    }
+
+    #[tokio::test]
+    async fn health_check_degraded_when_known_nodes_are_unreachable() {
+        let stale = std::time::Instant::now() - crate::state::NODE_STALE_AFTER - std::time::Duration::from_secs(1);
+        let (status, body) = health_with_peer(Some(stale)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["nodes"]["count"], 1);
+        assert_eq!(body["nodes"]["live"], 0);
     }
 }

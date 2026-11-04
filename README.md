@@ -98,7 +98,9 @@ stouter cert issue --node host2 --out /path/to/certs
 
 ### Registering Services
 
-Services are organized into groups. Each service entry maps a name to a local port and optional domain names:
+Services are organized into groups. Each service entry maps a name to a local port and optional domain names. A service is known by its name everywhere (proxies, routes, the REST API), so all instances of a service belong to one group, and a domain can belong to only one service.
+
+`stouter service add|rename|remove` and `stouter route set|clear`, local or `--remote`, refuse a change that would break the config, such as claiming another service's domain, or removing or renaming a service that still has routes (clear them first). A problem the config already had doesn't block unrelated changes.
 
 ```json
 {
@@ -219,10 +221,25 @@ once. Docker's default stop timeout is 10s; pass `-t 30` to `docker stop` (or
 
 ### Gossip Protocol
 
-Every 10 seconds each node connects to all known peers and exchanges a `Sync` message containing its current config version and known node list. On receiving a sync:
+Every 10 seconds each node connects to all known peers (all at once, each
+with a 10s timeout) and exchanges a `Sync` message containing its current
+config version and known node list. On receiving a sync:
 
 - If the peer has a higher config version, the local dynamic config is replaced.
+  Two *different* configs at the same version (changes made at once on two
+  nodes) are settled the same way everywhere, by the `changedBy` node that made
+  each and then by content, so the cluster can't stay split.
 - New peer addresses are merged into the known node set.
+
+**Liveness.** Each node gossips a heartbeat (wall-clock milliseconds) in its
+own entry, advanced every round and relayed by everyone else. A rising
+heartbeat proves a node is alive even to peers that can't reach it, which is
+how subscribers know an `outboundOnly` node is up. A node with no sign of life
+(no direct contact, no rising heartbeat) for 5 minutes is forgotten. A node
+that leaves or is forgotten is remembered for 30 minutes as departed, so a
+peer that still has a stale copy can't gossip it back; it rejoins as soon as it
+gossips a heartbeat newer than the one it left with (i.e. it restarted).
+A daemon never lists itself as a peer.
 
 Message types:
 
@@ -230,7 +247,7 @@ Message types:
 |---|---|
 | `Sync` | Full state exchange (config + known nodes) |
 | `ConfigUpdate` | Notify peers of a new config version |
-| `NodeJoin` / `NodeLeave` | Cluster membership changes |
+| `NodeJoin` / `NodeLeave` | Cluster membership changes (a node may only announce its own) |
 | `TunnelRequest` | Client requesting a tunnel to a named service |
 | `ReverseRegistration` | NAT'd node registering an idle reverse connection |
 | `MuxTunnel` | Upgrade connection to yamux multiplexing |
@@ -253,6 +270,12 @@ When a subscribe proxy needs to reach service `api` on node `host2`:
 4. Send a `TunnelRequest{node_id, service_name, timestamp_ms}`.
 5. Read a status byte: `0x00` = success.
 6. Proxy bytes bidirectionally between the local client and the remote service.
+
+Steps 3–5 must finish within 15s; a node that stops answering counts as a
+failed setup rather than hanging the client. Pooled connections the peer has
+closed are never handed out (and are swept every 5s), and pools to an
+unreachable node are refilled with exponential backoff (1s up to 60s), not in
+a tight loop.
 
 If steps 3–5 fail, the client connection is untouched, so the proxy retries on
 another node (up to 3 distinct nodes). A node whose tunnel setup fails 3 times
@@ -367,7 +390,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay peer at all times.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay peer at all times. A relay only accepts a registration for node X from a certificate for X, so no other node can take X's traffic. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer a known peer.
 
 ### Multiplexing (Yamux)
 
@@ -378,6 +401,8 @@ To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessi
 - A single cluster CA signs all node certificates.
 - All node certs share the fixed SAN `stouter-node`, which allows standard WebPki hostname verification without per-node DNS configuration.
 - Servers require client certificates; clients verify server certificates. Both sides authenticate against the cluster CA.
+- A node's identity is its certificate's CN, which must match its `nodeId`: tunnel, pool and mux connections to a known node check that the server's certificate names that node, a relay accepts reverse registrations for X only from X, and only X may announce X joining or leaving.
+- Certificates are valid from the day they are issued (backdated a day for clock skew): 20 years for a new CA, 10 years for a node certificate, never past the CA's own expiry.
 - Tunnel requests include a millisecond timestamp. The receiving node rejects requests with clock skew greater than ±30 seconds, providing basic replay protection.
 
 ### Shared State

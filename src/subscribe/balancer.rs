@@ -217,7 +217,7 @@ mod tests {
 
     fn backend(id: &str, weight: u32) -> Backend {
         Backend {
-            node: NodeInfo { id: id.into(), addr: String::new(), relay: None, last_seen: None, health: Default::default() },
+            node: NodeInfo { id: id.into(), addr: String::new(), relay: None, last_seen: None, health: Default::default(), ..Default::default() },
             weight,
             max_connections: None,
             request_timeout: None,

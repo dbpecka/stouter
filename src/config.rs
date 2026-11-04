@@ -264,7 +264,7 @@ impl SubscribeFilter {
 }
 
 /// Versioned, gossip-replicated configuration shared across the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicConfig {
     pub version: u64,
@@ -272,16 +272,11 @@ pub struct DynamicConfig {
     /// L7 routing rules for `http` services, in evaluation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<Route>,
-}
-
-impl Default for DynamicConfig {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            service_groups: Vec::new(),
-            routes: Vec::new(),
-        }
-    }
+    /// Node (or CLI host) that made this version. Settles which of two
+    /// different changes made at the same version wins, the same way on
+    /// every node (see [`DynamicConfig::supersedes`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub changed_by: String,
 }
 
 /// Failure modes for in-memory mutations of `DynamicConfig`.
@@ -316,6 +311,125 @@ impl fmt::Display for MutateErr {
 impl std::error::Error for MutateErr {}
 
 impl DynamicConfig {
+    /// Whether this config should replace `current`: it has a higher
+    /// version, or the same version with different content that wins the
+    /// tie-break (higher `changedBy`, then the larger serialized form).
+    ///
+    /// Without the tie-break, two nodes changing the config at once both
+    /// make version N+1, each node keeps whichever arrived first, and the
+    /// cluster stays split until the next change. Comparing `changedBy`
+    /// first also keeps a newer node's config from losing to the copy an
+    /// older node relays without the fields it doesn't know (and without
+    /// `changedBy`).
+    pub fn supersedes(&self, current: &DynamicConfig) -> bool {
+        if self.version != current.version {
+            return self.version > current.version;
+        }
+        if self == current {
+            return false;
+        }
+        let key = |dc: &DynamicConfig| (dc.changed_by.clone(), serde_json::to_vec(dc).unwrap_or_default());
+        key(self) > key(current)
+    }
+
+    /// Every structural problem with this config, as messages. Empty means
+    /// valid. Messages are deterministic, so two configs' lists can be
+    /// compared (see [`new_problem`]).
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems: Vec<String> = Vec::new();
+        let mut report = |problem: String| {
+            if !problems.contains(&problem) {
+                problems.push(problem);
+            }
+        };
+
+        let mut group_names = HashSet::new();
+        // A domain may be shared by instances of one service, but not
+        // claimed by two different services.
+        let mut domain_owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        // Instances of one service share a group: everything else (routes,
+        // proxies, the REST API, httpListen) knows a service by name only.
+        let mut service_group: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+
+        for group in &self.service_groups {
+            if !group_names.insert(group.name.as_str()) {
+                report(format!("duplicate service group name: '{}'", group.name));
+            }
+
+            // The same name on several nodes is one service with several
+            // instances; only the same name twice on one node is a duplicate.
+            let mut instances = HashSet::new();
+            for svc in &group.services {
+                if !instances.insert((svc.node_id.as_str(), svc.name.as_str())) {
+                    report(format!(
+                        "duplicate service '{}' on node '{}' in group '{}'",
+                        svc.name, svc.node_id, group.name
+                    ));
+                }
+                match service_group.insert(svc.name.as_str(), group.name.as_str()) {
+                    Some(other) if other != group.name => report(format!(
+                        "service '{}' is in both group '{other}' and group '{}'; all instances of a service must be in one group",
+                        svc.name, group.name
+                    )),
+                    _ => {}
+                }
+                if let Some(path) = &svc.health_path {
+                    if let Err(e) = validate_health_path(path) {
+                        report(format!("service '{}/{}' on node '{}': {e}", group.name, svc.name, svc.node_id));
+                    }
+                }
+                for domain in &svc.domains {
+                    match domain_owner.insert(domain.as_str(), svc.name.as_str()) {
+                        Some(owner) if owner != svc.name => report(format!(
+                            "domain '{}' is claimed by both '{}' and '{}/{}'",
+                            domain, owner, group.name, svc.name
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut routed: Vec<&str> = self.routes.iter().map(|r| r.service.as_str()).collect();
+        routed.sort();
+        routed.dedup();
+        for service in routed {
+            if let Err(e) = self.validate_route_target(service) {
+                report(e);
+            }
+            let routes: Vec<Route> = self.routes.iter().filter(|r| r.service == service).cloned().collect();
+            if let Err(e) = validate_routes(service, &routes) {
+                report(e);
+            }
+        }
+
+        // Fixed local ports: consistent per service and distinct across
+        // services. (Clashes with a daemon's own listeners depend on its
+        // static config; `Config::validate` checks those.)
+        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+        for name in self.service_names() {
+            match self.local_port_for(name) {
+                Err(e) => report(e),
+                Ok(Some(0)) => report(format!("localPort of '{name}' must not be 0")),
+                Ok(Some(port)) => {
+                    if let Some(other) = port_owner.insert(port, name) {
+                        report(format!("localPort {port} of '{name}' is already used by {other}"));
+                    }
+                }
+                Ok(None) => {}
+            }
+        }
+        problems
+    }
+
+    /// Distinct service names, sorted.
+    fn service_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.service_groups.iter().flat_map(|g| &g.services).map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Insert a service into `group`, or replace it in place when an entry
     /// with the same `(name, node_id)` already exists. Bumps `version` on
     /// success and returns the new version.
@@ -464,8 +578,16 @@ impl DynamicConfig {
     }
 }
 
+/// The first problem `after` has that `before` didn't. Changes are checked
+/// with this: one is refused for what it breaks, not for problems the config
+/// already had (which would otherwise block every unrelated change).
+pub fn new_problem(before: &DynamicConfig, after: &DynamicConfig) -> Option<String> {
+    let existing = before.problems();
+    after.problems().into_iter().find(|p| !existing.contains(p))
+}
+
 /// Identity and address of a known peer node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
     pub id: String,
@@ -473,15 +595,31 @@ pub struct NodeInfo {
     /// If set, this node is behind NAT and reachable only via this relay address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
-    /// Local-only liveness marker: when this node was last confirmed reachable
-    /// (a successful outbound gossip sync, or a reverse-connection
-    /// registration). Never gossiped or persisted — each daemon maintains it
-    /// independently. `None` means not yet confirmed.
+    /// Local-only liveness marker for load balancing: when this node was last
+    /// confirmed reachable (a successful outbound gossip sync or a
+    /// reverse-connection registration; for a node with no address, which
+    /// can't be contacted directly, a rising `heartbeat`). Never gossiped or
+    /// persisted. `None` means not yet confirmed.
     #[serde(skip)]
     pub last_seen: Option<Instant>,
     /// Health of the services this node hosts, as reported by the node itself.
     #[serde(default, skip_serializing_if = "ServiceHealth::is_unset")]
     pub health: ServiceHealth,
+    /// Liveness counter only the node itself advances (wall-clock
+    /// milliseconds, every gossip round), relayed by everyone else. A rising
+    /// value proves the node is alive even to peers that can't reach it. `0`:
+    /// a node too old to send one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub heartbeat: u64,
+    /// Local-only: when we last had any evidence the node is alive (direct
+    /// contact or a rising `heartbeat`). A node silent for long enough is
+    /// forgotten.
+    #[serde(skip)]
+    pub heard_at: Option<Instant>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A node's self-reported health for the services it hosts.
@@ -647,67 +785,12 @@ impl Config {
     /// - service names within a group are unique
     /// - domain names are globally unique across all services
     pub fn validate(&self) -> Result<()> {
-        let mut group_names = HashSet::new();
-        // A domain may be shared by instances of one service, but not
-        // claimed by two different services.
-        let mut domain_owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-
-        for group in &self.dynamic_config.service_groups {
-            if !group_names.insert(group.name.as_str()) {
-                return Err(anyhow!("duplicate service group name: '{}'", group.name));
-            }
-
-            // The same name on several nodes is one service with several
-            // instances; only the same name twice on one node is a duplicate.
-            let mut instances = HashSet::new();
-            for svc in &group.services {
-                if !instances.insert((svc.node_id.as_str(), svc.name.as_str())) {
-                    return Err(anyhow!(
-                        "duplicate service '{}' on node '{}' in group '{}'",
-                        svc.name,
-                        svc.node_id,
-                        group.name
-                    ));
-                }
-                if let Some(path) = &svc.health_path {
-                    validate_health_path(path).map_err(|e| {
-                        anyhow!("service '{}/{}' on node '{}': {e}", group.name, svc.name, svc.node_id)
-                    })?;
-                }
-                for domain in &svc.domains {
-                    match domain_owner.insert(domain.as_str(), svc.name.as_str()) {
-                        Some(owner) if owner != svc.name => {
-                            return Err(anyhow!(
-                                "domain '{}' is claimed by both '{}' and '{}/{}'",
-                                domain,
-                                owner,
-                                group.name,
-                                svc.name
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        if let Some(problem) = self.dynamic_config.problems().into_iter().next() {
+            return Err(anyhow!(problem));
         }
 
-        let mut routed: Vec<&str> = self.dynamic_config.routes.iter().map(|r| r.service.as_str()).collect();
-        routed.sort();
-        routed.dedup();
-        for service in routed {
-            self.dynamic_config.validate_route_target(service).map_err(|e| anyhow!(e))?;
-            let routes: Vec<Route> = self
-                .dynamic_config
-                .routes
-                .iter()
-                .filter(|r| r.service == service)
-                .cloned()
-                .collect();
-            validate_routes(service, &routes).map_err(|e| anyhow!(e))?;
-        }
-
-        // Fixed local ports: consistent per service, distinct across services,
-        // and clear of the daemon's own loopback listeners.
+        // Fixed local ports must stay clear of the daemon's own loopback
+        // listeners.
         let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
         let subscribes = matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe);
         if subscribes {
@@ -724,21 +807,9 @@ impl Config {
                 return Err(anyhow!("`httpListen` is only valid in subscribe or nodeSubscribe mode"));
             }
         }
-        let mut names: Vec<&str> = self
-            .dynamic_config
-            .service_groups
-            .iter()
-            .flat_map(|g| &g.services)
-            .map(|s| s.name.as_str())
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            if let Some(port) = self.dynamic_config.local_port_for(name).map_err(|e| anyhow!(e))? {
-                if port == 0 {
-                    return Err(anyhow!("localPort of '{name}' must not be 0"));
-                }
-                if let Some(other) = port_owner.insert(port, name) {
+        for name in self.dynamic_config.service_names() {
+            if let Ok(Some(port)) = self.dynamic_config.local_port_for(name) {
+                if let Some(other) = port_owner.get(&port) {
                     return Err(anyhow!("localPort {port} of '{name}' is already used by {other}"));
                 }
             }
@@ -1011,6 +1082,7 @@ mod tests {
                 version: 1,
                 routes: vec![],
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
+                ..Default::default()
             },
             ..Config::default()
         }
@@ -1588,6 +1660,7 @@ mod tests {
                         local_port: None,
                     }],
                 }],
+                ..Default::default()
             },
             ..Config::default()
         };
@@ -1632,5 +1705,68 @@ mod tests {
         Config { node_id: "n1".into(), ..Config::default() }.save(path.to_str().unwrap()).unwrap();
         assert_eq!(Config::load(path.to_str().unwrap()).unwrap().node_id, "n1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn equal_versions_resolve_to_the_same_winner_everywhere() {
+        let mut a = DynamicConfig::default();
+        a.upsert_service("g", instance("from-a", "n1", &[]));
+        a.changed_by = "node-a".into();
+        let mut b = DynamicConfig::default();
+        b.upsert_service("g", instance("from-b", "n1", &[]));
+        b.changed_by = "node-b".into();
+        assert_eq!(a.version, b.version);
+        // Exactly one wins, whichever a node holds first.
+        assert!(b.supersedes(&a) && !a.supersedes(&b));
+        assert!(!a.supersedes(&a.clone()), "identical configs never replace each other");
+        // A higher version always wins.
+        let mut older_b = b.clone();
+        older_b.version -= 1;
+        assert!(a.supersedes(&older_b));
+        // The copy an older node relays (no changedBy) never beats the
+        // newer node's original.
+        let stripped = DynamicConfig { changed_by: String::new(), ..b.clone() };
+        assert!(!stripped.supersedes(&b) && b.supersedes(&stripped));
+    }
+
+    #[test]
+    fn a_service_may_not_span_two_groups() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service("web", instance("api", "n1", &[]));
+        dc.upsert_service("ops", instance("api", "n2", &[]));
+        let problems = dc.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("both group 'web' and group 'ops'"), "{problems:?}");
+    }
+
+    #[test]
+    fn changes_are_refused_only_for_problems_they_introduce() {
+        let mut before = DynamicConfig::default();
+        before.upsert_service("g", http_instance("api", "n1", &[]));
+        before.set_routes("api", vec![route(serde_json::json!({"service": "api", "backends": [{}]}))]).unwrap();
+        assert!(before.problems().is_empty());
+
+        // Removing the only instance of a routed service leaves routes behind.
+        let mut after = before.clone();
+        after.remove_service("g", "n1", "api").unwrap();
+        assert!(new_problem(&before, &after).unwrap().contains("unknown service 'api'"));
+
+        // So does making it TCP.
+        let mut after = before.clone();
+        after.upsert_service("g", instance("api", "n1", &[]));
+        assert!(new_problem(&before, &after).unwrap().contains("protocol: http"));
+
+        // Claiming another service's domain.
+        let mut with_domain = before.clone();
+        with_domain.upsert_service("g", instance("web", "n1", &["x.example.com"]));
+        let mut after = with_domain.clone();
+        after.upsert_service("g", instance("other", "n2", &["x.example.com"]));
+        assert!(new_problem(&with_domain, &after).unwrap().contains("x.example.com"));
+
+        // A config that's already broken still accepts unrelated changes.
+        let broken = after.clone();
+        let mut fixed_elsewhere = broken.clone();
+        fixed_elsewhere.upsert_service("g", instance("unrelated", "n3", &[]));
+        assert_eq!(new_problem(&broken, &fixed_elsewhere), None);
     }
 }

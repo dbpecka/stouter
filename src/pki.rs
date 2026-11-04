@@ -9,6 +9,25 @@ use tracing::{info, warn};
 /// verification can be used without per-node cert customisation.
 pub const MESH_SERVER_NAME: &str = "stouter-node";
 
+/// How long a node certificate is valid from the day it is issued (but
+/// never past the CA's own expiry).
+const NODE_CERT_VALIDITY: time::Duration = time::Duration::days(10 * 365);
+
+/// How long a newly generated cluster CA is valid.
+const CA_VALIDITY: time::Duration = time::Duration::days(20 * 365);
+
+/// Certificates start this far in the past, so a peer whose clock runs a
+/// little behind still accepts one issued just now.
+const CLOCK_SKEW_ALLOWANCE: time::Duration = time::Duration::days(1);
+
+/// Validity window for a node certificate signed by `ca`: from now (less
+/// the skew allowance) for [`NODE_CERT_VALIDITY`], ending no later than the
+/// CA does, since a certificate can't outlive the CA that vouches for it.
+fn node_cert_validity(ca: &rcgen::Certificate) -> (time::OffsetDateTime, time::OffsetDateTime) {
+    let now = time::OffsetDateTime::now_utc();
+    (now - CLOCK_SKEW_ALLOWANCE, (now + NODE_CERT_VALIDITY).min(ca.params().not_after))
+}
+
 pub struct PkiMaterial {
     pub ca_cert_der: CertificateDer<'static>,
     pub node_cert_der: CertificateDer<'static>,
@@ -67,8 +86,7 @@ pub fn issue_cert_to_dir(tls_dir: &str, node_id: &str, out_dir: &str) -> Result<
     let mut params = CertificateParams::new(vec![MESH_SERVER_NAME.to_string()])
         .context("node cert params")?;
     params.distinguished_name.push(DnType::CommonName, node_id);
-    params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-    params.not_after  = rcgen::date_time_ymd(2034, 1, 1);
+    (params.not_before, params.not_after) = node_cert_validity(&ca_cert_rcgen);
 
     let cert = params.signed_by(&key, &ca_cert_rcgen, &ca_key)
         .context("sign node cert with CA")?;
@@ -151,8 +169,9 @@ fn generate_ca(
         .context("CA cert params")?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.distinguished_name.push(DnType::CommonName, "stouter-cluster-ca");
-    params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2044, 1, 1);
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - CLOCK_SKEW_ALLOWANCE;
+    params.not_after = now + CA_VALIDITY;
 
     let cert = params.self_signed(&key).context("self-sign CA")?;
     let der = CertificateDer::from(cert.der().to_vec());
@@ -200,8 +219,7 @@ fn generate_node_cert(
     let mut params = CertificateParams::new(vec![MESH_SERVER_NAME.to_string()])
         .context("node cert params")?;
     params.distinguished_name.push(DnType::CommonName, node_id);
-    params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2034, 1, 1);
+    (params.not_before, params.not_after) = node_cert_validity(ca_cert);
 
     let cert = params.signed_by(&key, ca_cert, ca_key)
         .context("sign node cert with CA")?;
@@ -286,5 +304,57 @@ mod tests {
         // The issued material still loads.
         load_or_create(out.to_str().unwrap(), "n2").unwrap();
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod validity_tests {
+    use super::*;
+
+    /// (not_before, not_after) of a PEM or DER certificate.
+    fn validity(der: &[u8]) -> (time::OffsetDateTime, time::OffsetDateTime) {
+        let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
+        (cert.validity().not_before.to_datetime(), cert.validity().not_after.to_datetime())
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("stouter_{tag}_{}_{}", std::process::id(), rand::random::<u64>()))
+    }
+
+    #[test]
+    fn certificates_are_valid_from_their_issue_date() {
+        let dir = temp_dir("validity");
+        let material = load_or_create(dir.to_str().unwrap(), "n1").unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let close = |a: time::OffsetDateTime, b: time::OffsetDateTime| (a - b).abs() < time::Duration::minutes(5);
+
+        let (ca_from, ca_until) = validity(&material.ca_cert_der);
+        assert!(close(ca_from, now - CLOCK_SKEW_ALLOWANCE) && close(ca_until, now + CA_VALIDITY));
+        let (from, until) = validity(&material.node_cert_der);
+        assert!(close(from, now - CLOCK_SKEW_ALLOWANCE) && close(until, now + NODE_CERT_VALIDITY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_certificates_never_outlive_their_ca() {
+        // A CA with one year left.
+        let dir = temp_dir("short_ca");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, "short-ca");
+        let ca_until = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+        params.not_after = ca_until;
+        let ca = params.self_signed(&key).unwrap();
+        std::fs::write(dir.join("ca.crt"), ca.pem()).unwrap();
+        std::fs::write(dir.join("ca.key"), key.serialize_pem()).unwrap();
+
+        let out = dir.join("issued");
+        issue_cert_to_dir(dir.to_str().unwrap(), "n2", out.to_str().unwrap()).unwrap();
+        let pem = std::fs::read_to_string(out.join("node.crt")).unwrap();
+        let (_, until) = validity(pem_to_der(&pem).unwrap().as_ref());
+        assert_eq!(until.unix_timestamp(), ca_until.unix_timestamp());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

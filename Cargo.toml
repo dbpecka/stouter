@@ -37,6 +37,8 @@ http-body-util = "0.1"
 bytes = "1"
 tower-service = "0.3"
 rand = "0.9"
+# Certificate validity dates (rcgen's own dependency, with the clock enabled).
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tower = "0.5"

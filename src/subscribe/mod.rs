@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::gossip;
-use crate::state::SharedState;
+use crate::state::{Backoff, SharedState};
 
 /// Port and metadata for a locally proxied service.
 pub(crate) struct ServiceInfo {
@@ -136,6 +136,11 @@ async fn manage_proxies(
     // Last localPort conflict per service key, likewise reported once.
     let mut port_conflicts: HashMap<String, String> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(2));
+    // Known node ids as of the previous pass, to notice nodes leaving.
+    let mut prev_nodes: HashSet<String> = HashSet::new();
+    // Service keys skipped because their name is taken by another group,
+    // so each conflict is reported once.
+    let mut name_conflicts: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -147,10 +152,31 @@ async fn manage_proxies(
         let dc = state.dynamic_config.read().await.clone();
         let nodes = state.known_nodes.load_full();
 
+        // A node that left may still be draining, and our idle HTTP
+        // keep-alive connections to it look like open tunnels to it: close
+        // them, so its drain doesn't wait out the pool's idle timeout.
+        {
+            let gone: HashSet<&str> =
+                prev_nodes.iter().map(String::as_str).filter(|id| !nodes.contains_key(*id)).collect();
+            if !gone.is_empty() {
+                let index = state.service_index.load();
+                let hosted: HashSet<&str> = index
+                    .keys()
+                    .filter(|(node, _)| gone.contains(node.as_str()))
+                    .map(|(_, svc)| svc.as_str())
+                    .collect();
+                http_proxies.reset_pools(|name| hosted.contains(name));
+            }
+        }
+        prev_nodes = nodes.keys().cloned().collect();
+
         // Build the desired set: "group/service" keys where at least one
         // node is reachable, with what proxy setup and the REST API need.
         let mut desired: HashMap<String, DesiredService> = HashMap::new();
         let mut seen_svc_keys: HashSet<String> = HashSet::new();
+        // Service name -> the first group (in config order) proxying it. A
+        // proxy, the REST API and httpListen know a service by name only.
+        let mut name_owner: HashMap<String, String> = HashMap::new();
         for group in &dc.service_groups {
             for svc in &group.services {
                 // In nodeSubscribe mode, services this node owns are already running
@@ -166,6 +192,21 @@ async fn manage_proxies(
                     }
                 }
                 let key = format!("{}/{}", group.name, svc.name);
+                match name_owner.get(&svc.name) {
+                    Some(owner) if *owner != group.name => {
+                        if name_conflicts.insert(key.clone()) {
+                            tracing::warn!(
+                                "service name '{}' is in groups '{owner}' and '{}'; proxying the one in '{owner}' (first in the config)",
+                                svc.name, group.name
+                            );
+                        }
+                        continue;
+                    }
+                    Some(_) => {}
+                    None => {
+                        name_owner.insert(svc.name.clone(), group.name.clone());
+                    }
+                }
                 if nodes.contains_key(&svc.node_id) && seen_svc_keys.insert(key.clone()) {
                     let local_port = match dc.local_port_for(&svc.name) {
                         Ok(port) => {
@@ -273,45 +314,63 @@ async fn manage_proxies(
     }
 }
 
+/// Connect addresses for every known node (its relay's, if it has one),
+/// without duplicates: several NAT'd nodes can share one relay.
+fn node_connect_addrs(state: &SharedState) -> Vec<String> {
+    let mut addrs: Vec<String> = Vec::new();
+    for node in state.known_nodes.load().values() {
+        let addr = node.relay.as_deref().unwrap_or(&node.addr);
+        if !addr.is_empty() && !addrs.iter().any(|a| a == addr) {
+            addrs.push(addr.to_string());
+        }
+    }
+    addrs
+}
+
 /// Background task that maintains warm TCP connections to known nodes.
 ///
 /// These pre-established connections eliminate TCP handshake latency on
-/// the proxy hot path.
+/// the proxy hot path. An address that can't be reached is retried with
+/// exponential backoff, rather than as fast as the loop spins.
 async fn fill_tunnel_pool(state: Arc<SharedState>) {
     /// Target number of warm connections per node address.
     const POOL_TARGET: usize = 8;
+    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
     while !state.shutdown.is_cancelled() {
-        let addrs: Vec<String> = {
-            let nodes = state.known_nodes.load();
-            nodes
-                .values()
-                .filter_map(|node| {
-                    let addr = node.relay.as_deref().unwrap_or(&node.addr);
-                    if addr.is_empty() || state.tunnel_pool.count(addr) >= POOL_TARGET {
-                        None
-                    } else {
-                        Some(addr.to_string())
-                    }
-                })
-                .collect()
-        };
+        let now = tokio::time::Instant::now();
+        let known = node_connect_addrs(&state);
+        backoff.retain(|addr| known.iter().any(|a| a == addr));
+        let wanted: Vec<String> = known
+            .into_iter()
+            .filter(|addr| state.tunnel_pool.count(addr) < POOL_TARGET && backoff.ready(addr, now))
+            .collect();
 
-        if addrs.is_empty() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        if wanted.is_empty() {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = state.shutdown.cancelled() => break,
+            }
             continue;
         }
 
-        for addr in &addrs {
-            match tokio::net::TcpStream::connect(addr.as_str()).await {
-                Ok(tcp) => {
-                    crate::io::configure_stream(&tcp);
-                    match state.tls_connect(tcp).await {
-                        Ok(stream) => state.tunnel_pool.push(addr.clone(), stream),
-                        Err(e) => tracing::debug!("TLS connect to {addr} failed: {e}"),
-                    }
+        // One new connection per address per round, all at once, so a slow
+        // address doesn't hold up the others.
+        let attempts = wanted.iter().map(|addr| {
+            let state = &state;
+            async move { state.connect_mesh(addr, state.node_at(addr).as_deref()).await }
+        });
+        let results = futures::future::join_all(attempts).await;
+        for (addr, result) in wanted.iter().zip(results) {
+            match result {
+                Ok(stream) => {
+                    backoff.succeeded(addr);
+                    state.tunnel_pool.push(addr.clone(), stream);
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    let wait = backoff.failed(addr, now);
+                    tracing::debug!("warm connection to {addr} failed, retrying in {}s: {e:#}", wait.as_secs());
+                }
             }
         }
 
@@ -321,38 +380,40 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
 
 /// Background task that maintains yamux multiplexed sessions to known nodes.
 ///
-/// Checks every 5 seconds for nodes without an active mux session and
-/// establishes one. Dead sessions are lazily removed by the MuxPool when
-/// `open_stream()` fails.
+/// Checks every 5 seconds for nodes without a live mux session and
+/// establishes one, all addresses at once and with backoff for ones that
+/// keep failing. Ended sessions are dropped by `MuxPool::contains` and the
+/// pool sweeper, so they are replaced within a round.
 async fn maintain_mux_sessions(state: Arc<SharedState>) {
+    let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
     while !state.shutdown.is_cancelled() {
-        let addrs: Vec<String> = {
-            let nodes = state.known_nodes.load();
-            nodes
-                .values()
-                .filter_map(|node| {
-                    let addr = node.relay.as_deref().unwrap_or(&node.addr);
-                    if addr.is_empty() || state.mux_pool.contains(addr) {
-                        None
-                    } else {
-                        Some(addr.to_string())
-                    }
-                })
-                .collect()
-        };
+        let now = tokio::time::Instant::now();
+        let known = node_connect_addrs(&state);
+        backoff.retain(|addr| known.iter().any(|a| a == addr));
+        let wanted: Vec<String> = known
+            .into_iter()
+            .filter(|addr| !state.mux_pool.contains(addr) && backoff.ready(addr, now))
+            .collect();
 
-        for addr in &addrs {
-            match crate::mux::establish_mux_session(addr, &state).await {
+        let attempts = wanted.iter().map(|addr| crate::mux::establish_mux_session(addr, &state));
+        let results = futures::future::join_all(attempts).await;
+        for (addr, result) in wanted.iter().zip(results) {
+            match result {
                 Ok(handle) => {
                     info!("mux session established to {addr}");
+                    backoff.succeeded(addr);
                     state.mux_pool.insert(addr.clone(), handle);
                 }
                 Err(e) => {
-                    tracing::debug!("failed to establish mux to {addr}: {e}");
+                    let wait = backoff.failed(addr, now);
+                    tracing::debug!("failed to establish mux to {addr}, retrying in {}s: {e:#}", wait.as_secs());
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = state.shutdown.cancelled() => break,
+        }
     }
 }

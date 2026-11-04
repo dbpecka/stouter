@@ -25,11 +25,6 @@ const REVERSE_POOL_TIMEOUT: Duration = Duration::from_secs(5);
 /// before giving up. Bounds retry amplification during a hosting outage.
 pub(super) const MAX_TUNNEL_ATTEMPTS: usize = 3;
 
-/// A node not confirmed reachable within this window is treated as unhealthy
-/// and excluded from load balancing. The gossip sync loop probes every peer
-/// every 10s, so this tolerates roughly three missed cycles before ejection.
-const NODE_STALE_AFTER: Duration = Duration::from_secs(30);
-
 /// Run a local TCP proxy for a service, routing across all available nodes.
 ///
 /// Binds on `127.0.0.1:{port}` (a random port when `None`), sends the bound
@@ -233,11 +228,7 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
 /// so per-connection retry can still find a working backend.
 pub(super) fn prefer_healthy(backends: Vec<Backend>, service_name: &str, state: &SharedState) -> Vec<Backend> {
     let now = Instant::now();
-    let live = prefer(backends, |b| {
-        b.node
-            .last_seen
-            .is_some_and(|seen| now.duration_since(seen) <= NODE_STALE_AFTER)
-    });
+    let live = prefer(backends, |b| crate::state::node_is_live(&b.node, now));
     prefer(live, |b| !state.service_unhealthy(&b.node.id, service_name))
 }
 
@@ -345,7 +336,24 @@ impl AsyncWrite for Tunnel {
     }
 }
 
+/// Time allowed to set up a tunnel, from picking a connection to the node's
+/// answer. A node that stopped responding otherwise hangs the client for as
+/// long as TCP takes to give up (many minutes), and is never ejected. Above
+/// the relay's own wait for a reverse connection, so a relayed setup can
+/// report why it failed.
+const TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(super) async fn establish_tunnel(
+    node: &NodeInfo,
+    service_name: String,
+    state: &Arc<SharedState>,
+) -> Result<Tunnel> {
+    tokio::time::timeout(TUNNEL_SETUP_TIMEOUT, establish_tunnel_untimed(node, service_name, state))
+        .await
+        .map_err(|_| anyhow::anyhow!("tunnel setup to node {} timed out", node.id))?
+}
+
+async fn establish_tunnel_untimed(
     node: &NodeInfo,
     service_name: String,
     state: &Arc<SharedState>,
@@ -394,14 +402,7 @@ pub(super) async fn establish_tunnel(
             })?
     } else {
         method = "cold";
-        let tcp = TcpStream::connect(connect_addr)
-            .await
-            .with_context(|| format!("connect to {connect_addr}"))?;
-        tcp.set_nodelay(true).ok();
-        state
-            .tls_connect(tcp)
-            .await
-            .with_context(|| format!("TLS connect to {connect_addr}"))?
+        state.connect_mesh(connect_addr, state.node_at(connect_addr).as_deref()).await?
     };
 
     send_and_check_tunnel(&mut node_stream, &msg).await?;
@@ -441,6 +442,7 @@ mod tests {
                 version: 1,
                 routes: vec![],
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
+                ..Default::default()
             },
             ..Config::default()
         };
@@ -459,6 +461,7 @@ mod tests {
                                 version: 1,
                                 unhealthy: unhealthy.iter().map(|s| s.to_string()).collect(),
                             },
+                            ..Default::default()
                         },
                     );
                 }

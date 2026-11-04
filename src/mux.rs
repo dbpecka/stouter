@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::debug;
@@ -35,6 +34,11 @@ pub struct MuxHandle {
 }
 
 impl MuxHandle {
+    /// Whether the session has ended (its driver task stopped).
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Open a new yamux stream on the underlying session.
     pub async fn open_stream(&self) -> StreamResult {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -88,9 +92,23 @@ impl MuxPool {
         self.sessions.lock().unwrap().insert(addr, handle);
     }
 
-    /// Check if a session exists for `addr`.
+    /// Check if a live session exists for `addr` (an ended one is dropped,
+    /// so it gets re-established instead of waiting for a request to fail).
     pub fn contains(&self, addr: &str) -> bool {
-        self.sessions.lock().unwrap().contains_key(addr)
+        let mut sessions = self.sessions.lock().unwrap();
+        match sessions.get(addr) {
+            Some(handle) if handle.is_closed() => {
+                sessions.remove(addr);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Drop sessions that have ended.
+    pub fn prune(&self) {
+        self.sessions.lock().unwrap().retain(|_, handle| !handle.is_closed());
     }
 
     /// Number of active sessions in the pool.
@@ -235,13 +253,10 @@ pub async fn establish_mux_session(
     addr: &str,
     state: &Arc<SharedState>,
 ) -> Result<MuxHandle> {
-    let tcp = TcpStream::connect(addr)
+    let mut stream = state
+        .connect_mesh(addr, state.node_at(addr).as_deref())
         .await
-        .with_context(|| format!("mux connect to {addr}"))?;
-
-    crate::io::configure_stream(&tcp);
-
-    let mut stream = state.tls_connect(tcp).await.context("mux TLS connect")?;
+        .context("mux connect")?;
 
     gossip::send_message(&mut stream, &Message::MuxTunnel {})
         .await

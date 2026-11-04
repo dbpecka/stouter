@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
 
             let metrics_handle = metrics::install();
             tokio::spawn(metrics::run_gauge_loop(state.clone()));
+            tokio::spawn(state::run_pool_sweeper(state.clone()));
 
             let daemon = async {
                 match cfg.mode {
@@ -442,8 +443,9 @@ async fn main() -> Result<()> {
                     meta,
                     local_port,
                 };
+                let before = cfg.dynamic_config.clone();
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
-                cfg.save(&cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config)?;
 
                 let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
                     let material = pki::load_or_create(dir, &cfg.node_id)?;
@@ -543,11 +545,12 @@ async fn main() -> Result<()> {
                 let mut cfg = Config::load(&cli.config)?;
                 let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
 
+                let before = cfg.dynamic_config.clone();
                 let version = cfg
                     .dynamic_config
                     .rename_service(&group_name, &node_id, &from, &to)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                cfg.save(&cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config)?;
 
                 let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
                     let material = pki::load_or_create(dir, &cfg.node_id)?;
@@ -603,11 +606,12 @@ async fn main() -> Result<()> {
                 let mut cfg = Config::load(&cli.config)?;
                 let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
 
+                let before = cfg.dynamic_config.clone();
                 let version = cfg
                     .dynamic_config
                     .remove_service(&group_name, &node_id, &name)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                cfg.save(&cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config)?;
 
                 let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
                     let material = pki::load_or_create(dir, &cfg.node_id)?;
@@ -655,11 +659,12 @@ async fn main() -> Result<()> {
                 .await?
             } else {
                 let mut cfg = Config::load(&cli.config)?;
+                let before = cfg.dynamic_config.clone();
                 let version = cfg
                     .dynamic_config
                     .set_routes(&service, routes)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                cfg.save(&cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config)?;
                 broadcast_config(&cfg, &cli.config).await?;
                 version
             };
@@ -888,6 +893,7 @@ async fn graceful_drain(state: std::sync::Arc<SharedState>) {
             &state,
             Message::NodeLeave {
                 id: state.config.node_id.clone(),
+                heartbeat: state.next_heartbeat(),
             },
         )
         .await;
@@ -1062,6 +1068,18 @@ fn parse_routes(service: &str, arg: &str) -> Result<Vec<config::Route>> {
     let routes: Vec<config::Route> = serde_json::from_value(raw.into()).context("invalid route")?;
     config::validate_routes(service, &routes).map_err(anyhow::Error::msg)?;
     Ok(routes)
+}
+
+/// Save a change the CLI made to the local config file: refused if it
+/// introduces a config problem (a domain claimed twice, routes left pointing
+/// at a removed service, ...), and stamped with who made it.
+fn save_local_change(cfg: &mut Config, before: &config::DynamicConfig, path: &str) -> Result<()> {
+    if let Some(problem) = config::new_problem(before, &cfg.dynamic_config) {
+        anyhow::bail!("{problem}");
+    }
+    cfg.dynamic_config.changed_by =
+        if cfg.node_id.is_empty() { config::get_hostname() } else { cfg.node_id.clone() };
+    cfg.save(path)
 }
 
 /// Push a locally changed config to the cluster.

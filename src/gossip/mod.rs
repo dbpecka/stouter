@@ -5,12 +5,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::config::NodeInfo;
-use crate::state::SharedState;
+use crate::state::{SharedState, NODE_EXPIRE_AFTER};
 use crate::tls::MeshStream;
 use messages::Message;
 
@@ -184,7 +183,8 @@ async fn handle_gossip_message(mut stream: MeshStream, peer_addr: String, msg: M
             }
         }
         other => {
-            apply_message(&state, other).await;
+            let peer_cn = stream.peer_cn().map(str::to_string);
+            apply_message(&state, other, peer_cn.as_deref()).await;
         }
     }
 }
@@ -235,6 +235,8 @@ async fn handle_admin_request(
     // other writer can see the in-memory state.
     let outcome: Result<(u64, crate::config::DynamicConfig), MutateErr> = {
         let mut dc = state.dynamic_config.write().await;
+        // Mutate a copy, so a refused change leaves nothing behind.
+        let mut next = dc.clone();
         let result = match op {
             AdminOp::ServiceAdd {
                 group,
@@ -265,21 +267,27 @@ async fn handle_admin_request(
                     meta,
                     local_port,
                 };
-                match svc.health_path.as_deref().map(crate::config::validate_health_path) {
-                    Some(Err(msg)) => Err(MutateErr::Invalid(msg)),
-                    _ => Ok(dc.upsert_service(&group, svc)),
-                }
+                Ok(next.upsert_service(&group, svc))
             }
-            AdminOp::RoutesSet { service, routes } => dc.set_routes(&service, routes),
+            AdminOp::RoutesSet { service, routes } => next.set_routes(&service, routes),
             AdminOp::ServiceRename { group, owner_node_id, from, to } => {
-                dc.rename_service(&group, &owner_node_id, &from, &to)
+                next.rename_service(&group, &owner_node_id, &from, &to)
             }
             AdminOp::ServiceRemove { group, owner_node_id, name } => {
-                dc.remove_service(&group, &owner_node_id, &name)
+                next.remove_service(&group, &owner_node_id, &name)
             }
         };
+        // Refuse a change that breaks the config (a domain claimed twice,
+        // routes left pointing at a removed or renamed service, ...), but
+        // not one made while it already had an unrelated problem.
+        let result = result.and_then(|version| match crate::config::new_problem(&dc, &next) {
+            Some(problem) => Err(MutateErr::Invalid(problem)),
+            None => Ok(version),
+        });
         match result {
             Ok(new_version) => {
+                next.changed_by = state.config.node_id.clone();
+                *dc = next;
                 persist_state_with(&state, &dc);
                 Ok((new_version, dc.clone()))
             }
@@ -334,7 +342,7 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
 /// [`Message::ConfigUpdate`] to all peers.
 ///
 /// The file counts as newer when its version is higher, or when it has the
-/// same version as memory but different services (a hand edit that didn't
+/// same version as memory but different services or routes (a hand edit that didn't
 /// bump the version; it is bumped here). A file at a *lower* version is
 /// stale, not an edit: it is what's left when persisting failed (e.g. a
 /// read-only mount), and adopting it would roll back every change made since
@@ -373,7 +381,9 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                     current_version, file_dc.version
                 );
                 file_dc
-            } else if file_dc.version == current_version && file_dc.service_groups != dc.service_groups {
+            } else if file_dc.version == current_version
+                && (file_dc.service_groups != dc.service_groups || file_dc.routes != dc.routes)
+            {
                 info!(
                     "manual config edit detected; auto-bumping version {} -> {}",
                     current_version,
@@ -398,6 +408,8 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             if new_dc.version <= current_version {
                 new_dc.version = current_version + 1;
             }
+            // The change entered the cluster here.
+            new_dc.changed_by = state.config.node_id.clone();
             *dc = new_dc.clone();
             persist_state_with(&state, &dc);
             new_dc
@@ -413,12 +425,17 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
 }
 
 /// Collect all unique peer addresses to contact: bootstrap peers + known member addrs.
+///
+/// Our own addresses are left out (a shared bootstrap list often names every
+/// node, this one included): syncing with ourselves only wastes connections.
 async fn peer_addrs(state: &Arc<SharedState>) -> Vec<String> {
-    let mut addrs: Vec<String> = state.bootstrap_peers.clone();
+    let own = [state.config.peer_addr().to_string(), state.config.bind.clone(), state.config.local_target()];
+    let mut addrs: Vec<String> = Vec::new();
     let members = state.known_nodes.load();
-    for node in members.values() {
-        if !node.addr.is_empty() && !addrs.contains(&node.addr) {
-            addrs.push(node.addr.clone());
+    let candidates = state.bootstrap_peers.iter().chain(members.values().map(|n| &n.addr));
+    for addr in candidates {
+        if !addr.is_empty() && !own.contains(addr) && !addrs.contains(addr) {
+            addrs.push(addr.clone());
         }
     }
     addrs
@@ -434,35 +451,63 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
             _ = state.shutdown.cancelled() => break,
         }
 
+        // All at once: one peer that stopped answering must not delay
+        // (and so make stale) every peer after it.
         let peers = peer_addrs(&state).await;
-
-        for addr in peers {
-            let start = std::time::Instant::now();
-            match time::timeout(Duration::from_secs(10), sync_with_peer(&state, &addr)).await {
-                Ok(Err(e)) => {
-                    metrics::counter!("stouter_gossip_syncs_total", "result" => "error").increment(1);
-                    debug!("sync with {addr} failed: {e}");
-                }
-                Err(_) => {
-                    metrics::counter!("stouter_gossip_syncs_total", "result" => "timeout").increment(1);
-                    debug!("sync with {addr} timed out");
-                }
-                Ok(Ok(())) => {
-                    metrics::counter!("stouter_gossip_syncs_total", "result" => "ok").increment(1);
-                    metrics::histogram!("stouter_gossip_sync_duration_seconds")
-                        .record(start.elapsed().as_secs_f64());
+        futures::future::join_all(peers.iter().map(|addr| {
+            let state = &state;
+            async move {
+                let start = std::time::Instant::now();
+                match time::timeout(Duration::from_secs(10), sync_with_peer(state, addr)).await {
+                    Ok(Err(e)) => {
+                        metrics::counter!("stouter_gossip_syncs_total", "result" => "error").increment(1);
+                        debug!("sync with {addr} failed: {e}");
+                    }
+                    Err(_) => {
+                        metrics::counter!("stouter_gossip_syncs_total", "result" => "timeout").increment(1);
+                        debug!("sync with {addr} timed out");
+                    }
+                    Ok(Ok(())) => {
+                        metrics::counter!("stouter_gossip_syncs_total", "result" => "ok").increment(1);
+                        metrics::histogram!("stouter_gossip_sync_duration_seconds")
+                            .record(start.elapsed().as_secs_f64());
+                    }
                 }
             }
-        }
+        }))
+        .await;
+
+        expire_silent_nodes(&state).await;
     }
 }
 
+/// Forget nodes with no sign of life for [`NODE_EXPIRE_AFTER`]: no direct
+/// contact and no rising heartbeat. They are buried so a stale copy still
+/// circulating in gossip doesn't bring them back.
+///
+/// A node that has never sent a heartbeat (an older version) and has no
+/// address is kept: there is no way to tell whether it is alive.
+async fn expire_silent_nodes(state: &Arc<SharedState>) {
+    let now = Instant::now();
+    state
+        .update_known_nodes(|kn| {
+            kn.retain(|id, node| {
+                let silent = node.heard_at.is_none_or(|t| now.duration_since(t) > NODE_EXPIRE_AFTER);
+                let can_tell = node.heartbeat > 0 || !node.addr.is_empty();
+                if silent && can_tell {
+                    info!("forgetting node {id}: no sign of life for {}s", NODE_EXPIRE_AFTER.as_secs());
+                    state.bury(id, node.heartbeat);
+                    false
+                } else {
+                    true
+                }
+            })
+        })
+        .await;
+}
+
 async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
-    let tcp = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("connect to {addr}"))?;
-    tcp.set_nodelay(true).ok();
-    let mut stream = state.tls_connect(tcp).await?;
+    let mut stream = state.connect_mesh(addr, None).await?;
 
     let our_sync = build_sync_msg(state).await;
     send_message(&mut stream, &our_sync).await?;
@@ -477,11 +522,12 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replace `0.0.0.0` addresses in `nodes` with the actual peer address we
-/// connected to, preserving the port from the original address.
+/// Replace wildcard addresses (`0.0.0.0`, `[::]`) in `nodes` with the actual
+/// peer address we connected to, preserving the port from the original address.
 fn fix_unroutable_addrs(nodes: &mut [NodeInfo], connected_addr: &str) {
     for node in nodes.iter_mut() {
-        if let Some(port) = node.addr.strip_prefix("0.0.0.0:") {
+        let port = node.addr.strip_prefix("0.0.0.0:").or_else(|| node.addr.strip_prefix("[::]:"));
+        if let Some(port) = port {
             if let Some(host) = connected_addr.rsplit_once(':').map(|(h, _)| h) {
                 let new_addr = format!("{host}:{port}");
                 debug!(
@@ -506,27 +552,21 @@ pub(crate) async fn broadcast_sync(state: &Arc<SharedState>) {
 
 pub async fn broadcast_message(state: &Arc<SharedState>, msg: Message) {
     let peers = peer_addrs(state).await;
-
-    for addr in peers {
-        match time::timeout(
-            Duration::from_secs(5),
-            send_to_peer(&addr, &msg, state),
-        )
-        .await
-        {
+    // All at once, so one unreachable peer doesn't hold up the rest (or an
+    // admin RPC waiting on this).
+    let msg = &msg;
+    futures::future::join_all(peers.iter().map(|addr| async move {
+        match time::timeout(Duration::from_secs(5), send_to_peer(addr, msg, state)).await {
             Ok(Err(e)) => debug!("broadcast to {addr} failed: {e}"),
             Err(_) => debug!("broadcast to {addr} timed out"),
             Ok(Ok(())) => {}
         }
-    }
+    }))
+    .await;
 }
 
 async fn send_to_peer(addr: &str, msg: &Message, state: &Arc<SharedState>) -> Result<()> {
-    let tcp = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("connect to {addr}"))?;
-    tcp.set_nodelay(true).ok();
-    let mut stream = state.tls_connect(tcp).await?;
+    let mut stream = state.connect_mesh(addr, None).await?;
     send_message(&mut stream, msg).await
 }
 
@@ -597,11 +637,8 @@ async fn merge_sync(
 ) {
     let updated = {
         let mut dc = state.dynamic_config.write().await;
-        if config.version > dc.version {
-            info!(
-                "dynamic config updated: version {} -> {}",
-                dc.version, config.version
-            );
+        if config.supersedes(&dc) {
+            log_adoption(&dc, &config, "dynamic config updated");
             *dc = config;
             persist_state_with(state, &dc);
             true
@@ -616,6 +653,7 @@ async fn merge_sync(
     }
 
     let own_id = state.config.node_id.as_str();
+    let now = Instant::now();
     let nodes_changed = state.update_known_nodes(|kn| {
         let mut changed = false;
         for mut node in nodes {
@@ -623,10 +661,10 @@ async fn merge_sync(
                 debug!("ignoring node with invalid id: {:?}", node.id);
                 continue;
             }
-            // We are the only authority on our own health; relayed copies of
-            // it are stale by definition.
+            // We know our own state first-hand; a relayed copy of it is
+            // stale by definition, and we are not our own peer.
             if node.id == own_id {
-                node.health = Default::default();
+                continue;
             }
             // Health changes are not `changed`: that flag drives persisting
             // config, and health is runtime-only state.
@@ -648,11 +686,29 @@ async fn merge_sync(
                     existing.relay = node.relay;
                     changed = true;
                 }
+                // A rising heartbeat, however it reached us, means the node
+                // is alive. For a node with no address it's also the only
+                // liveness signal there is: it can't be contacted directly.
+                if node.heartbeat > existing.heartbeat {
+                    existing.heartbeat = node.heartbeat;
+                    existing.heard_at = Some(now);
+                    if existing.addr.is_empty() {
+                        existing.last_seen = Some(now);
+                    }
+                }
             } else {
+                // A node that left or was forgotten comes back only with a
+                // heartbeat newer than the one it departed with.
+                if state.is_buried(&node.id, node.heartbeat) {
+                    debug!("ignoring stale gossip about departed node {}", node.id);
+                    continue;
+                }
+                state.unbury(&node.id);
                 info!("discovered new node: {} @ {}", node.id, node.addr);
                 // Give a freshly discovered node an initial liveness grace
                 // period; the sync loop will confirm or expire it shortly.
-                node.last_seen = Some(Instant::now());
+                node.last_seen = Some(now);
+                node.heard_at = Some(now);
                 kn.insert(node.id.clone(), node);
                 changed = true;
             }
@@ -661,7 +717,8 @@ async fn merge_sync(
         if let Some(addr) = contact_addr {
             for node in kn.values_mut() {
                 if !node.addr.is_empty() && node.addr == addr {
-                    node.last_seen = Some(Instant::now());
+                    node.last_seen = Some(now);
+                    node.heard_at = Some(now);
                 }
             }
         }
@@ -670,6 +727,18 @@ async fn merge_sync(
 
     if nodes_changed {
         persist_state(state).await;
+    }
+}
+
+/// Log that `incoming` is replacing `current`.
+fn log_adoption(current: &crate::config::DynamicConfig, incoming: &crate::config::DynamicConfig, what: &str) {
+    if incoming.version == current.version {
+        warn!(
+            "{what}: two different configs at version {}; keeping the one from '{}' over '{}' (the same choice on every node)",
+            incoming.version, incoming.changed_by, current.changed_by
+        );
+    } else {
+        info!("{what}: version {} -> {}", current.version, incoming.version);
     }
 }
 
@@ -688,17 +757,15 @@ fn merge_health(existing: Option<&mut NodeInfo>, incoming: &NodeInfo) {
     existing.health = incoming.health.clone();
 }
 
-/// Apply a non-Sync gossip message to local state.
-async fn apply_message(state: &Arc<SharedState>, msg: Message) {
+/// Apply a non-Sync gossip message to local state. `peer_cn` names the
+/// sender's certificate: a node may only announce its own join or leave.
+async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&str>) {
     match msg {
         Message::ConfigUpdate { config } => {
             let updated = {
                 let mut dc = state.dynamic_config.write().await;
-                if config.version > dc.version {
-                    info!(
-                        "config update received: version {} -> {}",
-                        dc.version, config.version
-                    );
+                if config.supersedes(&dc) {
+                    log_adoption(&dc, &config, "config update received");
                     *dc = config;
                     persist_state_with(state, &dc);
                     true
@@ -712,10 +779,15 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
             }
         }
         Message::NodeJoin { id, addr } => {
-            if !is_valid_node_id(&id) {
+            if !is_valid_node_id(&id) || id == state.config.node_id {
                 debug!("ignoring NodeJoin with invalid id: {:?}", id);
                 return;
             }
+            if peer_cn != Some(id.as_str()) {
+                warn!("ignoring NodeJoin for {id} sent by {}", peer_cn.unwrap_or("an unnamed peer"));
+                return;
+            }
+            state.unbury(&id);
             let changed = state.update_known_nodes(|kn| {
                 if let Some(existing) = kn.get_mut(&id) {
                     if existing.addr != addr {
@@ -727,15 +799,10 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
                     }
                 } else {
                     info!("node joined: {id} @ {addr}");
+                    let now = Instant::now();
                     kn.insert(
                         id.clone(),
-                        NodeInfo {
-                            id,
-                            addr,
-                            relay: None,
-                            last_seen: Some(Instant::now()),
-                            health: Default::default(),
-                        },
+                        NodeInfo { id, addr, last_seen: Some(now), heard_at: Some(now), ..Default::default() },
                     );
                     true
                 }
@@ -744,11 +811,19 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message) {
                 persist_state(state).await;
             }
         }
-        Message::NodeLeave { id } => {
+        Message::NodeLeave { id, heartbeat } => {
+            if peer_cn != Some(id.as_str()) {
+                warn!("ignoring NodeLeave for {id} sent by {}", peer_cn.unwrap_or("an unnamed peer"));
+                return;
+            }
             state.update_known_nodes(|kn| {
-                if kn.remove(&id).is_some() {
+                let last = kn.remove(&id).map(|n| n.heartbeat);
+                if last.is_some() {
                     info!("node left: {id}");
                 }
+                // Bury it so gossip still carrying it doesn't re-add it; a
+                // restart sends a newer heartbeat and is let back in.
+                state.bury(&id, heartbeat.max(last.unwrap_or(0)));
             }).await;
         }
         Message::Sync { config, nodes } => {
@@ -798,18 +873,15 @@ fn snapshot_nodes(state: &SharedState) -> Vec<NodeInfo> {
         };
 
         let health = (**state.local_health.load()).clone();
-        if let Some(existing) = nodes.iter_mut().find(|n| n.id == state.config.node_id) {
-            existing.addr = self_addr;
-            existing.health = health;
-        } else {
-            nodes.push(NodeInfo {
-                id: state.config.node_id.clone(),
-                addr: self_addr,
-                relay: None,
-                last_seen: None,
-                health,
-            });
-        }
+        let heartbeat = state.next_heartbeat();
+        nodes.retain(|n| n.id != state.config.node_id);
+        nodes.push(NodeInfo {
+            id: state.config.node_id.clone(),
+            addr: self_addr,
+            health,
+            heartbeat,
+            ..Default::default()
+        });
     }
 
     nodes
@@ -831,6 +903,7 @@ mod tests {
                 version,
                 unhealthy: unhealthy.iter().map(|s| s.to_string()).collect(),
             },
+            ..Default::default()
         }
     }
 
@@ -865,7 +938,7 @@ mod tests {
 
         let kn = state.known_nodes.load();
         assert_eq!(kn["a"].health.unhealthy, ["api"]);
-        assert!(kn["me"].health.is_unset());
+        assert!(!kn.contains_key("me"), "a daemon is not its own peer");
         assert!(!state.service_unhealthy("me", "x"));
     }
 
@@ -888,6 +961,7 @@ mod tests {
             version: 0,
             service_groups: vec![crate::config::ServiceGroup { name: "g".into(), services }],
             routes: vec![],
+            ..Default::default()
         }
     }
 
@@ -945,5 +1019,190 @@ mod tests {
         let memory = DynamicConfig { version: 5, ..named_services(&["old"]) };
         let (memory, _) = poll_once(file, memory).await;
         assert_eq!((memory.version, service_names(&memory)), (9, vec!["cli-added".into()]));
+    }
+
+    fn natd(id: &str, heartbeat: u64) -> NodeInfo {
+        NodeInfo { id: id.into(), relay: Some("relay:1".into()), heartbeat, ..Default::default() }
+    }
+
+    fn state_for(id: &str) -> Arc<SharedState> {
+        SharedState::new(Config { node_id: id.into(), ..Config::default() }, String::new(), CancellationToken::new(), None)
+    }
+
+    /// Set `id`'s liveness markers `ago` into the past.
+    async fn age(state: &SharedState, id: &str, ago: Duration) {
+        let then = Instant::now() - ago;
+        state
+            .update_known_nodes(|kn| {
+                let n = kn.get_mut(id).unwrap();
+                n.last_seen = Some(then);
+                n.heard_at = Some(then);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_rising_heartbeat_keeps_a_natd_node_live() {
+        let state = state_for("sub");
+        let dc = DynamicConfig::default();
+        merge_sync(&state, dc.clone(), vec![natd("natd", 100)], Some("relay:1")).await;
+        age(&state, "natd", Duration::from_secs(31)).await;
+
+        // The same heartbeat relayed again is no sign of life.
+        merge_sync(&state, dc.clone(), vec![natd("natd", 100)], Some("relay:1")).await;
+        assert!(!crate::state::node_is_live(&state.known_nodes.load()["natd"], Instant::now()));
+
+        merge_sync(&state, dc, vec![natd("natd", 101)], Some("relay:1")).await;
+        let node = state.known_nodes.load()["natd"].clone();
+        assert!(crate::state::node_is_live(&node, Instant::now()));
+        assert_eq!(node.heartbeat, 101);
+    }
+
+    #[tokio::test]
+    async fn silent_nodes_are_forgotten_and_stale_gossip_cannot_revive_them() {
+        let state = state_for("sub");
+        let dc = DynamicConfig::default();
+        let direct = NodeInfo { id: "dead".into(), addr: "dead:1".into(), heartbeat: 50, ..Default::default() };
+        merge_sync(&state, dc.clone(), vec![direct.clone(), natd("alive", 7)], None).await;
+        age(&state, "dead", NODE_EXPIRE_AFTER + Duration::from_secs(1)).await;
+        expire_silent_nodes(&state).await;
+        let kn = state.known_nodes.load();
+        assert!(!kn.contains_key("dead"));
+        assert!(kn.contains_key("alive"), "recently heard from");
+
+        // A peer that hasn't noticed relays its old copy: still gone.
+        merge_sync(&state, dc.clone(), vec![direct.clone()], None).await;
+        assert!(!state.known_nodes.load().contains_key("dead"));
+        // A restarted node gossips a newer heartbeat: welcome back.
+        merge_sync(&state, dc, vec![NodeInfo { heartbeat: 51, ..direct }], None).await;
+        assert!(state.known_nodes.load().contains_key("dead"));
+    }
+
+    #[tokio::test]
+    async fn old_natd_nodes_without_heartbeats_are_kept() {
+        // An older NAT'd node sends no heartbeat and can't be contacted, so
+        // silence proves nothing about it.
+        let state = state_for("sub");
+        merge_sync(&state, DynamicConfig::default(), vec![natd("old", 0)], None).await;
+        age(&state, "old", NODE_EXPIRE_AFTER * 2).await;
+        expire_silent_nodes(&state).await;
+        assert!(state.known_nodes.load().contains_key("old"));
+    }
+
+    #[tokio::test]
+    async fn only_a_node_itself_may_announce_its_join_or_leave() {
+        let state = state_for("sub");
+        let join = |id: &str| Message::NodeJoin { id: id.into(), addr: format!("{id}:1") };
+        apply_message(&state, join("a"), Some("mallory")).await;
+        assert!(!state.known_nodes.load().contains_key("a"), "join for someone else");
+        apply_message(&state, join("a"), Some("a")).await;
+        assert!(state.known_nodes.load().contains_key("a"));
+
+        apply_message(&state, Message::NodeLeave { id: "a".into(), heartbeat: 9 }, Some("mallory")).await;
+        assert!(state.known_nodes.load().contains_key("a"), "leave for someone else");
+        apply_message(&state, Message::NodeLeave { id: "a".into(), heartbeat: 9 }, Some("a")).await;
+        assert!(!state.known_nodes.load().contains_key("a"));
+
+        // Gossip still carrying its pre-leave heartbeat doesn't re-add it.
+        let relayed = NodeInfo { id: "a".into(), addr: "a:1".into(), heartbeat: 9, ..Default::default() };
+        merge_sync(&state, DynamicConfig::default(), vec![relayed], None).await;
+        assert!(!state.known_nodes.load().contains_key("a"));
+    }
+
+    #[test]
+    fn own_heartbeat_strictly_increases_and_skips_self_in_peer_list() {
+        let state = state_for("me");
+        let first = snapshot_nodes(&state).into_iter().find(|n| n.id == "me").unwrap().heartbeat;
+        let second = snapshot_nodes(&state).into_iter().find(|n| n.id == "me").unwrap().heartbeat;
+        assert!(first > 0 && second > first);
+    }
+
+    #[tokio::test]
+    async fn peer_list_leaves_out_our_own_address() {
+        let cfg = Config {
+            node_id: "me".into(),
+            bind: "0.0.0.0:7000".into(),
+            advertise_addr: Some("10.0.0.1:7000".into()),
+            known_nodes: vec!["10.0.0.1:7000".into(), "127.0.0.1:7000".into(), "10.0.0.2:7000".into()],
+            ..Config::default()
+        };
+        let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+        assert_eq!(peer_addrs(&state).await, ["10.0.0.2:7000"]);
+    }
+
+    #[test]
+    fn wildcard_addresses_are_rewritten_to_the_connected_host() {
+        let mut nodes = vec![
+            NodeInfo { id: "a".into(), addr: "0.0.0.0:7000".into(), ..Default::default() },
+            NodeInfo { id: "b".into(), addr: "[::]:7001".into(), ..Default::default() },
+        ];
+        fix_unroutable_addrs(&mut nodes, "[fd00::5]:7000");
+        assert_eq!(nodes[0].addr, "[fd00::5]:7000");
+        assert_eq!(nodes[1].addr, "[fd00::5]:7001");
+    }
+
+    #[tokio::test]
+    async fn concurrent_changes_at_one_version_converge() {
+        let mut a = named_services(&["from-a"]);
+        a.version = 5;
+        a.changed_by = "node-a".into();
+        let b = DynamicConfig { service_groups: named_services(&["from-b"]).service_groups, changed_by: "node-b".into(), ..a.clone() };
+        // Two nodes that got the two changes in opposite orders end up the same.
+        for order in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+            let state = state_for("x");
+            for config in order {
+                apply_message(&state, Message::ConfigUpdate { config }, None).await;
+            }
+            assert_eq!(*state.dynamic_config.read().await, b);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_rpc_refuses_a_change_that_breaks_the_config() {
+        use crate::state::test_support::{mesh_pair, tls_state, tls_state_with};
+        let dir = std::env::temp_dir().join(format!("stouter_admin_{}_{}", std::process::id(), rand::random::<u64>()));
+        let path = dir.join("node.json");
+        let mut dc = DynamicConfig::default();
+        let mut api: crate::config::Service =
+            serde_json::from_value(serde_json::json!({"name": "api", "nodeId": "n1", "nodePort": 1, "protocol": "http"})).unwrap();
+        dc.upsert_service("g", api.clone());
+        dc.set_routes("api", vec![serde_json::from_value(serde_json::json!({"service": "api", "backends": [{}]})).unwrap()]).unwrap();
+        let cfg = Config { node_id: "n1".into(), admin_cns: vec!["admin".into()], dynamic_config: dc, ..Config::default() };
+        std::fs::create_dir_all(&dir).unwrap();
+        cfg.save(path.to_str().unwrap()).unwrap();
+        let node = tls_state_with(&dir, cfg, path.to_str().unwrap().into());
+        let admin = tls_state(&dir, "admin");
+
+        let rpc = |op: messages::AdminOp| {
+            let (node, admin) = (node.clone(), admin.clone());
+            async move {
+                let (mut client, server) = mesh_pair(&admin, &node).await;
+                tokio::spawn(handle_admin_request(server, op, node.clone()));
+                match recv_message(&mut client).await.unwrap() {
+                    Message::AdminResponse { result } => result,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+
+        // Removing the routed service would strand its routes: refused.
+        let remove = messages::AdminOp::ServiceRemove { group: "g".into(), owner_node_id: "n1".into(), name: "api".into() };
+        match rpc(remove).await {
+            messages::AdminResult::Err { code, message } => {
+                assert_eq!(code, messages::AdminErrCode::Validation);
+                assert!(message.contains("unknown service 'api'"), "{message}");
+            }
+            ok => panic!("{ok:?}"),
+        }
+        assert_eq!(node.dynamic_config.read().await.version, 2, "nothing changed");
+
+        // A harmless change goes through and is stamped with this node.
+        api.weight = 3;
+        match rpc(messages::AdminOp::service_add("g".into(), api)).await {
+            messages::AdminResult::Ok { new_version } => assert_eq!(new_version, 3),
+            err => panic!("{err:?}"),
+        }
+        assert_eq!(node.dynamic_config.read().await.changed_by, "n1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

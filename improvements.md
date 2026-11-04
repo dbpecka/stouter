@@ -11,7 +11,15 @@ service mesh. Grouped by area, not prioritized.
   gossip admin RPC, authorized against the `adminCns` certificate allowlist.
 - Graceful shutdown on SIGINT/SIGTERM: `NodeLeave`, then a drain that waits
   only on tunnels and requests in progress (idle pooled connections and mux
-  sessions don't hold it up).
+  sessions don't hold it up, and subscribers close their HTTP keep-alives to a
+  node that left).
+- Gossiped heartbeats for liveness (so NAT'd nodes stay routable), expiry of
+  silent nodes with tombstones against gossip resurrection, and a
+  deterministic tie-break for concurrent changes at one config version.
+- Node identity bound to the certificate CN for tunnels, reverse
+  registrations and join/leave announcements.
+- Timeouts on every connection setup, exponential backoff for reconnects,
+  and pruning of pooled connections the peer has closed.
 - Health-aware load balancing: nodes with stale gossip liveness are skipped, and
   a failed tunnel setup is retried against another node.
 - Passive outlier ejection: a node whose tunnel setup fails repeatedly is

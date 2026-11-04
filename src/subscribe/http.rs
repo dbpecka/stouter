@@ -48,7 +48,9 @@ pub(super) struct HttpProxy {
     service_name: String,
     state: Arc<SharedState>,
     balancer: Arc<Balancer>,
-    client: Client<TunnelConnector, ProxyBody>,
+    /// Swapped for a fresh one (with an empty connection pool) when a node
+    /// hosting the service leaves; see [`HttpProxy::reset_pool`].
+    client: arc_swap::ArcSwap<Client<TunnelConnector, ProxyBody>>,
     retry_budget: RetryBudget,
 }
 
@@ -79,6 +81,16 @@ impl HttpProxies {
     pub fn retain(&self, keep: impl Fn(&str) -> bool) {
         self.map.lock().unwrap().retain(|name, _| keep(name));
     }
+
+    /// Close idle upstream connections of the services `affected` picks
+    /// (see [`HttpProxy::reset_pool`]).
+    pub fn reset_pools(&self, affected: impl Fn(&str) -> bool) {
+        for (name, proxy) in self.map.lock().unwrap().iter() {
+            if affected(name) {
+                proxy.reset_pool();
+            }
+        }
+    }
 }
 
 impl HttpProxy {
@@ -88,17 +100,21 @@ impl HttpProxy {
     }
 
     pub fn new(service_name: String, state: Arc<SharedState>, balancer: Arc<Balancer>) -> Arc<Self> {
-        let connector = TunnelConnector {
-            service_name: service_name.clone(),
-            state: state.clone(),
-        };
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            // The URI authority is a synthetic per-node pool key; the
-            // client's own Host header is forwarded instead.
-            .set_host(false)
-            .build(connector);
+        let client = arc_swap::ArcSwap::from_pointee(build_client(&service_name, &state));
         Arc::new(Self { service_name, state, balancer, client, retry_budget: RetryBudget::new() })
+    }
+
+    /// Close the idle keep-alive connections this proxy holds to its
+    /// service's nodes, by switching to a fresh client with an empty pool.
+    /// Requests in progress finish on their connections, which then close
+    /// rather than return to the old pool.
+    ///
+    /// Used when a node leaves: to that node a pooled keep-alive connection
+    /// is an open tunnel like any other, so it would hold up the node's
+    /// drain until the pool's idle timeout. (The other nodes' connections
+    /// are just reopened on the next request.)
+    pub fn reset_pool(&self) {
+        self.client.store(Arc::new(build_client(&self.service_name, &self.state)));
     }
 
     /// Serve HTTP/1.1 on one accepted client connection. The connection
@@ -350,7 +366,7 @@ impl HttpProxy {
             *upstream.version_mut() = Version::HTTP_11;
             *upstream.headers_mut() = parts.headers.clone();
 
-            let sent = self.client.request(upstream);
+            let sent = self.client.load().request(upstream);
             let result = match backend.request_timeout {
                 Some(limit) => match tokio::time::timeout(limit, sent).await {
                     Ok(r) => r,
@@ -420,6 +436,20 @@ impl HttpProxy {
             (outcome, _) => outcome,
         }
     }
+}
+
+/// A pooled HTTP/1.1 client whose connections are tunnels to `service_name`.
+fn build_client(service_name: &str, state: &Arc<SharedState>) -> Client<TunnelConnector, ProxyBody> {
+    let connector = TunnelConnector {
+        service_name: service_name.to_string(),
+        state: state.clone(),
+    };
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // The URI authority is a synthetic per-node pool key; the
+        // client's own Host header is forwarded instead.
+        .set_host(false)
+        .build(connector)
 }
 
 /// Serve HTTP/1.1 (with upgrades) on an accepted client connection until it
@@ -1048,6 +1078,14 @@ mod tests {
         assert!(!Arc::ptr_eq(&a, &proxies.get("web")));
         proxies.retain(|name| name == "web");
         assert!(!Arc::ptr_eq(&a, &proxies.get("api")), "a dropped service gets a fresh proxy");
+
+        // Resetting a service's pool swaps in a fresh client (empty pool)
+        // for that service only.
+        let (api, web) = (proxies.get("api"), proxies.get("web"));
+        let (api_client, web_client) = (api.client.load_full(), web.client.load_full());
+        proxies.reset_pools(|name| name == "api");
+        assert!(!Arc::ptr_eq(&api_client, &api.client.load_full()));
+        assert!(Arc::ptr_eq(&web_client, &web.client.load_full()));
     }
 
     #[test]

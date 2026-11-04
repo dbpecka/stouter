@@ -1,24 +1,28 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use tokio::net::TcpStream;
 use tokio::time;
-use tracing::debug;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 use crate::gossip;
 use crate::gossip::messages::Message;
-use crate::state::SharedState;
+use crate::state::{Backoff, SharedState};
 
 /// Background task for NAT'd nodes: maintains a pool of idle reverse
 /// connections to all known reachable peers.
 ///
 /// Spawns `pool_size` persistent worker tasks per peer. Each worker loops:
 /// open connection → wait for tunnel dispatch → handle tunnel → reconnect.
+/// A peer's workers stop when it is no longer a known peer (it left, was
+/// forgotten, or moved to another address), so they don't keep dialling a
+/// dead address forever.
 pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
     let pool_size = state.config.pool_size();
-    let mut spawned: HashSet<(String, usize)> = HashSet::new();
+    // Workers per relay address; cancelling the token stops them.
+    let mut relays: HashMap<String, CancellationToken> = HashMap::new();
     let mut interval = time::interval(Duration::from_secs(5));
 
     loop {
@@ -27,7 +31,7 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
             _ = state.shutdown.cancelled() => break,
         }
 
-        let peers: Vec<String> = state
+        let peers: HashSet<String> = state
             .known_nodes
             .load()
             .values()
@@ -35,43 +39,52 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
             .map(|n| n.addr.clone())
             .collect();
 
-        for peer_addr in &peers {
-            for slot in 0..pool_size {
-                let key = (peer_addr.clone(), slot);
-                if spawned.contains(&key) {
-                    continue;
-                }
-                spawned.insert(key);
-
-                let state = state.clone();
-                let addr = peer_addr.clone();
-                tokio::spawn(async move {
-                    reverse_worker(state, addr, slot).await;
-                });
+        relays.retain(|addr, workers| {
+            let keep = peers.contains(addr);
+            if !keep {
+                info!("stopping reverse connections to {addr}: no longer a known peer");
+                workers.cancel();
             }
+            keep
+        });
+
+        for peer_addr in peers {
+            if relays.contains_key(&peer_addr) {
+                continue;
+            }
+            let workers = state.shutdown.child_token();
+            for slot in 0..pool_size {
+                let (state, addr, stop) = (state.clone(), peer_addr.clone(), workers.clone());
+                tokio::spawn(async move { reverse_worker(state, addr, slot, stop).await });
+            }
+            relays.insert(peer_addr, workers);
         }
     }
 }
 
-/// A single reverse connection worker. Loops forever: connect → register →
-/// wait for tunnel dispatch → spawn tunnel handler → immediately reconnect.
+/// A single reverse connection worker. Loops until `stop` (shutdown, or the
+/// relay going away): connect → register → wait for tunnel dispatch → spawn
+/// tunnel handler → immediately reconnect. Failures back off exponentially
+/// (with jitter, so a pool's workers don't retry in lockstep).
 ///
 /// The tunnel handler runs in a separate task so the worker can replenish
 /// the pool without waiting for the in-flight tunnel to complete. This
 /// prevents burst traffic from draining the pool for the duration of every
 /// active connection.
-async fn reverse_worker(state: Arc<SharedState>, relay_addr: String, slot: usize) {
-    // Stops at shutdown, so a draining node takes no new tunnels this way.
-    while !state.shutdown.is_cancelled() {
-        match open_reverse_connection(&state, &relay_addr).await {
+async fn reverse_worker(state: Arc<SharedState>, relay_addr: String, slot: usize, stop: CancellationToken) {
+    let mut backoff = Backoff::new(Duration::from_secs(2), Duration::from_secs(60));
+    while !stop.is_cancelled() {
+        match open_reverse_connection(&state, &relay_addr, &stop).await {
             Ok(()) => {
+                backoff.succeeded(&relay_addr);
                 debug!("reverse connection to {relay_addr} slot {slot} completed (tunnel handled)");
             }
             Err(e) => {
-                debug!("reverse connection to {relay_addr} slot {slot}: {e}");
+                let wait = backoff.failed(&relay_addr, time::Instant::now());
+                debug!("reverse connection to {relay_addr} slot {slot}: {e:#}; retrying in {}s", wait.as_secs());
                 tokio::select! {
-                    _ = time::sleep(Duration::from_secs(2)) => {}
-                    _ = state.shutdown.cancelled() => {}
+                    _ = time::sleep(wait) => {}
+                    _ = stop.cancelled() => {}
                 }
             }
         }
@@ -85,13 +98,8 @@ async fn reverse_worker(state: Arc<SharedState>, relay_addr: String, slot: usize
 /// relay to forward a [`Message::TunnelRequest`]. The tunnel is handled in
 /// a spawned task so the caller can immediately open a replacement connection,
 /// keeping the pool full during bursts.
-async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str) -> Result<()> {
-    let tcp = TcpStream::connect(relay_addr)
-        .await
-        .with_context(|| format!("connect to relay {relay_addr}"))?;
-
-    crate::io::configure_stream(&tcp);
-    let mut stream = state.tls_connect(tcp).await?;
+async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, stop: &CancellationToken) -> Result<()> {
+    let mut stream = state.connect_mesh(relay_addr, state.node_at(relay_addr).as_deref()).await?;
 
     // Send registration.
     let timestamp_ms = SystemTime::now()
@@ -111,7 +119,7 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str) -> 
     // shutdown the connection is simply closed.
     let msg = tokio::select! {
         msg = gossip::recv_message(&mut stream) => msg?,
-        _ = state.shutdown.cancelled() => return Ok(()),
+        _ = stop.cancelled() => return Ok(()),
     };
     match msg {
         Message::TunnelRequest {

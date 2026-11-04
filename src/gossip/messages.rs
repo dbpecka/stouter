@@ -19,8 +19,14 @@ pub enum Message {
     ConfigUpdate { config: DynamicConfig },
     /// Announce that a new node has joined the cluster.
     NodeJoin { id: String, addr: String },
-    /// Announce that a node has left the cluster.
-    NodeLeave { id: String },
+    /// Announce that a node has left the cluster. Only the node itself may
+    /// send it. `heartbeat` is its last one, so gossip still carrying an
+    /// older copy of the node can't re-add it (`0` from older versions).
+    NodeLeave {
+        id: String,
+        #[serde(default)]
+        heartbeat: u64,
+    },
     /// Request to tunnel traffic to a service on a specific node.
     TunnelRequest {
         node_id: String,
@@ -195,6 +201,7 @@ mod tests {
                         local_port: None,
                     }],
                 }],
+                ..Default::default()
             },
         }
     }
@@ -274,9 +281,9 @@ mod tests {
 
     #[test]
     fn node_leave_round_trip() {
-        let msg = Message::NodeLeave { id: "n1".into() };
+        let msg = Message::NodeLeave { id: "n1".into(), heartbeat: 7 };
         match msgpack_round_trip(&msg) {
-            Message::NodeLeave { id } => assert_eq!(id, "n1"),
+            Message::NodeLeave { id, heartbeat } => assert_eq!((id.as_str(), heartbeat), ("n1", 7)),
             _ => panic!("wrong variant"),
         }
     }
@@ -304,6 +311,7 @@ mod tests {
                         local_port: None,
                     }],
                 }],
+                ..Default::default()
             },
         };
         match msgpack_round_trip(&msg) {
@@ -318,7 +326,7 @@ mod tests {
     #[test]
     fn sync_round_trip() {
         let msg = Message::Sync {
-            config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![] },
+            config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![], ..Default::default() },
             nodes: vec![NodeInfo {
                 id: "n1".into(),
                 addr: "10.0.0.1:8080".into(),
@@ -328,6 +336,7 @@ mod tests {
                     version: 9,
                     unhealthy: vec!["api".into()],
                 },
+                ..Default::default()
             }],
         };
         match msgpack_round_trip(&msg) {
@@ -350,6 +359,7 @@ mod tests {
             relay: None,
             last_seen: None,
             health: Default::default(),
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&node).unwrap().contains("health"));
         // A node that recovered still reports, so peers clear the old entry.
@@ -404,7 +414,7 @@ mod tests {
             mode: "node".into(),
             node_id: "host1".into(),
             bind: "0.0.0.0:8080".into(),
-            dynamic_config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![] },
+            dynamic_config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![], ..Default::default() },
             known_nodes: vec![],
         };
         match msgpack_round_trip(&msg) {
