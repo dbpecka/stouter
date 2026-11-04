@@ -15,6 +15,9 @@ service mesh. Grouped by area, not prioritized.
   temporarily removed from rotation, with exponential backoff.
 - Weighted traffic splitting at the connection level (`weight` on a service;
   `0` drains a node) via smooth weighted round-robin.
+- Fixed local proxy ports (`localPort`), and a shared HTTP listener
+  (`httpListen`) that routes by URL host / `Host` header, so callers can use
+  `HTTP_PROXY` instead of discovering per-service ports.
 - Circuit breaking: per-instance `maxConnections`, enforced by each
   subscriber as a hard cap (excess connections are rejected, not queued).
 - Active TCP health checks: each node probes its own services' `nodePort` and

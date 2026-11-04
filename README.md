@@ -419,3 +419,39 @@ To use a fixed address instead, give the service a `localPort` (CLI:
 - If the port is taken by another process, the subscriber logs one warning and
   keeps retrying. Until the bind succeeds, the service isn't proxied and is
   missing from `/services`.
+
+#### One address for every HTTP service (`httpListen`)
+
+For `http` services, a subscriber can also run a single listener that routes
+each request by its hostname, so callers need no ports at all:
+
+```json
+{ "mode": "nodeSubscribe", "httpListen": "127.0.0.1:15001", ... }
+```
+
+```bash
+export http_proxy=http://127.0.0.1:15001 HTTP_PROXY=http://127.0.0.1:15001
+curl http://inventory/items/42          # → service "inventory"
+curl http://stock.example.com/items/42  # → the service whose domains include it
+```
+
+- The target is the URL's host (sent in full when a client uses a proxy) or,
+  failing that, the `Host` header. A service name matches first, then any
+  service's `domains`, case-insensitively. Clients that ignore proxy settings
+  can call `http://127.0.0.1:15001/...` with `Host: inventory`.
+- Set both `http_proxy` and `HTTP_PROXY`: curl reads only the lowercase one,
+  and many other clients read the uppercase one.
+- These variables affect **every** HTTP call the process makes. List hosts
+  outside the mesh in `no_proxy`/`NO_PROXY`. Stouter answers an unknown host
+  with `404 unknown_service` rather than forwarding it to the internet.
+- HTTPS through the proxy (`CONNECT`) gets `501 connect_not_supported`, and
+  a `tcp` service gets `501 service_not_http`. Use those services' own (or
+  fixed `localPort`) addresses. Rejections are counted in
+  `stouter_http_listener_rejected_total{reason}`.
+- Requests use the same per-service proxy as the service's local port: one
+  balancer, so `maxConnections`, ejection, routes, retries and tracing apply
+  across both. Services on the same node (in `nodeSubscribe`) are reachable
+  too, and `subscribeFilter` applies.
+- Only valid in subscribe modes. Keep it on loopback; stouter warns at
+  startup if not, since anything that can reach it can call every `http`
+  service in the mesh.

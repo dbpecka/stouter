@@ -35,7 +35,7 @@ use crate::config::{labels_match, Route};
 use crate::telemetry::{Attributes, SpanEvent, SpanKind, SpanRecord};
 use crate::state::SharedState;
 
-type ProxyBody = BoxBody<Bytes, hyper::Error>;
+pub(super) type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// How long an idle pooled upstream connection is kept.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,7 +116,7 @@ impl HttpProxy {
         }
     }
 
-    async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
+    pub(super) async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
         let start = Instant::now();
         let start_wall = SystemTime::now();
         let method = req.method().clone();
@@ -562,7 +562,7 @@ enum Outcome {
     Error(StatusCode, &'static str),
 }
 
-fn error_response(status: StatusCode, reason: &'static str) -> Response<ProxyBody> {
+pub(super) fn error_response(status: StatusCode, reason: &'static str) -> Response<ProxyBody> {
     let mut resp = Response::new(
         Full::new(Bytes::from(format!("{reason}\n")))
             .map_err(|never| match never {})
@@ -996,6 +996,26 @@ mod tests {
         let tc = TraceContext { flags: "03".into(), ..unsampled.clone() };
         assert!(tc.is_sampled());
         assert!(!unsampled.child().is_sampled());
+    }
+
+    #[test]
+    fn registry_shares_one_proxy_and_balancer_per_service() {
+        let state = SharedState::new(
+            crate::config::Config::default(),
+            String::new(),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // The hyper client needs a runtime context to be built.
+        let _guard = rt.enter();
+        let proxies = HttpProxies::new(state);
+        let (a, b) = (proxies.get("api"), proxies.get("api"));
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a.balancer(), &b.balancer()));
+        assert!(!Arc::ptr_eq(&a, &proxies.get("web")));
+        proxies.retain(|name| name == "web");
+        assert!(!Arc::ptr_eq(&a, &proxies.get("api")), "a dropped service gets a fresh proxy");
     }
 
     #[test]

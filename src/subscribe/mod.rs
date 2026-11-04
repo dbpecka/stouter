@@ -1,6 +1,7 @@
 mod api;
 mod balancer;
 mod http;
+mod listener;
 mod proxy;
 
 use std::collections::{HashMap, HashSet};
@@ -67,6 +68,14 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
 
     let http_proxies = http::HttpProxies::new(state.clone());
     tokio::spawn(manage_proxies(state.clone(), service_ports, http_proxies.clone()));
+    if let Some(addr) = state.config.http_listen.clone() {
+        let (state, proxies) = (state.clone(), http_proxies.clone());
+        tokio::spawn(async move {
+            if let Err(e) = listener::run_http_listener(addr, state, proxies).await {
+                tracing::error!("HTTP listener exited: {e:#}");
+            }
+        });
+    }
     tokio::spawn(fill_tunnel_pool(state.clone()));
     tokio::spawn(maintain_mux_sessions(state.clone()));
 
