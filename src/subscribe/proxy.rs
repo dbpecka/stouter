@@ -415,6 +415,7 @@ mod tests {
                 request_timeout_ms: None,
                 health_path: None,
                 labels: Default::default(),
+                meta: Default::default(),
             })
             .collect();
         let cfg = Config {

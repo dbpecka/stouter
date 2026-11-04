@@ -135,6 +135,19 @@ rather than queued, and counted in
 each subscriber independently, so an instance's total load can reach
 `maxConnections` × the number of subscribers.
 
+An optional `meta` map carries key/value metadata for integrations. Stouter
+keeps it through gossip and config rewrites and serves it from the subscribe
+REST API, but doesn't interpret it. For example, the
+[Traefik plugin](https://github.com/dbpecka/traefik-plugin-stouter) reads
+`traefik.scheme` to pick the backend scheme, such as `h2c` for gRPC:
+
+```json
+{ "name": "wp-grpc", "nodeId": "min1", "nodePort": 9000,
+  "domains": ["wp-grpc.pecka.cloud"], "meta": { "traefik.scheme": "h2c" } }
+```
+
+CLI: `stouter service add ... --meta traefik.scheme=h2c` (repeatable).
+
 Subscribe nodes can filter which service groups they proxy:
 
 ```json
@@ -377,6 +390,9 @@ Subscribe-mode nodes expose a REST API on port `5381` by default (override with 
 
 ```
 GET /services          → list all proxied services and their local ports
+GET /services/{name}   → one service
 ```
+
+Each entry has `name`, `port`, `address`, `domains` and `meta`.
 
 This lets local processes discover which `127.0.0.1` port to connect to for each service name without static configuration.

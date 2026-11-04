@@ -115,8 +115,12 @@ enum ServiceAction {
         health_path: Option<String>,
         /// Label for routes to select this instance by, as `key=value`.
         /// Repeatable.
-        #[arg(long = "label", value_parser = parse_label)]
+        #[arg(long = "label", value_parser = parse_key_value)]
         labels: Vec<(String, String)>,
+        /// Metadata for integrations as `key=value`, e.g.
+        /// `--meta traefik.scheme=h2c` for the Traefik plugin. Repeatable.
+        #[arg(long = "meta", value_parser = parse_key_value)]
+        meta: Vec<(String, String)>,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -375,6 +379,7 @@ async fn main() -> Result<()> {
                     request_timeout_ms,
                     health_path,
                     labels,
+                    meta,
                     node,
                     remote,
                 },
@@ -383,6 +388,7 @@ async fn main() -> Result<()> {
                 config::validate_health_path(path).map_err(anyhow::Error::msg)?;
             }
             let labels: std::collections::BTreeMap<String, String> = labels.into_iter().collect();
+            let meta: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
             if let Some(target) = remote {
                 let cfg = Config::load(&cli.config).unwrap_or_default();
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
@@ -400,6 +406,7 @@ async fn main() -> Result<()> {
                         request_timeout_ms,
                         health_path,
                         labels,
+                        meta,
                     },
                     &cfg,
                     cli.cert_dir.as_deref(),
@@ -423,6 +430,7 @@ async fn main() -> Result<()> {
                     request_timeout_ms,
                     health_path,
                     labels,
+                    meta,
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -709,7 +717,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains, weight, max_connections, protocol, request_timeout_ms, health_path, labels) = src_dc
+            let (port, domains, weight, max_connections, protocol, request_timeout_ms, health_path, labels, meta) = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -728,6 +736,7 @@ async fn main() -> Result<()> {
                         s.request_timeout_ms,
                         s.health_path.clone(),
                         s.labels.clone(),
+                        s.meta.clone(),
                     )
                 })
                 .ok_or_else(|| {
@@ -755,6 +764,7 @@ async fn main() -> Result<()> {
                     request_timeout_ms,
                     health_path,
                     labels,
+                    meta,
                 },
                 &cfg,
                 to_certs,
@@ -1003,11 +1013,11 @@ fn print_status(
     }
 }
 
-/// Parse a `key=value` label argument.
-fn parse_label(arg: &str) -> std::result::Result<(String, String), String> {
+/// Parse a `key=value` argument (`--label`, `--meta`).
+fn parse_key_value(arg: &str) -> std::result::Result<(String, String), String> {
     match arg.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
-        _ => Err(format!("label '{arg}' must look like key=value")),
+        _ => Err(format!("'{arg}' must look like key=value")),
     }
 }
 
@@ -1054,10 +1064,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_label_requires_key() {
-        assert_eq!(parse_label("version=v2").unwrap(), ("version".into(), "v2".into()));
-        assert_eq!(parse_label("empty=").unwrap(), ("empty".into(), String::new()));
-        assert!(parse_label("=v2").is_err());
-        assert!(parse_label("novalue").is_err());
+    fn parse_key_value_requires_key() {
+        assert_eq!(parse_key_value("version=v2").unwrap(), ("version".into(), "v2".into()));
+        assert_eq!(parse_key_value("traefik.scheme=h2c").unwrap(), ("traefik.scheme".into(), "h2c".into()));
+        assert_eq!(parse_key_value("a=b=c").unwrap(), ("a".into(), "b=c".into()));
+        assert_eq!(parse_key_value("empty=").unwrap(), ("empty".into(), String::new()));
+        assert!(parse_key_value("=v2").is_err());
+        assert!(parse_key_value("novalue").is_err());
     }
 }

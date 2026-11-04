@@ -235,6 +235,7 @@ async fn handle_admin_request(
                 request_timeout_ms,
                 health_path,
                 labels,
+                meta,
             } => {
                 let svc = Service {
                     name,
@@ -247,6 +248,7 @@ async fn handle_admin_request(
                     request_timeout_ms,
                     health_path,
                     labels,
+                    meta,
                 };
                 match svc.health_path.as_deref().map(crate::config::validate_health_path) {
                     Some(Err(msg)) => Err(MutateErr::Invalid(msg)),

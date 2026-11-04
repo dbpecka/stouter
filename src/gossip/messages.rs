@@ -71,6 +71,8 @@ pub enum AdminOp {
         health_path: Option<String>,
         #[serde(default)]
         labels: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        meta: std::collections::BTreeMap<String, String>,
     },
     /// Replace every route for `service` (an empty list clears them).
     RoutesSet {
@@ -166,6 +168,7 @@ mod tests {
                         request_timeout_ms: None,
                         health_path: None,
                         labels: Default::default(),
+                        meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
                     }],
                 }],
             },
@@ -179,6 +182,7 @@ mod tests {
                 let svc = &config.service_groups[0].services[0];
                 assert!(svc.domains.is_empty());
                 assert_eq!(svc.weight, 4);
+                assert_eq!(svc.meta["traefik.scheme"], "h2c");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -272,6 +276,7 @@ mod tests {
                         request_timeout_ms: None,
                         health_path: None,
                         labels: Default::default(),
+                        meta: Default::default(),
                     }],
                 }],
             },
@@ -407,6 +412,7 @@ mod tests {
                 request_timeout_ms: Some(1500),
                 health_path: Some("/healthz".into()),
                 labels: [("version".to_string(), "v2".to_string())].into(),
+                meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
             },
         };
         match msgpack_round_trip(&msg) {
@@ -424,6 +430,7 @@ mod tests {
                         request_timeout_ms,
                         health_path,
                         labels,
+                        meta,
                     },
             } => {
                 assert_eq!(group, "web");
@@ -437,6 +444,7 @@ mod tests {
                 assert_eq!(request_timeout_ms, Some(1500));
                 assert_eq!(health_path.as_deref(), Some("/healthz"));
                 assert_eq!(labels["version"], "v2");
+                assert_eq!(meta["traefik.scheme"], "h2c");
             }
             other => panic!("wrong variant: {other:?}"),
         }
