@@ -17,7 +17,8 @@ service mesh. Grouped by area, not prioritized.
   silent nodes with tombstones against gossip resurrection, and a
   deterministic tie-break for concurrent changes at one config version.
 - Node identity bound to the certificate CN for tunnels, reverse
-  registrations and join/leave announcements.
+  registrations and join/leave announcements, and signed node records, so
+  no node can redirect, hide or fake another in gossip.
 - Admin-signed configs (`requireSignedConfig`): nodes accept a config change
   only if a certificate in `adminCns` signed it, so no node can rewrite the
   cluster's config; `stouter config push` applies hand edits.

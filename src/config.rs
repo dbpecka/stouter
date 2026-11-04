@@ -646,10 +646,46 @@ pub struct NodeInfo {
     /// forgotten.
     #[serde(skip)]
     pub heard_at: Option<Instant>,
+    /// The node's own signed account of itself, relayed as is. When present
+    /// (and valid), `addr`, `heartbeat`, `health` and `relays` come from it
+    /// and nothing anyone else says about the node can change them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed: Option<SignedNode>,
+    /// Local-only, from the signed record: the relays (node ids) a NAT'd
+    /// node holds reverse connections to, the only ones its tunnels may go
+    /// through.
+    #[serde(skip)]
+    pub relays: Vec<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// What a node says about itself; see [`NodeInfo::signed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRecord {
+    pub id: String,
+    /// Where peers connect to it; empty for an `outboundOnly` node.
+    pub addr: String,
+    /// Orders records: a node's newer record always has a higher one.
+    pub heartbeat: u64,
+    #[serde(default)]
+    pub health: ServiceHealth,
+    /// Node ids of the relays it holds reverse connections to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+}
+
+/// A [`NodeRecord`] signed by its node: the exact JSON text, the node's
+/// certificate (DER, hex) and an ECDSA P-256/SHA-256 signature (DER, hex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedNode {
+    pub record_json: String,
+    pub cert: String,
+    pub signature: String,
 }
 
 /// A node's self-reported health for the services it hosts.

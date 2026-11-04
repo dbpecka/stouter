@@ -235,15 +235,27 @@ config version and known node list. On receiving a sync:
   each and then by content, so the cluster can't stay split.
 - New peer addresses are merged into the known node set.
 
-**Liveness.** Each node gossips a heartbeat (wall-clock milliseconds) in its
-own entry, advanced every round and relayed by everyone else. A rising
-heartbeat proves a node is alive even to peers that can't reach it, which is
-how subscribers know an `outboundOnly` node is up. A node with no sign of life
-(no direct contact, no rising heartbeat) for 5 minutes is forgotten. A node
-that leaves or is forgotten is remembered for 30 minutes as departed, so a
-peer that still has a stale copy can't gossip it back; it rejoins as soon as it
-gossips a heartbeat newer than the one it left with (i.e. it restarted).
-A daemon never lists itself as a peer.
+**Signed node records.** What each node says about itself (its address,
+heartbeat, health report, and for an `outboundOnly` node the relays it holds
+reverse connections to) is signed with its own certificate's key and relayed
+as is. Peers believe what they hear about node X only from X's signature, so
+no node can point X's address at itself, claim to be X's relay, mark X's
+services down or fake X's heartbeat. Once X has been seen signed, unsigned
+gossip about X is ignored; with `requireSignedConfig`, unsigned gossip about
+any node is.
+
+**Liveness.** Each node's heartbeat (wall-clock milliseconds) advances every
+round and is relayed by everyone else. A rising heartbeat proves a node is
+alive even to peers that can't reach it, which is how subscribers know an
+`outboundOnly` node is up. A node with no sign of life (no direct contact, no
+rising heartbeat) for 5 minutes is forgotten. A node that leaves or is
+forgotten is remembered for 30 minutes as departed, so a peer that still has a
+stale copy can't gossip it back; it rejoins as soon as it gossips a heartbeat
+newer than the one it left with (i.e. it restarted). A forgotten node may only
+have been cut off, so its last address is retried about once a minute for 24
+hours: when the network heals, the two sides find each other again even if
+neither lists the other in `knownNodes`. A daemon never lists itself as a
+peer.
 
 Message types:
 
@@ -394,7 +406,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay peer at all times. A relay only accepts a registration for node X from a certificate for X, so no other node can take X's traffic. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer a known peer.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay peer at all times. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer a known peer.
 
 ### Multiplexing (Yamux)
 
@@ -405,7 +417,7 @@ To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessi
 - A single cluster CA signs all node certificates.
 - All node certs share the fixed SAN `stouter-node`, which allows standard WebPki hostname verification without per-node DNS configuration.
 - Servers require client certificates; clients verify server certificates. Both sides authenticate against the cluster CA.
-- A node's identity is its certificate's CN, which must match its `nodeId`: tunnel, pool and mux connections to a known node check that the server's certificate names that node, a relay accepts reverse registrations for X only from X, and only X may announce X joining or leaving.
+- A node's identity is its certificate's CN, which must match its `nodeId`. A tunnel to X, whether on a mux session, a pooled connection or a new one, must reach a server whose certificate names X (or, for a NAT'd X, a relay X signed for); a relay accepts reverse registrations for X only from X; only X may announce X joining or leaving; and only X's signature makes gossip about X believed (see [Gossip Protocol](#gossip-protocol)).
 - Certificates are valid from the day they are issued (backdated a day for clock skew): 20 years for a new CA, 10 years for a node certificate, never past the CA's own expiry.
 - Tunnel requests include a millisecond timestamp. The receiving node rejects requests with clock skew greater than ±30 seconds, providing basic replay protection.
 

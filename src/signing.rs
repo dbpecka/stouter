@@ -1,47 +1,98 @@
-//! Admin-signed configs (`requireSignedConfig`).
+//! Signatures on gossiped state.
 //!
-//! Gossip carries the cluster's config through every node, and any node with
-//! a cluster certificate can send one. With `requireSignedConfig`, a node
-//! accepts a config change only if an admin signed it: a certificate from the
-//! cluster CA whose CN is in that node's `adminCns`. The signature covers the
-//! exact JSON text of the config, which travels with it, so any node can
-//! relay a signed config but none can alter it.
+//! Gossip carries state through every node, and any node with a cluster
+//! certificate can send some. Two kinds of it are signed, so that any node
+//! can relay them but none can alter them:
+//!
+//! - **Node records**: what each node says about itself (address,
+//!   heartbeat, health, the relays it uses), signed with its own
+//!   certificate's key. Peers believe what they hear about node X only if X
+//!   signed it, so no node can redirect, hide or fake another.
+//! - **Configs** (`requireSignedConfig`): a config change counts only if an
+//!   admin signed it, a certificate from the cluster CA whose CN is in the
+//!   receiving node's `adminCns`.
+//!
+//! Each signature covers the exact JSON text of what was signed, which
+//! travels with it, so it verifies however the rest was re-encoded on the
+//! way (an older node may drop fields it doesn't know). What a receiver uses
+//! is always decoded from that text.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::sign::SigningKey;
 use tokio_rustls::rustls::{self, SignatureScheme};
 use tracing::{debug, warn};
 
-use crate::config::{ConfigSignature, DynamicConfig};
+use crate::config::{ConfigSignature, DynamicConfig, NodeRecord, SignedNode};
 use crate::state::SharedState;
 use crate::tls::TlsContext;
 
-/// Prefix of every signed message, so a config signature can't be passed off
-/// as a signature over anything else.
-const DOMAIN: &[u8] = b"stouter signed config v1\n";
+/// Prefixes of signed messages, one per kind, so a signature on one kind of
+/// state can't be passed off as a signature on another.
+const CONFIG_DOMAIN: &[u8] = b"stouter signed config v1\n";
+const NODE_DOMAIN: &[u8] = b"stouter node record v1\n";
 
-fn message(config_json: &str) -> Vec<u8> {
-    [DOMAIN, config_json.as_bytes()].concat()
+/// A signing key and the certificate vouching for it.
+pub struct Signer {
+    cert: CertificateDer<'static>,
+    key: Arc<dyn SigningKey>,
 }
 
-/// `dc`, signed by the holder of `key`, whose certificate is `cert`.
-pub fn sign(dc: &DynamicConfig, cert: &CertificateDer<'_>, key: &PrivateKeyDer<'_>) -> Result<DynamicConfig> {
+impl Signer {
+    pub fn new(cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<Self> {
+        let key = rustls::crypto::aws_lc_rs::sign::any_supported_type(key)
+            .map_err(|e| anyhow!("load signing key: {e}"))?;
+        Ok(Self { cert, key })
+    }
+
+    /// The signer for a node's (or the CLI's) own TLS identity.
+    pub fn from_material(material: &crate::pki::PkiMaterial) -> Result<Self> {
+        Self::new(material.node_cert_der.clone(), &material.node_key)
+    }
+
+    /// Hex signature over `domain` + `text`.
+    fn sign(&self, domain: &[u8], text: &str) -> Result<String> {
+        let signer = self
+            .key
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .ok_or_else(|| anyhow!("the signing key is not an ECDSA P-256 key"))?;
+        let signature = signer
+            .sign(&[domain, text.as_bytes()].concat())
+            .map_err(|e| anyhow!("sign: {e}"))?;
+        Ok(hex(&signature))
+    }
+}
+
+/// Check that `signature` (hex) over `domain` + `text` was made by the key
+/// of `cert` (hex DER), and that `cert` is valid for this cluster. Returns
+/// the signer's Common Name.
+fn verify_text(domain: &[u8], text: &str, cert: &str, signature: &str, tls: &TlsContext) -> Result<String> {
+    let cert = CertificateDer::from(unhex(cert).context("signer certificate")?);
+    let signer = tls
+        .verify_cluster_cert(&cert)?
+        .ok_or_else(|| anyhow!("the signer's certificate has no CN"))?;
+    let end_entity = webpki::EndEntityCert::try_from(&cert).map_err(|e| anyhow!("signer certificate: {e:?}"))?;
+    let signature = unhex(signature).context("signature")?;
+    end_entity
+        .verify_signature(webpki::aws_lc_rs::ECDSA_P256_SHA256, &[domain, text.as_bytes()].concat(), &signature)
+        .map_err(|_| anyhow!("the signature does not verify"))?;
+    Ok(signer)
+}
+
+// ---------------------------------------------------------------------------
+// Configs
+// ---------------------------------------------------------------------------
+
+/// `dc`, signed by `signer`.
+pub fn sign(dc: &DynamicConfig, signer: &Signer) -> Result<DynamicConfig> {
     let mut signed = dc.clone();
     signed.signature = None;
     let config_json = serde_json::to_string(&signed)?;
-    let key = rustls::crypto::aws_lc_rs::sign::any_supported_type(key)
-        .map_err(|e| anyhow!("load signing key: {e}"))?;
-    let signer = key
-        .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
-        .ok_or_else(|| anyhow!("the signing key is not an ECDSA P-256 key"))?;
-    let signature = signer.sign(&message(&config_json)).map_err(|e| anyhow!("sign config: {e}"))?;
-    signed.signature = Some(ConfigSignature {
-        config_json,
-        signer_cert: hex(cert.as_ref()),
-        signature: hex(&signature),
-    });
+    let signature = signer.sign(CONFIG_DOMAIN, &config_json)?;
+    signed.signature = Some(ConfigSignature { config_json, signer_cert: hex(signer.cert.as_ref()), signature });
     Ok(signed)
 }
 
@@ -56,18 +107,11 @@ pub fn verify(dc: &DynamicConfig, tls: &TlsContext, admin_cns: &[String]) -> Res
         .signature
         .as_ref()
         .ok_or_else(|| anyhow!("config version {} is not signed", dc.version))?;
-    let cert = CertificateDer::from(unhex(&sig.signer_cert).context("signer certificate")?);
-    let signer = tls
-        .verify_cluster_cert(&cert)?
-        .ok_or_else(|| anyhow!("the signer's certificate has no CN"))?;
+    let signer = verify_text(CONFIG_DOMAIN, &sig.config_json, &sig.signer_cert, &sig.signature, tls)
+        .map_err(|e| anyhow!("config version {}: {e:#}", dc.version))?;
     if !admin_cns.contains(&signer) {
         bail!("config version {} is signed by '{signer}', which is not in adminCns", dc.version);
     }
-    let end_entity = webpki::EndEntityCert::try_from(&cert).map_err(|e| anyhow!("signer certificate: {e:?}"))?;
-    let signature = unhex(&sig.signature).context("signature")?;
-    end_entity
-        .verify_signature(webpki::aws_lc_rs::ECDSA_P256_SHA256, &message(&sig.config_json), &signature)
-        .map_err(|_| anyhow!("the signature on config version {} does not verify", dc.version))?;
     let mut config: DynamicConfig = serde_json::from_str(&sig.config_json).context("decode signed config")?;
     config.signature = Some(sig.clone());
     Ok((config, signer))
@@ -92,6 +136,41 @@ pub fn log_refusal(state: &SharedState, version: u64, err: &anyhow::Error) {
     } else {
         debug!("refusing config version {version} again: {err:#}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Node records
+// ---------------------------------------------------------------------------
+
+/// `record`, signed by the node it describes.
+pub fn sign_node(record: &NodeRecord, signer: &Signer) -> Result<SignedNode> {
+    let record_json = serde_json::to_string(record)?;
+    let signature = signer.sign(NODE_DOMAIN, &record_json)?;
+    Ok(SignedNode { record_json, cert: hex(signer.cert.as_ref()), signature })
+}
+
+/// The heartbeat a signed record claims, read without verifying it: enough
+/// to skip a record that's no newer than one already held (the common case,
+/// as every peer relays every record each round) before paying for a check.
+pub fn claimed_heartbeat(signed: &SignedNode) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Heartbeat {
+        #[serde(default)]
+        heartbeat: u64,
+    }
+    serde_json::from_str::<Heartbeat>(&signed.record_json).ok().map(|h| h.heartbeat)
+}
+
+/// The record `signed` vouches for. Fails unless the certificate is valid
+/// for this cluster, names the very node the record describes, and the
+/// signature verifies: only node X can say anything about X.
+pub fn verify_node(signed: &SignedNode, tls: &TlsContext) -> Result<NodeRecord> {
+    let signer = verify_text(NODE_DOMAIN, &signed.record_json, &signed.cert, &signed.signature, tls)?;
+    let record: NodeRecord = serde_json::from_str(&signed.record_json).context("decode node record")?;
+    if record.id != signer {
+        bail!("a record for node '{}' signed by '{signer}'", record.id);
+    }
+    Ok(record)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -138,7 +217,7 @@ mod tests {
     fn a_signed_config_verifies_and_comes_back_as_signed() {
         let dir = temp_dir("ok");
         let (admin, node) = setup(&dir, "admin");
-        let signed = sign(&sample(), &admin.node_cert_der, &admin.node_key).unwrap();
+        let signed = sign(&sample(), &Signer::from_material(&admin).unwrap()).unwrap();
         let (verified, signer) = verify(&signed, &node, &["admin".into()]).unwrap();
         assert_eq!(signer, "admin");
         assert_eq!(DynamicConfig { signature: None, ..verified.clone() }, sample());
@@ -158,7 +237,7 @@ mod tests {
         let dir = temp_dir("bad");
         let (admin, node) = setup(&dir, "admin");
         let admins = ["admin".to_string()];
-        let signed = sign(&sample(), &admin.node_cert_der, &admin.node_key).unwrap();
+        let signed = sign(&sample(), &Signer::from_material(&admin).unwrap()).unwrap();
 
         let mut forged = signed.clone();
         let sig = forged.signature.as_mut().unwrap();
@@ -169,13 +248,13 @@ mod tests {
 
         // Signed by a valid cluster certificate that isn't an admin's.
         let (mallory, _) = setup(&dir, "mallory");
-        let by_mallory = sign(&sample(), &mallory.node_cert_der, &mallory.node_key).unwrap();
+        let by_mallory = sign(&sample(), &Signer::from_material(&mallory).unwrap()).unwrap();
         assert!(verify(&by_mallory, &node, &admins).unwrap_err().to_string().contains("not in adminCns"));
 
         // An "admin" certificate from some other CA.
         let other = temp_dir("other");
         let (foreign_admin, _) = setup(&other, "admin");
-        let foreign = sign(&sample(), &foreign_admin.node_cert_der, &foreign_admin.node_key).unwrap();
+        let foreign = sign(&sample(), &Signer::from_material(&foreign_admin).unwrap()).unwrap();
         assert!(verify(&foreign, &node, &admins).unwrap_err().to_string().contains("not valid for this cluster"));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other);

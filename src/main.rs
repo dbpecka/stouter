@@ -282,6 +282,8 @@ async fn main() -> Result<()> {
             let tls_ctx = tls::TlsContext::new(&material)?;
 
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
+            // Signs this node's own record, which peers believe only signed.
+            let _ = state.signer.set(signing::Signer::from_material(&material)?);
             if cfg.require_signed_config {
                 cfg.validate().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
                 if let Err(e) = signing::admit(&state, cfg.dynamic_config.clone()) {
@@ -1048,7 +1050,7 @@ const PUSH_ATTEMPTS: usize = 3;
 /// `next`, signed with the CLI's certificate, as a push onto `base_version`.
 fn signed_push(mut next: config::DynamicConfig, base_version: u64, material: &pki::PkiMaterial) -> Result<AdminOp> {
     next.changed_by = tls::cert_cn(&material.node_cert_der).unwrap_or_else(|| "stouter-cli".into());
-    let config = signing::sign(&next, &material.node_cert_der, &material.node_key)?;
+    let config = signing::sign(&next, &signing::Signer::from_material(material)?)?;
     Ok(AdminOp::ConfigPush { config, base_version })
 }
 
@@ -1226,7 +1228,7 @@ fn save_local_change(
             );
         }
         cfg.dynamic_config.changed_by = signer;
-        cfg.dynamic_config = signing::sign(&cfg.dynamic_config, &material.node_cert_der, &material.node_key)?;
+        cfg.dynamic_config = signing::sign(&cfg.dynamic_config, &signing::Signer::from_material(&material)?)?;
     } else {
         cfg.dynamic_config.changed_by =
             if cfg.node_id.is_empty() { config::get_hostname() } else { cfg.node_id.clone() };

@@ -32,6 +32,17 @@ pub const NODE_EXPIRE_AFTER: Duration = Duration::from_secs(300);
 /// copy still circulating in gossip can't bring it back.
 const TOMBSTONE_TTL: Duration = Duration::from_secs(1800);
 
+/// How long a node forgotten for silence keeps being retried at its last
+/// address. It may have been cut off rather than dead; when the network
+/// heals, this is how the two sides find each other again even if neither
+/// lists the other as a bootstrap peer.
+pub const RECONNECT_FOR: Duration = Duration::from_secs(24 * 3600);
+
+/// A relay counts as one this node uses while it holds a reverse
+/// connection there, or registered one this recently (connections are
+/// consumed by tunnels and replaced, so the count dips during bursts).
+const RELAY_GRACE: Duration = Duration::from_secs(30);
+
 /// Whether `node` was confirmed reachable recently enough to route to.
 pub fn node_is_live(node: &NodeInfo, now: std::time::Instant) -> bool {
     node.last_seen.is_some_and(|seen| now.saturating_duration_since(seen) <= NODE_STALE_AFTER)
@@ -209,6 +220,21 @@ pub async fn run_pool_sweeper(state: Arc<SharedState>) {
     }
 }
 
+/// A reverse connection registered with a relay, from
+/// [`SharedState::relay_registered`]; gone when dropped.
+pub struct RelayRegistration {
+    state: Arc<SharedState>,
+    relay: String,
+}
+
+impl Drop for RelayRegistration {
+    fn drop(&mut self) {
+        if let Some((live, _)) = self.state.relays.lock().unwrap().get_mut(&self.relay) {
+            *live = live.saturating_sub(1);
+        }
+    }
+}
+
 /// RAII guard that decrements the in-flight counter on drop.
 pub struct InFlightGuard(Arc<InFlightTracker>);
 
@@ -302,6 +328,24 @@ pub struct SharedState {
     /// Version of the last config refused for lacking a valid signature, so
     /// each is reported once rather than on every sync.
     pub(crate) rejected_config_version: AtomicU64,
+    /// This node's key and certificate, to sign its own node record. Set at
+    /// daemon start.
+    pub signer: std::sync::OnceLock<crate::signing::Signer>,
+    /// Relays (by node id) this node registered reverse connections with:
+    /// how many it holds there now, and when it last registered one.
+    relays: Mutex<HashMap<String, (usize, std::time::Instant)>>,
+    /// Nodes forgotten for silence: last address, and when.
+    forgotten: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// The record this node last gossiped about itself, reused while fresh.
+    pub(crate) own_record: Mutex<Option<OwnRecord>>,
+}
+
+/// This node's last record (see `gossip::snapshot_nodes`): its content, the
+/// heartbeat and signature it went out with, and when it was made.
+pub(crate) struct OwnRecord {
+    pub record: crate::config::NodeRecord,
+    pub signed: Option<crate::config::SignedNode>,
+    pub at: std::time::Instant,
 }
 
 impl SharedState {
@@ -336,6 +380,10 @@ impl SharedState {
             heartbeat: AtomicU64::new(0),
             departed: Mutex::new(HashMap::new()),
             rejected_config_version: AtomicU64::new(0),
+            signer: std::sync::OnceLock::new(),
+            relays: Mutex::new(HashMap::new()),
+            forgotten: Mutex::new(HashMap::new()),
+            own_record: Mutex::new(None),
         })
     }
 
@@ -385,13 +433,20 @@ impl SharedState {
         Ok(stream)
     }
 
-    /// The id of the known node advertising `addr`, if any: whose
-    /// certificate a connection to `addr` should present.
+    /// The id of the known node advertising `addr`: whose certificate a
+    /// connection to `addr` should present. `None` if no node, or more than
+    /// one, claims it (then only per-tunnel checks decide who it may serve).
     pub fn node_at(&self, addr: &str) -> Option<String> {
         if addr.is_empty() {
             return None;
         }
-        self.known_nodes.load().values().find(|n| n.addr == addr).map(|n| n.id.clone())
+        let known = self.known_nodes.load();
+        let mut claimants = known.values().filter(|n| n.addr == addr);
+        let only = claimants.next()?;
+        if claimants.next().is_some() {
+            return None;
+        }
+        Some(only.id.clone())
     }
 
     pub async fn rebuild_service_index(&self) {
@@ -461,6 +516,42 @@ impl SharedState {
     /// Forget that `id` departed (it rejoined).
     pub fn unbury(&self, id: &str) {
         self.departed.lock().unwrap().remove(id);
+        self.forgotten.lock().unwrap().remove(id);
+    }
+
+    /// Remember the last address of `id`, forgotten for silence, so it is
+    /// retried for [`RECONNECT_FOR`]. (Not for a node that left: it said so.)
+    pub fn remember_forgotten(&self, id: &str, addr: &str) {
+        if !addr.is_empty() {
+            self.forgotten.lock().unwrap().insert(id.to_string(), (addr.to_string(), std::time::Instant::now()));
+        }
+    }
+
+    /// Last addresses of nodes forgotten within [`RECONNECT_FOR`].
+    pub fn forgotten_addrs(&self) -> Vec<String> {
+        let mut forgotten = self.forgotten.lock().unwrap();
+        forgotten.retain(|_, (_, at)| at.elapsed() < RECONNECT_FOR);
+        forgotten.values().map(|(addr, _)| addr.clone()).collect()
+    }
+
+    /// Note a reverse connection registered with `relay` (a node id); the
+    /// returned guard marks it gone when dropped.
+    pub fn relay_registered(self: &Arc<Self>, relay: &str) -> RelayRegistration {
+        let mut relays = self.relays.lock().unwrap();
+        let entry = relays.entry(relay.to_string()).or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
+        entry.1 = std::time::Instant::now();
+        RelayRegistration { state: Arc::clone(self), relay: relay.to_string() }
+    }
+
+    /// The relays this node uses (sorted ids): ones it holds a reverse
+    /// connection to, or registered one with in the last [`RELAY_GRACE`].
+    pub fn current_relays(&self) -> Vec<String> {
+        let mut relays = self.relays.lock().unwrap();
+        relays.retain(|_, (live, at)| *live > 0 || at.elapsed() < RELAY_GRACE);
+        let mut ids: Vec<String> = relays.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 
     pub async fn update_known_nodes<F, R>(&self, f: F) -> R
@@ -508,7 +599,9 @@ pub(crate) mod test_support {
     pub fn tls_state_with(dir: &std::path::Path, cfg: Config, config_path: String) -> Arc<SharedState> {
         let material = crate::pki::load_or_create(dir.to_str().unwrap(), &cfg.node_id).unwrap();
         let tls = TlsContext::new(&material).unwrap();
-        SharedState::new(cfg, config_path, CancellationToken::new(), Some(tls))
+        let state = SharedState::new(cfg, config_path, CancellationToken::new(), Some(tls));
+        let _ = state.signer.set(crate::signing::Signer::from_material(&material).unwrap());
+        state
     }
 
     /// An mTLS connection from `client` to `server`: (client end, server end).

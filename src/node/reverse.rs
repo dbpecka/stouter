@@ -113,6 +113,11 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
     };
     gossip::send_message(&mut stream, &msg).await?;
 
+    // While this connection waits at the relay, the relay is one we use: it
+    // goes into our signed node record, the only list of relays peers will
+    // send our tunnels through. Who the relay is comes from its certificate.
+    let _registration = stream.peer_cn().map(|relay| state.relay_registered(relay));
+
     debug!("reverse connection established to {relay_addr}");
 
     // Wait for a tunnel dispatch from the relay. Idle until then, so at

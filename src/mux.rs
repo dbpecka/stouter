@@ -31,6 +31,8 @@ type StreamResult = std::result::Result<yamux::Stream, yamux::ConnectionError>;
 #[derive(Clone)]
 pub struct MuxHandle {
     tx: mpsc::Sender<oneshot::Sender<StreamResult>>,
+    /// The CN of the server's certificate: the node at the other end.
+    peer: Option<String>,
 }
 
 impl MuxHandle {
@@ -71,11 +73,21 @@ impl MuxPool {
     /// Try to open a new yamux stream on an existing session for `addr`.
     ///
     /// Returns `None` if no session exists. Removes dead sessions on error.
-    pub async fn open_stream(&self, addr: &str) -> Option<yamux::Stream> {
+    ///
+    /// With `expect`, only if the session is with that node: sessions are
+    /// keyed by address, and a tunnel must reach the node it is meant for
+    /// whatever gossip says about who is at that address.
+    pub async fn open_stream(&self, addr: &str, expect: Option<&str>) -> Option<yamux::Stream> {
         let handle = {
             let sessions = self.sessions.lock().unwrap();
             sessions.get(addr)?.clone()
         };
+        if let Some(expected) = expect {
+            if handle.peer.as_deref() != Some(expected) {
+                debug!("mux session to {addr} is with {:?}, not {expected}", handle.peer);
+                return None;
+            }
+        }
 
         match handle.open_stream().await {
             Ok(stream) => Some(stream),
@@ -262,6 +274,8 @@ pub async fn establish_mux_session(
         .await
         .context("send MuxTunnel")?;
 
+    let peer = stream.peer_cn().map(str::to_string);
+
     // Upgrade to yamux client mode.
     let compat = stream.compat();
     let config = yamux::Config::default();
@@ -275,7 +289,7 @@ pub async fn establish_mux_session(
         drive_client_connection(connection, rx, &addr_owned).await;
     });
 
-    Ok(MuxHandle { tx })
+    Ok(MuxHandle { tx, peer })
 }
 
 /// Background task that drives a yamux client connection.
@@ -328,4 +342,20 @@ async fn drive_client_connection<T>(
     .await;
 
     debug!("mux client session to {addr} ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_session_serves_only_the_node_it_is_with() {
+        let pool = MuxPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        pool.insert("10.0.0.1:7000".into(), MuxHandle { tx, peer: Some("m".into()) });
+        // Gossip may claim x is at m's address: x's tunnels still don't
+        // ride m's session.
+        assert!(pool.open_stream("10.0.0.1:7000", Some("x")).await.is_none());
+        assert!(pool.contains("10.0.0.1:7000"), "the session itself is fine");
+    }
 }

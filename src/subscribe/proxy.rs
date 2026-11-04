@@ -283,13 +283,6 @@ pub(super) enum Tunnel {
     Mesh(Box<MeshStream>),
 }
 
-/// Establish an authenticated tunnel to `service_name` on `node`.
-///
-/// Connection acquisition priority:
-/// 1. Mux pool (open stream on existing yamux session)
-/// 2. Reverse pool (instant check — free path to NAT'd nodes)
-/// 3. Reverse pool with wait (for NAT-only nodes with no address)
-/// 4. Cold TCP connect as last resort
 impl AsyncRead for Tunnel {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -353,6 +346,39 @@ pub(super) async fn establish_tunnel(
         .map_err(|_| anyhow::anyhow!("tunnel setup to node {} timed out", node.id))?
 }
 
+/// Where to connect for a tunnel to `node`, and the node whose certificate
+/// must answer there. `None`: no address and no usable relay, so only a
+/// reverse connection the node holds to us can reach it.
+///
+/// A node with an address is reached there, and only that node may answer:
+/// whoever else gossip says is at the address, a tunnel for `node` never
+/// goes to them. A NAT'd node that signs its record is reached only through
+/// a relay it lists there. An older NAT'd node, known from unsigned gossip,
+/// through its gossiped relay.
+fn tunnel_route(node: &NodeInfo, state: &SharedState) -> Option<(String, Option<String>)> {
+    if !node.addr.is_empty() {
+        return Some((node.addr.clone(), Some(node.id.clone())));
+    }
+    if node.signed.is_some() {
+        let known = state.known_nodes.load();
+        let now = Instant::now();
+        let relays: Vec<&NodeInfo> = node
+            .relays
+            .iter()
+            .filter_map(|id| known.get(id))
+            .filter(|relay| !relay.addr.is_empty())
+            .collect();
+        // Prefer a live relay we already have a session with.
+        let relay = relays
+            .iter()
+            .find(|r| crate::state::node_is_live(r, now) && state.mux_pool.contains(&r.addr))
+            .or_else(|| relays.iter().find(|r| crate::state::node_is_live(r, now)))
+            .or(relays.first())?;
+        return Some((relay.addr.clone(), Some(relay.id.clone())));
+    }
+    node.relay.as_ref().map(|relay| (relay.clone(), state.node_at(relay)))
+}
+
 async fn establish_tunnel_untimed(
     node: &NodeInfo,
     service_name: String,
@@ -368,43 +394,50 @@ async fn establish_tunnel_untimed(
         service_name,
         timestamp_ms,
     };
-
-    let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
     let connect_start = Instant::now();
 
-    // --- Try mux pool first (multiplexed yamux stream) ---
-    if !connect_addr.is_empty() {
-        if let Some(yamux_stream) = state.mux_pool.open_stream(connect_addr).await {
-            let mut compat = yamux_stream.compat();
-            send_and_check_tunnel(&mut compat, &msg).await?;
-            metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
-                .record(connect_start.elapsed().as_secs_f64());
-            return Ok(Tunnel::Mux(compat));
-        }
+    // A reverse connection the node holds to us: it registered it with its
+    // own certificate, so it is the right node.
+    if let Some(mut stream) = state.reverse_pool.try_take(&node.id) {
+        send_and_check_tunnel(&mut stream, &msg).await?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Mesh(Box::new(stream)));
     }
 
-    // --- Fallback: legacy single-connection path ---
-    let method;
-    let mut node_stream: MeshStream = if let Some(stream) = state.reverse_pool.try_take(&node.id) {
-        method = "reverse";
-        stream
-    } else if let Some(stream) = state.tunnel_pool.try_take(connect_addr) {
-        method = "pool";
-        stream
-    } else if connect_addr.is_empty() {
-        method = "reverse";
-        state
+    let Some((addr, expect)) = tunnel_route(node, state) else {
+        // No address and no usable relay: wait for the node to give us a
+        // reverse connection.
+        let mut stream = state
             .reverse_pool
             .take(&node.id, REVERSE_POOL_TIMEOUT)
             .await
-            .with_context(|| {
-                format!("node {} not reachable: no address and no reverse connections", node.id)
-            })?
-    } else {
-        method = "cold";
-        state.connect_mesh(connect_addr, state.node_at(connect_addr).as_deref()).await?
+            .with_context(|| format!("node {} not reachable: no address, relay or reverse connection", node.id))?;
+        send_and_check_tunnel(&mut stream, &msg).await?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Mesh(Box::new(stream)));
     };
+    let expect = expect.as_deref();
 
+    // A stream on a mux session, if it is with the node we must reach.
+    if let Some(yamux_stream) = state.mux_pool.open_stream(&addr, expect).await {
+        let mut compat = yamux_stream.compat();
+        send_and_check_tunnel(&mut compat, &msg).await?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Mux(compat));
+    }
+
+    // A warm pooled connection to that node, else a new one.
+    let pooled = state
+        .tunnel_pool
+        .try_take(&addr)
+        .filter(|stream| expect.is_none() || stream.peer_cn() == expect);
+    let (method, mut node_stream) = match pooled {
+        Some(stream) => ("pool", stream),
+        None => ("cold", state.connect_mesh(&addr, expect).await?),
+    };
     send_and_check_tunnel(&mut node_stream, &msg).await?;
     metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => method)
         .record(connect_start.elapsed().as_secs_f64());
@@ -502,5 +535,35 @@ mod tests {
             unhealthy: vec!["api".into()],
         }));
         assert_eq!(ids(&find_service_nodes("api", &state)), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn tunnels_go_to_the_node_itself_or_a_relay_it_signed() {
+        let state = state_with(&[("r1", true, &[]), ("m", true, &[])]).await;
+        let signed = Some(crate::config::SignedNode {
+            record_json: String::new(),
+            cert: String::new(),
+            signature: String::new(),
+        });
+        // A direct node: its own address, and only it may answer there.
+        let direct = NodeInfo { id: "x".into(), addr: "x:1".into(), ..Default::default() };
+        assert_eq!(tunnel_route(&direct, &state), Some(("x:1".into(), Some("x".into()))));
+
+        // A signing NAT'd node: only through a relay it listed, whatever
+        // relay gossip claims for it.
+        let natd = NodeInfo {
+            id: "n".into(),
+            relays: vec!["r1".into()],
+            relay: Some("m:1".into()),
+            signed: signed.clone(),
+            ..Default::default()
+        };
+        assert_eq!(tunnel_route(&natd, &state), Some(("r1:1".into(), Some("r1".into()))));
+        let unlisted = NodeInfo { relays: vec!["nobody".into()], ..natd };
+        assert_eq!(tunnel_route(&unlisted, &state), None, "no usable relay: reverse connections only");
+
+        // An older, unsigned NAT'd node: its gossiped relay, as before.
+        let old = NodeInfo { id: "o".into(), relay: Some("m:1".into()), ..Default::default() };
+        assert_eq!(tunnel_route(&old, &state), Some(("m:1".into(), Some("m".into()))));
     }
 }
