@@ -87,6 +87,10 @@ enum ServiceAction {
         /// Comma-separated list of domains to route to this service
         #[arg(long, value_delimiter = ',')]
         domains: Vec<String>,
+        /// Metadata for integrations as `key=value`, e.g.
+        /// `--meta traefik.scheme=h2c` for the Traefik plugin. Repeatable.
+        #[arg(long = "meta", value_parser = parse_key_value)]
+        meta: Vec<(String, String)>,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -304,10 +308,12 @@ async fn main() -> Result<()> {
                     name,
                     port,
                     domains,
+                    meta,
                     node,
                     remote,
                 },
         }) => {
+            let meta: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
             if let Some(target) = remote {
                 let cfg = Config::load(&cli.config).unwrap_or_default();
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
@@ -319,6 +325,7 @@ async fn main() -> Result<()> {
                         owner_node_id,
                         port,
                         domains: domains.clone(),
+                        meta: meta.clone(),
                     },
                     &cfg,
                     cli.cert_dir.as_deref(),
@@ -336,6 +343,7 @@ async fn main() -> Result<()> {
                     node_id,
                     node_port: port,
                     domains: domains.clone(),
+                    meta: meta.clone(),
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -542,7 +550,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains) = src_dc
+            let (port, domains, meta) = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -551,7 +559,7 @@ async fn main() -> Result<()> {
                         .iter()
                         .find(|s| s.name == name && s.node_id == owner_node_id)
                 })
-                .map(|s| (s.node_port, s.domains.clone()))
+                .map(|s| (s.node_port, s.domains.clone(), s.meta.clone()))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "service '{}' on node '{}' not found in group '{}' on {}",
@@ -571,6 +579,7 @@ async fn main() -> Result<()> {
                     owner_node_id: dest_node.clone(),
                     port,
                     domains: domains.clone(),
+                    meta: meta.clone(),
                 },
                 &cfg,
                 to_certs,
@@ -795,5 +804,26 @@ fn print_status(
     }
     for node in known_nodes {
         println!("  {:<20} {}", node.id, node.addr);
+    }
+}
+
+/// Parse a `key=value` argument.
+fn parse_key_value(arg: &str) -> std::result::Result<(String, String), String> {
+    match arg.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("'{arg}' must look like key=value")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_value_requires_key() {
+        assert_eq!(parse_key_value("traefik.scheme=h2c").unwrap(), ("traefik.scheme".into(), "h2c".into()));
+        assert_eq!(parse_key_value("a=b=c").unwrap(), ("a".into(), "b=c".into()));
+        assert!(parse_key_value("=h2c").is_err());
+        assert!(parse_key_value("novalue").is_err());
     }
 }

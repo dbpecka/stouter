@@ -132,6 +132,7 @@ async fn list_services(State(state): State<AppState>) -> Json<Vec<serde_json::Va
                 "port": info.port,
                 "address": format!("127.0.0.1:{}", info.port),
                 "domains": info.domains,
+                "meta": info.meta,
             })
         })
         .collect();
@@ -158,6 +159,7 @@ async fn get_service(
                 "port": info.port,
                 "address": format!("127.0.0.1:{}", info.port),
                 "domains": info.domains,
+                "meta": info.meta,
             })),
         ),
         None => (
@@ -192,10 +194,15 @@ mod tests {
                     ServiceInfo {
                         port: *v,
                         domains: domains.iter().map(|d| d.to_string()).collect(),
+                        meta: Default::default(),
                     },
                 )
             })
             .collect();
+        app_from(map)
+    }
+
+    fn app_from(map: HashMap<String, ServiceInfo>) -> Router {
         let service_ports: ServicePorts = Arc::new(RwLock::new(map));
         let shared = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
         let state = AppState {
@@ -285,6 +292,38 @@ mod tests {
         assert_eq!(domains.len(), 2);
         assert_eq!(domains[0], "example.com");
         assert_eq!(domains[1], "www.example.com");
+    }
+
+    /// The Traefik plugin (dbpecka/traefik-plugin-stouter) reads
+    /// `meta["traefik.scheme"]` from these responses.
+    #[tokio::test]
+    async fn services_expose_meta_for_integrations() {
+        let services = || {
+            let mut map = HashMap::new();
+            map.insert(
+                "wp-grpc".to_string(),
+                ServiceInfo {
+                    port: 9000,
+                    domains: vec!["wp-grpc.pecka.cloud".into()],
+                    meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
+                },
+            );
+            map.insert(
+                "plain".to_string(),
+                ServiceInfo { port: 9001, domains: vec![], meta: Default::default() },
+            );
+            map
+        };
+
+        let (status, body) = do_request(app_from(services()), "GET", "/services/wp-grpc").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["meta"], serde_json::json!({"traefik.scheme": "h2c"}));
+
+        let (_, body) = do_request(app_from(services()), "GET", "/services").await;
+        let list = body.as_array().unwrap();
+        let by_name = |n: &str| list.iter().find(|s| s["name"] == n).unwrap().clone();
+        assert_eq!(by_name("wp-grpc")["meta"]["traefik.scheme"], "h2c");
+        assert_eq!(by_name("plain")["meta"], serde_json::json!({}));
     }
 
     #[tokio::test]

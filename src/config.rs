@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
@@ -29,6 +29,11 @@ pub struct Service {
     pub node_port: u16,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
+    /// Free-form key/value metadata for integrations, kept as-is and served
+    /// by the subscribe REST API (e.g. `traefik.scheme: h2c` for the Traefik
+    /// plugin). Stouter itself does not interpret it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, String>,
 }
 
 /// A named collection of services.
@@ -121,8 +126,7 @@ impl DynamicConfig {
                 .iter_mut()
                 .find(|s| s.name == service.name && s.node_id == service.node_id)
             {
-                existing.node_port = service.node_port;
-                existing.domains = service.domains;
+                *existing = service;
             } else {
                 g.services.push(service);
             }
@@ -574,6 +578,7 @@ mod tests {
                 node_id: "n1".into(),
                 node_port: 3000,
                 domains: vec![],
+                meta: Default::default(),
             },
         );
         assert_eq!(v, 1);
@@ -588,11 +593,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         let v = dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![] },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], meta: Default::default() },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups.len(), 1);
@@ -604,7 +609,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         let v = dc.upsert_service(
             "web",
@@ -613,12 +618,15 @@ mod tests {
                 node_id: "n1".into(),
                 node_port: 9999,
                 domains: vec!["x.example".into()],
+                meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
             },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups[0].services.len(), 1);
         assert_eq!(dc.service_groups[0].services[0].node_port, 9999);
         assert_eq!(dc.service_groups[0].services[0].domains, vec!["x.example".to_string()]);
+        // The whole entry is replaced, so re-adding can set meta.
+        assert_eq!(dc.service_groups[0].services[0].meta["traefik.scheme"], "h2c");
     }
 
     #[test]
@@ -626,11 +634,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         assert_eq!(dc.service_groups[0].services.len(), 2);
     }
@@ -640,7 +648,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         let v = dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(v, 2);
@@ -659,7 +667,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         let err = dc.remove_service("web", "n1", "api").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -670,11 +678,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 1);
@@ -686,7 +694,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
         assert_eq!(v, 2);
@@ -705,7 +713,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -716,11 +724,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![] },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], meta: Default::default() },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![] },
+            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], meta: Default::default() },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::DuplicateService { .. }));
@@ -779,6 +787,7 @@ mod tests {
                         node_id: "host1".into(),
                         node_port: 3000,
                         domains: vec!["api.example.com".into(), "www.api.example.com".into()],
+                        meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
                     }],
                 }],
             },
@@ -788,7 +797,22 @@ mod tests {
         let loaded = Config::load(path_str).unwrap();
         assert_eq!(loaded.dynamic_config.version, 5);
         assert_eq!(loaded.dynamic_config.service_groups[0].services[0].name, "api");
+        assert_eq!(loaded.dynamic_config.service_groups[0].services[0].meta["traefik.scheme"], "h2c");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn service_meta_parses_and_is_omitted_when_empty() {
+        let svc: Service = serde_json::from_str(
+            r#"{"name":"wp-grpc","nodeId":"min1","nodePort":9000,"domains":["wp-grpc.pecka.cloud"],"meta":{"traefik.scheme":"h2c"}}"#,
+        )
+        .unwrap();
+        assert_eq!(svc.meta["traefik.scheme"], "h2c");
+        assert!(serde_json::to_string(&svc).unwrap().contains(r#""meta":{"traefik.scheme":"h2c"}"#));
+
+        let plain: Service = serde_json::from_str(r#"{"name":"a","nodeId":"n1","nodePort":1}"#).unwrap();
+        assert!(plain.meta.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("meta"));
     }
 }

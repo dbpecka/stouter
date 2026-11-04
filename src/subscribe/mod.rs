@@ -18,6 +18,15 @@ use crate::state::SharedState;
 pub(crate) struct ServiceInfo {
     pub port: u16,
     pub domains: Vec<String>,
+    /// Integration metadata from the service config (e.g. `traefik.scheme`).
+    pub meta: std::collections::BTreeMap<String, String>,
+}
+
+/// A service a proxy should be running for, as of the current config.
+struct DesiredService {
+    name: String,
+    domains: Vec<String>,
+    meta: std::collections::BTreeMap<String, String>,
 }
 
 /// A running local proxy for a single service.
@@ -117,8 +126,8 @@ async fn manage_proxies(
         let nodes = state.known_nodes.load_full();
 
         // Build the desired set: "group/service" keys where at least one
-        // node is reachable. Track (service_name, domains) for proxy setup.
-        let mut desired: HashMap<String, (String, Vec<String>)> = HashMap::new();
+        // node is reachable, with what proxy setup and the REST API need.
+        let mut desired: HashMap<String, DesiredService> = HashMap::new();
         let mut seen_svc_keys: HashSet<String> = HashSet::new();
         for group in &dc.service_groups {
             for svc in &group.services {
@@ -136,7 +145,14 @@ async fn manage_proxies(
                 }
                 let key = format!("{}/{}", group.name, svc.name);
                 if nodes.contains_key(&svc.node_id) && seen_svc_keys.insert(key.clone()) {
-                    desired.insert(key, (svc.name.clone(), svc.domains.clone()));
+                    desired.insert(
+                        key,
+                        DesiredService {
+                            name: svc.name.clone(),
+                            domains: svc.domains.clone(),
+                            meta: svc.meta.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -157,8 +173,15 @@ async fn manage_proxies(
         }
 
         // Start proxies for newly desired services.
-        for (key, (svc_name, svc_domains)) in desired {
-            if proxies.contains_key(&key) {
+        for (key, DesiredService { name: svc_name, domains: svc_domains, meta: svc_meta }) in desired {
+            if let Some(handle) = proxies.get(&key) {
+                // Keep the API's view current when a running service's
+                // domains or meta change, without restarting its proxy.
+                let mut ports = service_ports.write().await;
+                if let Some(info) = ports.get_mut(&handle.service_name) {
+                    info.domains = svc_domains;
+                    info.meta = svc_meta;
+                }
                 continue;
             }
 
@@ -185,7 +208,7 @@ async fn manage_proxies(
 
             match port_rx.await {
                 Ok(local_port) => {
-                    service_ports.write().await.insert(svc_name.clone(), ServiceInfo { port: local_port, domains: svc_domains });
+                    service_ports.write().await.insert(svc_name.clone(), ServiceInfo { port: local_port, domains: svc_domains, meta: svc_meta });
                     proxies.insert(key.clone(), ProxyHandle { service_name: svc_name, local_port, abort });
                     info!("Started proxy for {key} on 127.0.0.1:{local_port}");
                 }
