@@ -9,6 +9,9 @@ service mesh. Grouped by area, not prioritized.
   restart when `ca.key` is present, and `stouter cert issue` provisions new nodes.
 - Config-mutation RBAC: the REST API is read-only, and mutations go through the
   gossip admin RPC, authorized against the `adminCns` certificate allowlist.
+- Graceful shutdown on SIGINT/SIGTERM: `NodeLeave`, then a drain that waits
+  only on tunnels and requests in progress (idle pooled connections and mux
+  sessions don't hold it up).
 - Health-aware load balancing: nodes with stale gossip liveness are skipped, and
   a failed tunnel setup is retried against another node.
 - Passive outlier ejection: a node whose tunnel setup fails repeatedly is
@@ -67,8 +70,6 @@ service mesh. Grouped by area, not prioritized.
 ## Observability
 - `https://` OTLP endpoints and OTLP metrics export; spans for tunnel
   setup on hosting nodes.
-- Faster graceful shutdown: long-lived peer mux sessions count as
-  in-flight, so a drain always waits the full 30s timeout.
 - Per-route metrics once route rules exist (per-service request metrics exist
   for `http` services).
 - A metrics endpoint for pure `node`-mode daemons (only subscribers serve
@@ -93,4 +94,3 @@ service mesh. Grouped by area, not prioritized.
    certs, enforced on hosting nodes.
 2. **A `/metrics` endpoint for `node`-mode daemons** — small, but tunnel
    metrics recorded on nodes can't be scraped today.
-3. **Graceful shutdown that doesn't wait on idle mux sessions.**

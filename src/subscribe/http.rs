@@ -101,18 +101,21 @@ impl HttpProxy {
         Arc::new(Self { service_name, state, balancer, client, retry_budget: RetryBudget::new() })
     }
 
-    /// Serve HTTP/1.1 on one accepted client connection.
-    pub async fn serve_connection(self: Arc<Self>, client: TcpStream) {
+    /// Serve HTTP/1.1 on one accepted client connection. The connection
+    /// counts as in-flight for a drain from this call (made at accept) until
+    /// the returned future finishes.
+    pub fn serve_connection(self: Arc<Self>, client: TcpStream) -> impl Future<Output = ()> + Send + 'static {
+        let in_flight = self.state.in_flight.track();
+        let shutdown = self.state.shutdown.clone();
         let service = service_fn(move |req| {
             let proxy = self.clone();
             async move { Ok::<_, std::convert::Infallible>(proxy.handle(req).await) }
         });
-        if let Err(e) = http1::Builder::new()
-            .serve_connection(TokioIo::new(client), service)
-            .with_upgrades()
-            .await
-        {
-            debug!("HTTP connection error: {e}");
+        async move {
+            let _in_flight = in_flight;
+            if let Err(e) = serve_http1(client, service, &shutdown).await {
+                debug!("HTTP connection error: {e}");
+            }
         }
     }
 
@@ -181,7 +184,11 @@ impl HttpProxy {
                 if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
                     if let Some(client_upgrade) = client_upgrade {
                         let backend_upgrade = hyper::upgrade::on(&mut resp);
+                        // The HTTP connection ends at the upgrade; the
+                        // upgraded stream is in-flight work of its own.
+                        let in_flight = self.state.in_flight.track();
                         tokio::spawn(async move {
+                            let _in_flight = in_flight;
                             let _slot = slot;
                             match tokio::try_join!(client_upgrade, backend_upgrade) {
                                 Ok((client_io, backend_io)) => {
@@ -411,6 +418,31 @@ impl HttpProxy {
         match (outcome, fallback) {
             (Outcome::Error(..), Some(fallback)) => fallback,
             (outcome, _) => outcome,
+        }
+    }
+}
+
+/// Serve HTTP/1.1 (with upgrades) on an accepted client connection until it
+/// closes. Once `shutdown` fires, the connection finishes the request it is
+/// on and then closes; an idle keep-alive connection closes at once.
+pub(super) async fn serve_http1<S>(
+    client: TcpStream,
+    service: S,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<(), hyper::Error>
+where
+    S: hyper::service::HttpService<Incoming, ResBody = ProxyBody>,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let conn = http1::Builder::new()
+        .serve_connection(TokioIo::new(client), service)
+        .with_upgrades();
+    tokio::pin!(conn);
+    tokio::select! {
+        result = conn.as_mut() => result,
+        _ = shutdown.cancelled() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
         }
     }
 }

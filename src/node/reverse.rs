@@ -61,14 +61,18 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
 /// prevents burst traffic from draining the pool for the duration of every
 /// active connection.
 async fn reverse_worker(state: Arc<SharedState>, relay_addr: String, slot: usize) {
-    loop {
+    // Stops at shutdown, so a draining node takes no new tunnels this way.
+    while !state.shutdown.is_cancelled() {
         match open_reverse_connection(&state, &relay_addr).await {
             Ok(()) => {
                 debug!("reverse connection to {relay_addr} slot {slot} completed (tunnel handled)");
             }
             Err(e) => {
                 debug!("reverse connection to {relay_addr} slot {slot}: {e}");
-                time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = time::sleep(Duration::from_secs(2)) => {}
+                    _ = state.shutdown.cancelled() => {}
+                }
             }
         }
     }
@@ -103,8 +107,12 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str) -> 
 
     debug!("reverse connection established to {relay_addr}");
 
-    // Wait for a tunnel dispatch from the relay.
-    let msg = gossip::recv_message(&mut stream).await?;
+    // Wait for a tunnel dispatch from the relay. Idle until then, so at
+    // shutdown the connection is simply closed.
+    let msg = tokio::select! {
+        msg = gossip::recv_message(&mut stream) => msg?,
+        _ = state.shutdown.cancelled() => return Ok(()),
+    };
     match msg {
         Message::TunnelRequest {
             node_id,
@@ -114,7 +122,9 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str) -> 
             // Spawn tunnel handling in a background task so this worker can
             // immediately reconnect and replenish the pool.
             let state = Arc::clone(state);
+            let in_flight = state.in_flight.track();
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 if let Err(e) =
                     super::tunnel::handle_tunnel(stream, node_id, service_name, timestamp_ms, state)
                         .await

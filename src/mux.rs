@@ -127,7 +127,11 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
         match next {
             Some(Ok(yamux_stream)) => {
                 let state = state.clone();
+                // Each stream is a tunnel; the session itself isn't tracked,
+                // so an idle session doesn't hold up a drain.
+                let in_flight = state.in_flight.track();
                 tokio::spawn(async move {
+                    let _in_flight = in_flight;
                     let compat = yamux_stream.compat();
                     if let Err(e) = handle_mux_stream(compat, state).await {
                         debug!("mux stream error: {e}");
@@ -161,6 +165,8 @@ async fn handle_mux_stream(
             service_name,
             timestamp_ms,
         } => {
+            crate::node::tunnel::refuse_if_draining(&mut stream, &state).await?;
+
             // Verify timestamp
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

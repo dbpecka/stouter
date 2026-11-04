@@ -103,13 +103,13 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
             stream.set_nodelay(true).ok();
             let state = state.clone();
             let peer = peer_addr.to_string();
-            let guard = state.in_flight.track();
+            // In-flight tracking happens in `dispatch_connection`, once the
+            // connection carries work; idle pooled connections don't count.
             tokio::spawn(async move {
                 match state.tls_accept(stream).await {
                     Ok(mesh) => gossip::dispatch_connection(mesh, peer, state).await,
                     Err(e) => tracing::debug!("TLS accept from {peer}: {e}"),
                 }
-                drop(guard);
             });
         }
     }
