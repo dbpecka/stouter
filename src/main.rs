@@ -284,6 +284,8 @@ async fn main() -> Result<()> {
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
             // Signs this node's own record, which peers believe only signed.
             let _ = state.signer.set(signing::Signer::from_material(&material)?);
+            // Orders this process's heartbeats above any earlier process's.
+            let _ = state.incarnation.set(state::incarnation_for(&cli.config));
             if cfg.require_signed_config {
                 cfg.validate().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
                 if let Err(e) = signing::admit(&state, cfg.dynamic_config.clone()) {
@@ -378,16 +380,22 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&cli.config).unwrap_or_default();
             let target = remote.clone().unwrap_or_else(|| cfg.local_target());
 
-            match tokio::net::TcpStream::connect(&target).await {
+            match tokio::time::timeout(state::CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&target)).await {
                 Err(_) => {
+                    println!("No daemon answering on {target} (connect timed out)");
+                }
+                Ok(Err(_)) => {
                     println!("No daemon running on {target}");
                 }
-                Ok(tcp) => {
+                Ok(Ok(tcp)) => {
                     let tls_ctx = build_cli_tls(&cfg, cli.cert_dir.as_deref())?;
-                    let mut stream = tls_ctx.connect(tcp).await?;
-
-                    gossip::send_message(&mut stream, &Message::StatusRequest).await?;
-                    let msg = gossip::recv_message(&mut stream).await?;
+                    let msg = tokio::time::timeout(RPC_TIMEOUT, async {
+                        let mut stream = tls_ctx.connect(tcp).await?;
+                        gossip::send_message(&mut stream, &Message::StatusRequest).await?;
+                        gossip::recv_message(&mut stream).await
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("no answer from {target} within {}s", RPC_TIMEOUT.as_secs()))??;
 
                     match msg {
                         Message::StatusResponse {
@@ -1018,10 +1026,23 @@ struct DaemonConfig {
     require_signed_config: bool,
 }
 
-async fn fetch_daemon_config(target: &str, tls_ctx: &tls::TlsContext) -> Result<DaemonConfig> {
+/// Time allowed for a daemon to answer a CLI request (an admin change
+/// waits for the daemon to tell its peers).
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Send `request` to a daemon and read its answer, within [`RPC_TIMEOUT`].
+async fn daemon_request(target: &str, tls_ctx: &tls::TlsContext, request: &Message) -> Result<Message> {
     let mut stream = connect_daemon(target, tls_ctx).await?;
-    gossip::send_message(&mut stream, &Message::StatusRequest).await?;
-    match gossip::recv_message(&mut stream).await? {
+    tokio::time::timeout(RPC_TIMEOUT, async {
+        gossip::send_message(&mut stream, request).await?;
+        gossip::recv_message(&mut stream).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("no answer from {target} within {}s", RPC_TIMEOUT.as_secs()))?
+}
+
+async fn fetch_daemon_config(target: &str, tls_ctx: &tls::TlsContext) -> Result<DaemonConfig> {
+    match daemon_request(target, tls_ctx, &Message::StatusRequest).await? {
         Message::StatusResponse { dynamic_config, require_signed_config, .. } => {
             Ok(DaemonConfig { dynamic_config, require_signed_config })
         }
@@ -1035,9 +1056,7 @@ async fn send_admin(
     tls_ctx: &tls::TlsContext,
     op: AdminOp,
 ) -> Result<std::result::Result<u64, (AdminErrCode, String)>> {
-    let mut stream = connect_daemon(target, tls_ctx).await?;
-    gossip::send_message(&mut stream, &Message::AdminRequest { op }).await?;
-    match gossip::recv_message(&mut stream).await? {
+    match daemon_request(target, tls_ctx, &Message::AdminRequest { op }).await? {
         Message::AdminResponse { result: AdminResult::Ok { new_version } } => Ok(Ok(new_version)),
         Message::AdminResponse { result: AdminResult::Err { code, message } } => Ok(Err((code, message))),
         _ => anyhow::bail!("unexpected response from daemon"),

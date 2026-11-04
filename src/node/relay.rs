@@ -13,6 +13,10 @@ use crate::tls::MeshStream;
 /// Maximum time to wait for an idle reverse connection before failing.
 const POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Most idle reverse connections one node may hold here (and so the most
+/// `reversePoolSize` can usefully be).
+pub const MAX_IDLE_REVERSE_PER_NODE: usize = 1024;
+
 /// Reverse connections tried for one tunnel before giving up.
 const RELAY_ATTEMPTS: usize = 3;
 
@@ -56,25 +60,39 @@ pub async fn handle_reverse_registration(
         );
     }
 
-    info!(
-        "reverse connection registered for node {} (relay via {})",
-        node_id,
-        state.config.peer_addr()
-    );
+    // A NAT'd node keeps `reversePoolSize` idle connections here; more than
+    // this is one hogging file descriptors.
+    let idle = state.reverse_pool.count(&node_id);
+    if idle >= MAX_IDLE_REVERSE_PER_NODE {
+        bail!("node {node_id} already holds {idle} idle reverse connections here (limit {MAX_IDLE_REVERSE_PER_NODE})");
+    }
 
     // --- Update known_nodes relay field ---
     {
-        let our_addr = state.config.peer_addr().to_owned();
+        // Where peers reach us for this node. Bound to all interfaces with
+        // no `advertiseAddr`, our own address is a wildcard nobody else can
+        // dial: use the one the NAT'd node just reached us on instead.
+        let mut our_addr = state.config.peer_addr().to_owned();
+        if gossip::is_wildcard(&our_addr) {
+            if let Ok(local) = stream.local_addr() {
+                our_addr = local.to_string();
+            }
+        }
         let nid = node_id.clone();
-        state
+        let relay_addr = our_addr.clone();
+        // Whether we weren't already relaying for it: worth one line at
+        // info; every further connection (one per tunnel) only at debug.
+        let newly = state
             .update_known_nodes(|kn| {
                 let now = Instant::now();
                 if let Some(node) = kn.get_mut(&nid) {
+                    let newly = node.relay.as_deref() != Some(our_addr.as_str());
                     node.relay = Some(our_addr);
                     // A reverse registration is direct contact with the NAT'd
                     // node, so it counts as a liveness signal.
                     node.last_seen = Some(now);
                     node.heard_at = Some(now);
+                    newly
                 } else {
                     // Direct contact: it's here, whatever gossip said before.
                     state.unbury(&nid);
@@ -88,9 +106,15 @@ pub async fn handle_reverse_registration(
                             ..Default::default()
                         },
                     );
+                    true
                 }
             })
             .await;
+        if newly {
+            info!("relaying for node {node_id} (reverse connections registered; peers reach it via {relay_addr})");
+        } else {
+            debug!("reverse connection registered for node {node_id}");
+        }
     }
 
     // --- Store in reverse pool ---
@@ -230,8 +254,13 @@ mod tests {
         assert!(!relay.known_nodes.load().contains_key("victim"));
 
         let (_client, server_end) = mesh_pair(&mallory, &relay).await;
+        let reached_at = server_end.local_addr().unwrap().to_string();
         handle_reverse_registration(server_end, "mallory".into(), now_ms(), relay.clone()).await.unwrap();
         assert_eq!(relay.reverse_pool.count("mallory"), 1);
+        // The relay binds 0.0.0.0 with no advertiseAddr: it records where
+        // it was actually reached, not the unroutable wildcard.
+        assert!(gossip::is_wildcard(relay.config.peer_addr()));
+        assert_eq!(relay.known_nodes.load()["mallory"].relay.as_deref(), Some(reached_at.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

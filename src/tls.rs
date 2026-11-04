@@ -30,6 +30,14 @@ pub enum MeshStream {
 }
 
 impl MeshStream {
+    /// The local address of the underlying TCP connection.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            MeshStream::TlsServer { stream, .. } => stream.get_ref().0.local_addr(),
+            MeshStream::TlsClient { stream, .. } => stream.get_ref().0.local_addr(),
+        }
+    }
+
     /// The Common Name of the peer's leaf certificate, if it has one: the
     /// client's on an accepted stream, the server's on a connected one.
     pub fn peer_cn(&self) -> Option<&str> {

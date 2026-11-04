@@ -100,7 +100,8 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
                     break;
                 }
             };
-            stream.set_nodelay(true).ok();
+            // Keepalive, so a peer that vanished without closing is noticed.
+            crate::io::configure_stream(&stream);
             let state = state.clone();
             let peer = peer_addr.to_string();
             // In-flight tracking happens in `dispatch_connection`, once the

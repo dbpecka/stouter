@@ -50,7 +50,8 @@ async fn run_listener(state: Arc<SharedState>) -> Result<()> {
                 break;
             }
         };
-        stream.set_nodelay(true).ok();
+        // Keepalive, so a peer that vanished without closing is noticed.
+        crate::io::configure_stream(&stream);
         debug!("accepted connection from {peer_addr}");
 
         let state = state.clone();

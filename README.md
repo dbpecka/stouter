@@ -57,7 +57,7 @@ Create a `stouter.json` file:
 | `advertiseAddr` | Address peers use to reach this node |
 | `nodeId` | Unique identifier for this node |
 | `outboundOnly` | Set `true` for nodes behind NAT — disables listener, uses reverse connections |
-| `reversePoolSize` | Number of idle reverse connections to maintain per relay peer (default 64) |
+| `reversePoolSize` | Number of idle reverse connections to maintain per relay peer (default 64, at most 1024: relays refuse more from one node) |
 | `knownNodes` | Bootstrap peer addresses for initial gossip |
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
 | `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default) disables admin RPC |
@@ -244,8 +244,11 @@ services down or fake X's heartbeat. Once X has been seen signed, unsigned
 gossip about X is ignored; with `requireSignedConfig`, unsigned gossip about
 any node is.
 
-**Liveness.** Each node's heartbeat (wall-clock milliseconds) advances every
-round and is relayed by everyone else. A rising heartbeat proves a node is
+**Liveness.** Each node's heartbeat advances every few seconds and is relayed
+by everyone else. Its high half is the node's *incarnation*, one higher every
+time the daemon starts (kept in `<config file>.state`, and never below the
+current Unix time), so a restarted node always outranks what it gossiped
+before, even if its clock was set back meanwhile. A rising heartbeat proves a node is
 alive even to peers that can't reach it, which is how subscribers know an
 `outboundOnly` node is up. A node with no sign of life (no direct contact, no
 rising heartbeat) for 5 minutes is forgotten. A node that leaves or is
@@ -269,6 +272,17 @@ Message types:
 | `MuxTunnel` | Upgrade connection to yamux multiplexing |
 
 All gossip messages are MessagePack-encoded with a 4-byte big-endian length prefix. All connections are mTLS-authenticated.
+
+Limits, so one peer can't exhaust a node:
+
+- Messages are at most 8 MiB; an oversized one is refused (and warned about)
+  on both ends. A config change that would make the config larger than 2 MiB
+  encoded (a signed config counts its signed copy too) is refused, since it
+  could never reach the rest of the cluster.
+- One peer may hold at most 64 connections waiting for their first message
+  (subscribers keep 8 warm per node), 16 mux sessions, and 1024 idle reverse
+  connections. Accepted connections use TCP keepalive, so ones whose peer
+  vanished are closed.
 
 ### Tunnel Routing
 
@@ -383,8 +397,8 @@ too. This works for `tcp` and `http` services alike. Two failures in a row mark 
 unhealthy; one success marks it healthy again. The node publishes the result in
 its own gossip entry and pushes it to peers as soon as it changes, so
 subscribers stop routing to a dead backend within about 10s of it going down,
-before any client connection has to fail. Reports carry a version (wall-clock
-milliseconds), so a relayed copy never overwrites a newer one and a restarted
+before any client connection has to fail. Reports carry a version ordered like
+heartbeats, so a relayed copy never overwrites a newer one and a restarted
 node's first report replaces anything peers held from before.
 
 Health shows up in `stouter status` (an `UNHEALTHY` marker per service) and in

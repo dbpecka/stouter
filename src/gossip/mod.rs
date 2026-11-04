@@ -13,8 +13,40 @@ use crate::state::{SharedState, NODE_EXPIRE_AFTER};
 use crate::tls::MeshStream;
 use messages::Message;
 
-/// Maximum allowed message size: 1 MiB.
-const MAX_MSG_BYTES: u32 = 1024 * 1024;
+/// Largest message sent or accepted: room for a large signed config and
+/// thousands of signed node records. (A config alone is capped well below
+/// this; see `config::MAX_CONFIG_BYTES`.)
+const MAX_MSG_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Warn about an oversized message at most this often: a peer that sends
+/// one does so every sync round.
+const SIZE_WARNING_EVERY: Duration = Duration::from_secs(60);
+
+/// Log `message` at warn level, at most once per [`SIZE_WARNING_EVERY`].
+fn warn_message_size(message: std::fmt::Arguments<'_>) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    warn_rarely(&LAST, message);
+}
+
+/// Log `message` at warn level if `last` (one per kind of warning) is
+/// over a minute ago, else at debug: for conditions that repeat every round.
+fn warn_rarely(last: &std::sync::Mutex<Option<std::time::Instant>>, message: std::fmt::Arguments<'_>) {
+    let mut last = last.lock().unwrap();
+    if last.is_none_or(|at| at.elapsed() >= SIZE_WARNING_EVERY) {
+        *last = Some(std::time::Instant::now());
+        warn!("{message}");
+    } else {
+        debug!("{message}");
+    }
+}
+
+/// Most connections one peer may hold here waiting for their first
+/// message. Subscribers keep a few warm (8 per node), so this only stops a
+/// peer piling up idle connections until we run out of file descriptors.
+const MAX_IDLE_PER_PEER: usize = 64;
+
+/// Most mux sessions one peer may hold here (subscribers keep one).
+const MAX_MUX_SESSIONS_PER_PEER: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Wire helpers
@@ -28,7 +60,14 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(
     msg: &Message,
 ) -> Result<()> {
     let payload = encode_message(msg)?;
-    let len = u32::try_from(payload.len()).context("message too large")?;
+    let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    if len > MAX_MSG_BYTES {
+        // The receiver would refuse it; say so here, where it can be fixed.
+        warn_message_size(format_args!(
+            "not sending a {len}-byte message: over the {MAX_MSG_BYTES}-byte limit (a very large config or cluster?)"
+        ));
+        bail!("message too large to send: {len} bytes");
+    }
     stream
         .write_all(&len.to_be_bytes())
         .await
@@ -63,14 +102,23 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Mes
     let len = u32::from_be_bytes(len_buf);
 
     if len > MAX_MSG_BYTES {
+        warn_message_size(format_args!(
+            "refusing a {len}-byte message: over the {MAX_MSG_BYTES}-byte limit"
+        ));
         bail!("message too large: {len} bytes");
     }
 
-    let mut payload = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut payload)
+    // Grow the buffer as data arrives rather than trusting the length
+    // prefix: a peer can't make us allocate a whole message it never sends.
+    let mut payload = Vec::with_capacity((len as usize).min(64 * 1024));
+    (&mut *stream)
+        .take(u64::from(len))
+        .read_to_end(&mut payload)
         .await
         .context("read payload")?;
+    if payload.len() != len as usize {
+        bail!("read payload: connection closed after {} of {len} bytes", payload.len());
+    }
 
     let msg: Message = rmp_serde::from_slice(&payload).context("deserialize Message")?;
     Ok(msg)
@@ -87,10 +135,20 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Mes
 /// until it arrives the connection is idle (subscribers keep warm ones open
 /// until they need a tunnel), and at shutdown an idle one is just closed.
 pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, state: Arc<SharedState>) {
+    static LAST_LIMIT_WARNING: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let peer = stream.peer_cn().unwrap_or_default().to_string();
+    let Some(idle) = state.try_peer_slot("idle", &peer, MAX_IDLE_PER_PEER) else {
+        warn_rarely(
+            &LAST_LIMIT_WARNING,
+            format_args!("closing a connection from '{peer}' ({peer_addr}): it already holds {MAX_IDLE_PER_PEER} idle ones"),
+        );
+        return;
+    };
     let first = tokio::select! {
         result = recv_message(&mut stream) => result,
         _ = state.shutdown.cancelled() => return,
     };
+    drop(idle);
     let msg = match first {
         Ok(msg) => msg,
         Err(e) => {
@@ -148,6 +206,13 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
         }
         Message::MuxTunnel {} => {
             metrics::counter!("stouter_connections_total", "type" => "mux").increment(1);
+            let Some(_session) = state.try_peer_slot("mux", &peer, MAX_MUX_SESSIONS_PER_PEER) else {
+                warn_rarely(
+                    &LAST_LIMIT_WARNING,
+                    format_args!("refusing a mux session from '{peer}': it already holds {MAX_MUX_SESSIONS_PER_PEER}"),
+                );
+                return;
+            };
             crate::mux::handle_mux_session(stream, state).await;
         }
         Message::AdminRequest { op } => {
@@ -606,7 +671,7 @@ fn host_of(addr: &str) -> Option<&str> {
 
 /// Whether `addr` is a wildcard (`0.0.0.0:port`, `[::]:port`): what a node
 /// bound to all interfaces advertises if it has no `advertiseAddr`.
-fn is_wildcard(addr: &str) -> bool {
+pub(crate) fn is_wildcard(addr: &str) -> bool {
     addr.starts_with("0.0.0.0:") || addr.starts_with("[::]:")
 }
 
@@ -660,24 +725,12 @@ async fn print_dynamic_config(state: &Arc<SharedState>) {
     }
 }
 
-/// Persist dynamic config to disk.
+/// Persist `dc` to the config file.
 ///
-/// Loads the current config file first so that external changes to static
-/// fields (e.g. `bind`) are preserved.  The `known_nodes`
-/// list in the config file is left untouched — it contains bootstrap peer
-/// addresses, not the gossip-discovered member list.
-async fn persist_state(state: &Arc<SharedState>) {
-    // Hold the lock while writing: every change persists under the write
-    // lock, so this write can't land on top of a newer version's.
-    let dc = state.dynamic_config.read().await;
-    persist_state_with(state, &dc);
-}
-
-/// Same as `persist_state`, but accepts the dynamic config directly so the
-/// caller can persist while still holding a write lock on
-/// `state.dynamic_config` — `persist_state` itself takes a read lock and would
-/// deadlock under such a caller. Every change to `state.dynamic_config`
-/// persists this way before releasing the lock, which keeps the file written
+/// Loads the current file first so that external changes to static fields
+/// (e.g. `bind`) are preserved; its `knownNodes` (bootstrap peers, not the
+/// gossip-discovered members) is left untouched. Callers hold the
+/// `state.dynamic_config` lock (write, for a change), so the file is written
 /// in version order (the config poll loop relies on that).
 fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) {
     let mut cfg = match crate::config::Config::load(&state.config_path) {
@@ -725,7 +778,9 @@ async fn merge_sync(
     let own_id = state.config.node_id.as_str();
     let strict = state.config.require_signed_config;
     let now = Instant::now();
-    let nodes_changed = state.update_known_nodes(|kn| {
+    // Node info isn't persisted (the config file only holds bootstrap
+    // peers), so a change here writes nothing to disk.
+    state.update_known_nodes(|kn| {
         let mut changed = false;
         for mut node in nodes {
             if !is_valid_node_id(&node.id) {
@@ -819,10 +874,6 @@ async fn merge_sync(
         }
         changed
     }).await;
-
-    if nodes_changed {
-        persist_state(state).await;
-    }
 }
 
 /// Replace `dc` with `incoming` if it supersedes it and this node may adopt
@@ -1015,7 +1066,7 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&
                 return;
             }
             state.unbury(&id);
-            let changed = state.update_known_nodes(|kn| {
+            state.update_known_nodes(|kn| {
                 if let Some(existing) = kn.get_mut(&id) {
                     if existing.addr != addr {
                         info!("node {id} address updated: {} -> {addr}", existing.addr);
@@ -1034,9 +1085,6 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&
                     true
                 }
             }).await;
-            if changed {
-                persist_state(state).await;
-            }
         }
         Message::NodeLeave { id, heartbeat } => {
             if peer_cn != Some(id.as_str()) {
@@ -1696,5 +1744,59 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 1, "retried within about a minute");
         sync.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_and_truncated_messages_are_refused() {
+        // Too big to send.
+        let mut dc = named_services(&["api"]);
+        dc.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_MSG_BYTES as usize));
+        let (mut a, _b) = tokio::io::duplex(1 << 16);
+        let err = send_message(&mut a, &Message::ConfigUpdate { config: dc }).await.unwrap_err();
+        assert!(err.to_string().contains("too large to send"), "{err}");
+
+        // A length prefix over the limit, and one the peer never delivers.
+        for (len, sent, expect) in [(MAX_MSG_BYTES + 1, 0, "too large"), (1000, 10, "closed after 10 of 1000")] {
+            let (mut tx, mut rx) = tokio::io::duplex(1 << 16);
+            tx.write_all(&len.to_be_bytes()).await.unwrap();
+            tx.write_all(&vec![0u8; sent]).await.unwrap();
+            drop(tx);
+            let err = format!("{:#}", recv_message(&mut rx).await.unwrap_err());
+            assert!(err.contains(expect), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_pile_up_idle_connections() {
+        use crate::state::test_support::{mesh_pair, tls_state};
+        let dir = std::env::temp_dir().join(format!("stouter_idle_{}_{}", std::process::id(), rand::random::<u64>()));
+        let node = tls_state(&dir, "node");
+        let peer = tls_state(&dir, "peer");
+        let other = tls_state(&dir, "other");
+        let open = || async {
+            let (client, server) = mesh_pair(&peer, &node).await;
+            (client, tokio::spawn(dispatch_connection(server, "peer".into(), node.clone())))
+        };
+        let mut held = Vec::new();
+        for _ in 0..MAX_IDLE_PER_PEER {
+            held.push(open().await);
+        }
+        tokio::task::yield_now().await;
+        let (_extra_client, extra) = open().await;
+        tokio::time::timeout(Duration::from_secs(5), extra).await.expect("closed at once").unwrap();
+        assert!(held.iter().all(|(_, task)| !task.is_finished()), "the first ones still wait");
+
+        // Another peer isn't affected, and closing one frees a place.
+        let (_c, other_task) = {
+            let (client, server) = mesh_pair(&other, &node).await;
+            (client, tokio::spawn(dispatch_connection(server, "other".into(), node.clone())))
+        };
+        let (client, task) = held.pop().unwrap();
+        drop(client);
+        task.await.unwrap();
+        let (_again_client, again) = open().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!again.is_finished() && !other_task.is_finished());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

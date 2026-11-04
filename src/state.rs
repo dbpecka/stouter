@@ -43,6 +43,41 @@ pub const RECONNECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// consumed by tunnels and replaced, so the count dips during bursts).
 const RELAY_GRACE: Duration = Duration::from_secs(30);
 
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// This process's incarnation: one above the previous process's (kept in
+/// `{config_path}.state`) and no lower than the current Unix time in
+/// seconds, which also puts it above heartbeats from versions that used the
+/// wall clock directly, or from before the state file existed. Saved back
+/// for the next start. If it can't be saved (a read-only directory), the
+/// clock alone orders restarts, as before.
+pub fn incarnation_for(config_path: &str) -> u64 {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct NodeStateFile {
+        incarnation: u64,
+    }
+    let path = format!("{config_path}.state");
+    let stored = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<NodeStateFile>(&text).ok())
+        .map_or(0, |state| state.incarnation);
+    let incarnation = stored.saturating_add(1).max(unix_seconds());
+    let saved = serde_json::to_vec(&NodeStateFile { incarnation })
+        .map_err(std::io::Error::other)
+        .and_then(|json| crate::config::write_atomic(std::path::Path::new(&path), &json));
+    if let Err(e) = saved {
+        tracing::info!(
+            "cannot save {path} ({e}): if this node restarts with its clock set back, peers may ignore it until the clock catches up"
+        );
+    }
+    incarnation
+}
+
 /// Whether `node` was confirmed reachable recently enough to route to.
 pub fn node_is_live(node: &NodeInfo, now: std::time::Instant) -> bool {
     node.last_seen.is_some_and(|seen| now.saturating_duration_since(seen) <= NODE_STALE_AFTER)
@@ -321,8 +356,11 @@ pub struct SharedState {
     pub in_flight: Arc<InFlightTracker>,
     /// Span exporter, set at daemon start when `tracing` is configured.
     pub tracer: std::sync::OnceLock<Arc<crate::telemetry::Tracer>>,
-    /// The last heartbeat this node gossiped about itself.
+    /// Heartbeats issued by this process (the low half of each).
     heartbeat: AtomicU64,
+    /// This process's incarnation, the high half of each heartbeat. Set at
+    /// daemon start from [`incarnation_for`]; the clock if never set.
+    pub incarnation: std::sync::OnceLock<u64>,
     /// Nodes that left or were forgotten, by id.
     departed: Mutex<HashMap<String, Tombstone>>,
     /// Version of the last config refused for lacking a valid signature, so
@@ -338,6 +376,27 @@ pub struct SharedState {
     forgotten: Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// The record this node last gossiped about itself, reused while fresh.
     pub(crate) own_record: Mutex<Option<OwnRecord>>,
+    /// Open connections per (kind, peer CN), for the per-peer limits.
+    peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
+}
+
+/// One of a peer's limited connections (see [`SharedState::try_peer_slot`]);
+/// frees its place when dropped.
+pub struct PeerSlot {
+    state: Arc<SharedState>,
+    key: (&'static str, String),
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut slots = self.state.peer_slots.lock().unwrap();
+        if let Some(count) = slots.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                slots.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// This node's last record (see `gossip::snapshot_nodes`): its content, the
@@ -378,12 +437,14 @@ impl SharedState {
             in_flight: InFlightTracker::new(),
             tracer: std::sync::OnceLock::new(),
             heartbeat: AtomicU64::new(0),
+            incarnation: std::sync::OnceLock::new(),
             departed: Mutex::new(HashMap::new()),
             rejected_config_version: AtomicU64::new(0),
             signer: std::sync::OnceLock::new(),
             relays: Mutex::new(HashMap::new()),
             forgotten: Mutex::new(HashMap::new()),
             own_record: Mutex::new(None),
+            peer_slots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -470,21 +531,16 @@ impl SharedState {
             .is_some_and(|n| n.health.is_unhealthy(service_name))
     }
 
-    /// Advance and return this node's own heartbeat: wall-clock
-    /// milliseconds, kept strictly increasing, so it also orders above the
-    /// heartbeats gossiped before a restart.
+    /// Advance and return this node's own heartbeat: this process's
+    /// incarnation in the high 32 bits, a counter in the low 32. Every
+    /// process's incarnation is above the previous one's (it is persisted;
+    /// see [`incarnation_for`]), so a restarted node's heartbeats outrank
+    /// the ones it gossiped before whatever the clock did meanwhile. Also
+    /// orders health reports.
     pub fn next_heartbeat(&self) -> u64 {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let prev = self.heartbeat.fetch_max(now_ms, Ordering::SeqCst);
-        if prev >= now_ms {
-            // Same millisecond (or a clock step back): step past the last one.
-            self.heartbeat.fetch_add(1, Ordering::SeqCst) + 1
-        } else {
-            now_ms
-        }
+        let incarnation = *self.incarnation.get_or_init(unix_seconds);
+        let counter = self.heartbeat.fetch_add(1, Ordering::SeqCst) + 1;
+        (incarnation << 32) | (counter & 0xFFFF_FFFF)
     }
 
     /// Remember that `id` departed with heartbeat `heartbeat`.
@@ -532,6 +588,19 @@ impl SharedState {
         let mut forgotten = self.forgotten.lock().unwrap();
         forgotten.retain(|_, (_, at)| at.elapsed() < RECONNECT_FOR);
         forgotten.values().map(|(addr, _)| addr.clone()).collect()
+    }
+
+    /// Take one of `peer`'s at most `limit` connections of `kind`, or `None`
+    /// if it already holds them all.
+    pub fn try_peer_slot(self: &Arc<Self>, kind: &'static str, peer: &str, limit: usize) -> Option<PeerSlot> {
+        let key = (kind, peer.to_string());
+        let mut slots = self.peer_slots.lock().unwrap();
+        let count = slots.entry(key.clone()).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot { state: Arc::clone(self), key })
     }
 
     /// Note a reverse connection registered with `relay` (a node id); the
@@ -730,6 +799,32 @@ mod tests {
         // Connect and handshake each get CONNECT_TIMEOUT. (Paused time also
         // advances while real socket I/O is in flight, so no exact value.)
         assert!(start.elapsed() <= 2 * CONNECT_TIMEOUT, "{:?}", start.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_outranks_earlier_heartbeats_even_with_the_clock_set_back() {
+        let dir = std::env::temp_dir().join(format!("stouter_incarnation_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("stouter.json").to_str().unwrap().to_string();
+        // The previous process ran with the clock a long way ahead; now it's
+        // been set back.
+        let ahead = unix_seconds() + 1_000_000;
+        std::fs::write(format!("{config}.state"), format!(r#"{{"incarnation":{ahead}}}"#)).unwrap();
+        let last_before_restart = (ahead << 32) | 0xFFFF_FFFF;
+
+        let state = SharedState::new(Config::default(), config.clone(), CancellationToken::new(), None);
+        state.incarnation.set(incarnation_for(&config)).unwrap();
+        let first = state.next_heartbeat();
+        assert!(first > last_before_restart);
+        assert!(state.next_heartbeat() > first);
+        // Saved for the next start.
+        assert_eq!(incarnation_for(&config), ahead + 2);
+
+        // Also above the wall-clock-millisecond heartbeats of older versions.
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let fresh = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
+        assert!(fresh.next_heartbeat() > now_ms);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

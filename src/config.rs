@@ -263,6 +263,10 @@ impl SubscribeFilter {
     }
 }
 
+/// Largest encoded config (signature included) accepted as a change: a
+/// quarter of a gossip message, leaving the rest for the node list.
+pub const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+
 /// Versioned, gossip-replicated configuration shared across the cluster.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -448,6 +452,16 @@ impl DynamicConfig {
                 }
                 Ok(None) => {}
             }
+        }
+
+        // It must fit in the gossip messages that carry it (with room for
+        // the node list), or it would never reach the rest of the cluster.
+        let size = rmp_serde::to_vec_named(self).map_or(usize::MAX, |bytes| bytes.len());
+        if size > MAX_CONFIG_BYTES {
+            report(format!(
+                "the config is too large to gossip: {size} bytes encoded, limit {MAX_CONFIG_BYTES} \
+                 (a signed config counts its signed copy too)"
+            ));
         }
         problems
     }
@@ -635,10 +649,10 @@ pub struct NodeInfo {
     /// Health of the services this node hosts, as reported by the node itself.
     #[serde(default, skip_serializing_if = "ServiceHealth::is_unset")]
     pub health: ServiceHealth,
-    /// Liveness counter only the node itself advances (wall-clock
-    /// milliseconds, every gossip round), relayed by everyone else. A rising
-    /// value proves the node is alive even to peers that can't reach it. `0`:
-    /// a node too old to send one.
+    /// Liveness counter only the node itself advances (its incarnation, then
+    /// a counter; see `SharedState::next_heartbeat`), relayed by everyone
+    /// else. A rising value proves the node is alive even to peers that
+    /// can't reach it. `0`: a node too old to send one.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub heartbeat: u64,
     /// Local-only: when we last had any evidence the node is alive (direct
@@ -692,8 +706,8 @@ pub struct SignedNode {
 ///
 /// Only the hosting node writes this; everyone else relays it through gossip.
 /// `version` orders reports so a relayed copy never overwrites a fresher one.
-/// It is derived from wall-clock milliseconds, so a restarted node's reports
-/// still supersede the ones peers held from before the restart.
+/// It is ordered like heartbeats, so a restarted node's reports still
+/// supersede the ones peers held from before the restart.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceHealth {
@@ -892,6 +906,13 @@ impl Config {
             tracing.validate().map_err(|e| anyhow!(e))?;
         }
 
+        if usize::from(self.reverse_pool_size.unwrap_or(0)) > crate::node::relay::MAX_IDLE_REVERSE_PER_NODE {
+            return Err(anyhow!(
+                "reversePoolSize may be at most {}: relays refuse more idle reverse connections from one node",
+                crate::node::relay::MAX_IDLE_REVERSE_PER_NODE
+            ));
+        }
+
         if self.require_signed_config && self.admin_cns.is_empty() {
             return Err(anyhow!(
                 "`requireSignedConfig` needs `adminCns`: without an admin, no change could ever be signed"
@@ -980,7 +1001,7 @@ impl Config {
 /// Falls back to writing in place (not atomic, as before) where a rename
 /// can't work: the directory isn't writable, or `path` is itself a mount
 /// point, as with a single-file `docker run -v stouter.json:...` bind mount.
-fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::ErrorKind;
 
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -1857,5 +1878,19 @@ mod tests {
         cfg.validate().unwrap();
         // Off by default, and omitted from JSON unless on.
         assert!(!serde_json::to_string(&Config::default()).unwrap().contains("requireSignedConfig"));
+    }
+
+    #[test]
+    fn configs_too_large_to_gossip_and_oversized_pools_are_refused() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service("g", instance("api", "n1", &[]));
+        assert!(dc.problems().is_empty());
+        let mut huge = dc.clone();
+        huge.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_CONFIG_BYTES));
+        let problem = new_problem(&dc, &huge).expect("refused");
+        assert!(problem.contains("too large to gossip"), "{problem}");
+
+        let cfg = Config { reverse_pool_size: Some(5000), ..Config::default() };
+        assert!(cfg.validate().unwrap_err().to_string().contains("reversePoolSize"));
     }
 }
