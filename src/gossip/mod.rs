@@ -194,7 +194,7 @@ async fn handle_admin_request(
     op: messages::AdminOp,
     state: Arc<SharedState>,
 ) {
-    use crate::config::{Mode, MutateErr, Service};
+    use crate::config::{Mode, MutateErr};
     use messages::{AdminErrCode, AdminOp, AdminResult, Message as Msg};
 
     // Authorization: peer's TLS CN must be in the configured allowlist.
@@ -235,58 +235,27 @@ async fn handle_admin_request(
     // other writer can see the in-memory state.
     let outcome: Result<(u64, crate::config::DynamicConfig), MutateErr> = {
         let mut dc = state.dynamic_config.write().await;
-        // Mutate a copy, so a refused change leaves nothing behind.
-        let mut next = dc.clone();
         let result = match op {
-            AdminOp::ServiceAdd {
-                group,
-                name,
-                owner_node_id,
-                port,
-                domains,
-                weight,
-                max_connections,
-                protocol,
-                request_timeout_ms,
-                health_path,
-                labels,
-                meta,
-                local_port,
-            } => {
-                let svc = Service {
-                    name,
-                    node_id: owner_node_id,
-                    node_port: port,
-                    domains,
-                    weight,
-                    max_connections,
-                    protocol,
-                    request_timeout_ms,
-                    health_path,
-                    labels,
-                    meta,
-                    local_port,
-                };
-                Ok(next.upsert_service(&group, svc))
-            }
-            AdminOp::RoutesSet { service, routes } => next.set_routes(&service, routes),
-            AdminOp::ServiceRename { group, owner_node_id, from, to } => {
-                next.rename_service(&group, &owner_node_id, &from, &to)
-            }
-            AdminOp::ServiceRemove { group, owner_node_id, name } => {
-                next.remove_service(&group, &owner_node_id, &name)
+            AdminOp::ConfigPush { config, base_version } => accept_push(&state, &dc, config, base_version),
+            _ if state.config.require_signed_config => Err(MutateErr::Unauthorized(
+                "this node accepts only signed config changes (requireSignedConfig): make the change \
+                 with a stouter CLI that signs it, using an admin certificate"
+                    .into(),
+            )),
+            op => {
+                // Mutate a copy, so a refused change leaves nothing behind.
+                let mut next = dc.clone();
+                op.apply(&mut next).and_then(|_| check_change(&dc, next)).map(|mut next| {
+                    next.changed_by = state.config.node_id.clone();
+                    // An edit invalidates any signature the config carried.
+                    next.signature = None;
+                    next
+                })
             }
         };
-        // Refuse a change that breaks the config (a domain claimed twice,
-        // routes left pointing at a removed or renamed service, ...), but
-        // not one made while it already had an unrelated problem.
-        let result = result.and_then(|version| match crate::config::new_problem(&dc, &next) {
-            Some(problem) => Err(MutateErr::Invalid(problem)),
-            None => Ok(version),
-        });
         match result {
-            Ok(new_version) => {
-                next.changed_by = state.config.node_id.clone();
+            Ok(next) => {
+                let new_version = next.version;
                 *dc = next;
                 persist_state_with(&state, &dc);
                 Ok((new_version, dc.clone()))
@@ -301,22 +270,57 @@ async fn handle_admin_request(
             broadcast_message(&state, Msg::ConfigUpdate { config: new_dc }).await;
             Msg::AdminResponse { result: AdminResult::Ok { new_version } }
         }
-        Err(err) => {
-            let code = match err {
-                MutateErr::GroupNotFound { .. } | MutateErr::ServiceNotFound { .. } => {
-                    AdminErrCode::NotFound
-                }
-                MutateErr::DuplicateService { .. } | MutateErr::Invalid(_) => AdminErrCode::Validation,
-            };
-            Msg::AdminResponse {
-                result: AdminResult::Err { code, message: err.to_string() },
-            }
-        }
+        Err(err) => Msg::AdminResponse {
+            result: AdminResult::Err { code: AdminErrCode::from(&err), message: err.to_string() },
+        },
     };
 
     if let Err(e) = send_message(&mut stream, &response).await {
         debug!("admin: failed to send response: {e}");
     }
+}
+
+/// `next` if changing `current` into it introduces no config problem (a
+/// domain claimed twice, routes left on a removed service, ...); problems
+/// `current` already had don't count.
+fn check_change(
+    current: &crate::config::DynamicConfig,
+    next: crate::config::DynamicConfig,
+) -> Result<crate::config::DynamicConfig, crate::config::MutateErr> {
+    match crate::config::new_problem(current, &next) {
+        Some(problem) => Err(crate::config::MutateErr::Invalid(problem)),
+        None => Ok(next),
+    }
+}
+
+/// The config to adopt for a pushed one: it must be signed by an admin, made
+/// to the version we're at (else `Conflict`, and the CLI retries), and not
+/// break the config. It is adopted exactly as signed.
+fn accept_push(
+    state: &SharedState,
+    current: &crate::config::DynamicConfig,
+    pushed: crate::config::DynamicConfig,
+    base_version: u64,
+) -> Result<crate::config::DynamicConfig, crate::config::MutateErr> {
+    use crate::config::MutateErr;
+    let tls = state
+        .tls
+        .as_deref()
+        .ok_or_else(|| MutateErr::Unauthorized("no TLS context to check signatures with".into()))?;
+    let (verified, signer) = crate::signing::verify(&pushed, tls, &state.config.admin_cns)
+        .map_err(|e| MutateErr::Unauthorized(format!("{e:#}")))?;
+    if current.version != base_version {
+        return Err(MutateErr::Conflict { current: current.version });
+    }
+    if verified.version <= current.version {
+        return Err(MutateErr::Invalid(format!(
+            "pushed config version {} is not above the current version {}",
+            verified.version, current.version
+        )));
+    }
+    let verified = check_change(current, verified)?;
+    info!("accepting config version {} signed by {signer}", verified.version);
+    Ok(verified)
 }
 
 async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) {
@@ -326,6 +330,7 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
         bind: state.config.bind.clone(),
         dynamic_config: state.dynamic_config.read().await.clone(),
         known_nodes: snapshot_nodes(&state),
+        require_signed_config: state.config.require_signed_config,
     };
 
     if let Err(e) = send_message(&mut stream, &response).await {
@@ -352,6 +357,8 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
     // The (file, memory) versions last warned about, so a file stuck behind
     // memory is reported once per change rather than on every poll.
     let mut warned_stale: Option<(u64, u64)> = None;
+    // The unsigned file content last warned about (requireSignedConfig).
+    let mut warned_unsigned: Option<String> = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
@@ -374,6 +381,43 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 "config poll: file version={}, in-memory version={}",
                 file_dc.version, current_version
             );
+
+            if state.config.require_signed_config {
+                // Only an admin-signed config counts: the CLI's local path
+                // writes one, a hand edit can't. It is adopted exactly as
+                // signed (no version bump, no changedBy).
+                let content = |c: &crate::config::DynamicConfig| (c.service_groups.clone(), c.routes.clone());
+                match crate::signing::admit(&state, file_dc.clone()) {
+                    Ok(signed) if signed.supersedes(&dc) => {
+                        info!("config file has a newer signed config: version {} -> {}", current_version, signed.version);
+                        *dc = signed.clone();
+                        persist_state_with(&state, &dc);
+                        drop(dc);
+                        state.rebuild_service_index().await;
+                        print_dynamic_config(&state).await;
+                        broadcast_message(&state, Message::ConfigUpdate { config: signed }).await;
+                        continue;
+                    }
+                    verdict => {
+                        // Edited by hand: unsigned, or a signature that
+                        // covers something else than the file now says.
+                        let edited = match &verdict {
+                            Ok(signed) => content(signed) != content(&file_dc),
+                            Err(_) => content(&file_dc) != content(&dc),
+                        };
+                        let key = serde_json::to_string(&content(&file_dc)).unwrap_or_default();
+                        if edited && warned_unsigned.as_ref() != Some(&key) {
+                            warn!(
+                                "ignoring the edit to {}: this node accepts only signed config changes \
+                                 (requireSignedConfig); push it with `stouter config push` using an admin certificate",
+                                state.config_path
+                            );
+                            warned_unsigned = Some(key);
+                        }
+                        continue;
+                    }
+                }
+            }
 
             let mut new_dc = if file_dc.version > current_version {
                 info!(
@@ -408,8 +452,9 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             if new_dc.version <= current_version {
                 new_dc.version = current_version + 1;
             }
-            // The change entered the cluster here.
+            // The change entered the cluster here, unsigned.
             new_dc.changed_by = state.config.node_id.clone();
+            new_dc.signature = None;
             *dc = new_dc.clone();
             persist_state_with(&state, &dc);
             new_dc
@@ -637,14 +682,7 @@ async fn merge_sync(
 ) {
     let updated = {
         let mut dc = state.dynamic_config.write().await;
-        if config.supersedes(&dc) {
-            log_adoption(&dc, &config, "dynamic config updated");
-            *dc = config;
-            persist_state_with(state, &dc);
-            true
-        } else {
-            false
-        }
+        adopt_if_newer(state, &mut dc, config, "dynamic config updated")
     };
 
     if updated {
@@ -730,6 +768,35 @@ async fn merge_sync(
     }
 }
 
+/// Replace `dc` with `incoming` if it supersedes it and this node may adopt
+/// it (with `requireSignedConfig`, only an admin-signed config, adopted as
+/// signed). Persists under the caller's lock. Returns whether it was adopted.
+fn adopt_if_newer(
+    state: &Arc<SharedState>,
+    dc: &mut crate::config::DynamicConfig,
+    incoming: crate::config::DynamicConfig,
+    what: &str,
+) -> bool {
+    if !incoming.supersedes(dc) {
+        return false;
+    }
+    let version = incoming.version;
+    match crate::signing::admit(state, incoming) {
+        // The signed text decides; the envelope around it may claim more.
+        Ok(config) if config.supersedes(dc) => {
+            log_adoption(dc, &config, what);
+            *dc = config;
+            persist_state_with(state, dc);
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            crate::signing::log_refusal(state, version, &e);
+            false
+        }
+    }
+}
+
 /// Log that `incoming` is replacing `current`.
 fn log_adoption(current: &crate::config::DynamicConfig, incoming: &crate::config::DynamicConfig, what: &str) {
     if incoming.version == current.version {
@@ -764,14 +831,7 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&
         Message::ConfigUpdate { config } => {
             let updated = {
                 let mut dc = state.dynamic_config.write().await;
-                if config.supersedes(&dc) {
-                    log_adoption(&dc, &config, "config update received");
-                    *dc = config;
-                    persist_state_with(state, &dc);
-                    true
-                } else {
-                    false
-                }
+                adopt_if_newer(state, &mut dc, config, "config update received")
             };
             if updated {
                 state.rebuild_service_index().await;
@@ -1204,5 +1264,112 @@ mod tests {
         }
         assert_eq!(node.dynamic_config.read().await.changed_by, "n1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node with `requireSignedConfig` (admin: "admin"), its config file,
+    /// and TLS material for "admin" and "mallory" from the same CA.
+    struct SignedCluster {
+        dir: std::path::PathBuf,
+        path: String,
+        node: Arc<SharedState>,
+        admin: crate::pki::PkiMaterial,
+        mallory: crate::pki::PkiMaterial,
+    }
+
+    impl Drop for SignedCluster {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn signed_cluster() -> SignedCluster {
+        let dir = std::env::temp_dir().join(format!("stouter_signed_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.json").to_str().unwrap().to_string();
+        let cfg = Config {
+            node_id: "n1".into(),
+            admin_cns: vec!["admin".into()],
+            require_signed_config: true,
+            dynamic_config: DynamicConfig { version: 1, ..named_services(&["api"]) },
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let node = crate::state::test_support::tls_state_with(&dir, cfg, path.clone());
+        let material = |id: &str| crate::pki::load_or_create(dir.to_str().unwrap(), id).unwrap();
+        SignedCluster { admin: material("admin"), mallory: material("mallory"), node, path, dir }
+    }
+
+    fn signed_by(m: &crate::pki::PkiMaterial, dc: &DynamicConfig) -> DynamicConfig {
+        crate::signing::sign(dc, &m.node_cert_der, &m.node_key).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_signing_node_adopts_only_admin_signed_gossip() {
+        let c = signed_cluster();
+        let v2 = DynamicConfig { version: 2, ..named_services(&["api", "new"]) };
+        for refused in [v2.clone(), signed_by(&c.mallory, &v2)] {
+            apply_message(&c.node, Message::ConfigUpdate { config: refused }, None).await;
+            assert_eq!(c.node.dynamic_config.read().await.version, 1);
+        }
+        apply_message(&c.node, Message::ConfigUpdate { config: signed_by(&c.admin, &v2) }, None).await;
+        let dc = c.node.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, service_names(&dc)), (2, vec!["api".into(), "new".into()]));
+        assert!(dc.signature.is_some(), "kept, to relay");
+        // Persisted with its signature, so it survives a restart.
+        assert_eq!(Config::load(&c.path).unwrap().dynamic_config, dc);
+    }
+
+    #[tokio::test]
+    async fn a_signing_node_takes_only_signed_pushes_on_its_current_version() {
+        use crate::state::test_support::{mesh_pair, tls_state};
+        let c = signed_cluster();
+        let admin_client = tls_state(&c.dir, "admin");
+        let rpc = |op: messages::AdminOp| {
+            let (node, admin) = (c.node.clone(), admin_client.clone());
+            async move {
+                let (mut client, server) = mesh_pair(&admin, &node).await;
+                tokio::spawn(handle_admin_request(server, op, node.clone()));
+                match recv_message(&mut client).await.unwrap() {
+                    Message::AdminResponse { result: messages::AdminResult::Err { code, .. } } => Err(code),
+                    Message::AdminResponse { result: messages::AdminResult::Ok { new_version } } => Ok(new_version),
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        use messages::{AdminErrCode, AdminOp};
+        let remove = AdminOp::ServiceRemove { group: "g".into(), owner_node_id: "n1".into(), name: "api".into() };
+        assert_eq!(rpc(remove).await, Err(AdminErrCode::Unauthorized), "an unsigned edit");
+
+        let v2 = DynamicConfig { version: 2, changed_by: "admin".into(), ..named_services(&[]) };
+        let push = |config, base_version| AdminOp::ConfigPush { config, base_version };
+        assert_eq!(rpc(push(signed_by(&c.mallory, &v2), 1)).await, Err(AdminErrCode::Unauthorized));
+        assert_eq!(rpc(push(signed_by(&c.admin, &v2), 0)).await, Err(AdminErrCode::Conflict), "made to an old version");
+        assert_eq!(rpc(push(signed_by(&c.admin, &v2), 1)).await, Ok(2));
+        let dc = c.node.dynamic_config.read().await.clone();
+        assert_eq!(dc.version, 2);
+        assert_eq!(dc.changed_by, "admin", "adopted exactly as signed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_signing_node_ignores_hand_edits_but_takes_signed_files() {
+        let c = signed_cluster();
+        let poll = |node: Arc<SharedState>| async move {
+            let task = tokio::spawn(run_config_poll_loop(node));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            task.abort();
+        };
+        // A hand edit at a higher version: still unsigned, so ignored.
+        let mut file = Config::load(&c.path).unwrap();
+        file.dynamic_config = DynamicConfig { version: 5, ..named_services(&["hand-edited"]) };
+        file.save(&c.path).unwrap();
+        poll(c.node.clone()).await;
+        assert_eq!(c.node.dynamic_config.read().await.version, 1);
+
+        // What the CLI's local path writes: a signed config. Adopted.
+        file.dynamic_config = signed_by(&c.admin, &DynamicConfig { version: 6, ..named_services(&["signed"]) });
+        file.save(&c.path).unwrap();
+        poll(c.node.clone()).await;
+        let dc = c.node.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, service_names(&dc)), (6, vec!["signed".into()]));
     }
 }

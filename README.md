@@ -62,6 +62,7 @@ Create a `stouter.json` file:
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
 | `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default) disables admin RPC |
 | `apiPort` | Subscribe-mode REST API port on `127.0.0.1` (default 5381). Set per-cluster when running multiple instances on one host. |
+| `requireSignedConfig` | Accept a config change only if a certificate in `adminCns` signed it (see [Signed config changes](#signed-config-changes)). Default `false`. |
 
 ### Modes
 
@@ -94,6 +95,9 @@ stouter service list
 
 # Issue a signed node certificate (run on the CA node)
 stouter cert issue --node host2 --out /path/to/certs
+
+# Sign the dynamic config in the local file and push it (hand edits, with requireSignedConfig)
+stouter --cert-dir /path/to/admin-certs config push --remote host1:8080
 ```
 
 ### Registering Services
@@ -404,6 +408,32 @@ To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessi
 - A node's identity is its certificate's CN, which must match its `nodeId`: tunnel, pool and mux connections to a known node check that the server's certificate names that node, a relay accepts reverse registrations for X only from X, and only X may announce X joining or leaving.
 - Certificates are valid from the day they are issued (backdated a day for clock skew): 20 years for a new CA, 10 years for a node certificate, never past the CA's own expiry.
 - Tunnel requests include a millisecond timestamp. The receiving node rejects requests with clock skew greater than ±30 seconds, providing basic replay protection.
+
+### Signed config changes
+
+Gossip carries the cluster's config through every node, and by default any
+node with a cluster certificate can replace it. `adminCns` only guards the
+admin RPC. With `"requireSignedConfig": true`, a node accepts a config change
+(from gossip, an admin RPC, or its own config file) only if it was signed by a
+certificate from the cluster CA whose CN is in that node's `adminCns`. The
+signature covers the exact JSON text of the config, which travels with it, so
+any node can relay a signed config but none can alter it.
+
+- `stouter service add|rename|remove` and `stouter route set|clear` with
+  `--remote` notice the flag in the daemon's status, make the change
+  themselves, sign it with the certificate from `--cert-dir`, and push it
+  (re-reading and retrying if the config changed meanwhile). Without
+  `--remote`, they sign the change written to the local file.
+- Editing a config file by hand no longer changes anything: the node logs a
+  warning. Apply the edit with
+  `stouter --cert-dir <admin certs> config push [--remote host:port]`.
+- Issue the admin certificate with `stouter cert issue --node <admin CN>` and
+  list that CN in `adminCns` on every node.
+
+Turn it on everywhere at once, once every node runs a version that supports
+it. Older nodes don't relay the signature, and a node without the flag still
+adopts unsigned changes. Until an admin pushes a first signed change, nodes
+keep the config they have (and warn at startup that it isn't signed).
 
 ### Shared State
 

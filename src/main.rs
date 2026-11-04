@@ -6,6 +6,7 @@ mod metrics;
 mod mux;
 mod node;
 mod pki;
+mod signing;
 mod state;
 mod subscribe;
 mod telemetry;
@@ -65,6 +66,24 @@ enum Commands {
     Cert {
         #[command(subcommand)]
         action: CertAction,
+    },
+    /// Manage the cluster's dynamic config as a whole
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Sign the dynamic config in the local config file with your (admin)
+    /// certificate and push it to a daemon, replacing the cluster's. How to
+    /// apply a hand edit where `requireSignedConfig` is on.
+    Push {
+        /// Address `host:port` of the daemon to push to (defaults to this
+        /// host's daemon).
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -263,6 +282,15 @@ async fn main() -> Result<()> {
             let tls_ctx = tls::TlsContext::new(&material)?;
 
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
+            if cfg.require_signed_config {
+                cfg.validate().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
+                if let Err(e) = signing::admit(&state, cfg.dynamic_config.clone()) {
+                    tracing::warn!(
+                        "starting with a config that isn't admin-signed ({e:#}); peers requiring signatures \
+                         won't accept it until an admin pushes a signed change"
+                    );
+                }
+            }
 
             if let Some(tracing_cfg) = &cfg.tracing {
                 tracing_cfg.validate().map_err(anyhow::Error::msg)?;
@@ -361,8 +389,13 @@ async fn main() -> Result<()> {
 
                     match msg {
                         Message::StatusResponse {
-                            mode, node_id, bind, dynamic_config, known_nodes,
-                        } => print_status(&mode, &node_id, &bind, &dynamic_config, &known_nodes),
+                            mode, node_id, bind, dynamic_config, known_nodes, require_signed_config,
+                        } => {
+                            print_status(&mode, &node_id, &bind, &dynamic_config, &known_nodes);
+                            if require_signed_config {
+                                println!("\nConfig changes must be signed by an admin (requireSignedConfig).");
+                            }
+                        }
                         _ => println!("Unexpected response from daemon"),
                     }
                 }
@@ -445,7 +478,7 @@ async fn main() -> Result<()> {
                 };
                 let before = cfg.dynamic_config.clone();
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
-                save_local_change(&mut cfg, &before, &cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
                     let material = pki::load_or_create(dir, &cfg.node_id)?;
@@ -550,7 +583,7 @@ async fn main() -> Result<()> {
                     .dynamic_config
                     .rename_service(&group_name, &node_id, &from, &to)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                save_local_change(&mut cfg, &before, &cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
                     let material = pki::load_or_create(dir, &cfg.node_id)?;
@@ -611,7 +644,7 @@ async fn main() -> Result<()> {
                     .dynamic_config
                     .remove_service(&group_name, &node_id, &name)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                save_local_change(&mut cfg, &before, &cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
                     let material = pki::load_or_create(dir, &cfg.node_id)?;
@@ -664,7 +697,7 @@ async fn main() -> Result<()> {
                     .dynamic_config
                     .set_routes(&service, routes)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                save_local_change(&mut cfg, &before, &cli.config)?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
                 broadcast_config(&cfg, &cli.config).await?;
                 version
             };
@@ -824,6 +857,39 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
+        // config push
+        // -----------------------------------------------------------------
+        Some(Commands::Config {
+            action: ConfigAction::Push { remote },
+        }) => {
+            let cfg = Config::load(&cli.config)?;
+            let target = remote.unwrap_or_else(|| cfg.local_target());
+            let material = load_cli_material(&cfg, cli.cert_dir.as_deref())?;
+            let tls_ctx = tls::TlsContext::new(&material)?;
+            let mut desired = cfg.dynamic_config.clone();
+            desired.signature = None;
+            let mut pushed = None;
+            for attempt in 1..=PUSH_ATTEMPTS {
+                let current = fetch_daemon_config(&target, &tls_ctx).await?.dynamic_config;
+                let next = config::DynamicConfig { version: current.version + 1, ..desired.clone() };
+                if let Some(problem) = config::new_problem(&current, &next) {
+                    anyhow::bail!("{problem}");
+                }
+                let push = signed_push(next, current.version, &material)?;
+                match send_admin(&target, &tls_ctx, push).await? {
+                    Ok(version) => {
+                        pushed = Some(version);
+                        break;
+                    }
+                    Err((AdminErrCode::Conflict, _)) if attempt < PUSH_ATTEMPTS => continue,
+                    Err((_, message)) => anyhow::bail!("push to {target} failed: {message}"),
+                }
+            }
+            let version = pushed.expect("the last attempt breaks or bails");
+            println!("Pushed the config in {} to {target} (version {version})", cli.config);
+        }
+
+        // -----------------------------------------------------------------
         // cert issue
         // -----------------------------------------------------------------
         Some(Commands::Cert {
@@ -914,40 +980,112 @@ async fn graceful_drain(state: std::sync::Arc<SharedState>) {
 
 /// Build a `TlsContext` for an outbound CLI connection, preferring an
 /// explicit `--cert-dir` over the local config's `tlsDir`.
-fn build_cli_tls(cfg: &Config, cert_dir: Option<&str>) -> Result<tls::TlsContext> {
+/// The CLI's own TLS identity: from `--cert-dir`, else the local config's
+/// `tlsDir`. Also what it signs config changes with.
+fn load_cli_material(cfg: &Config, cert_dir: Option<&str>) -> Result<pki::PkiMaterial> {
     let dir = cert_dir
         .or(cfg.tls_dir.as_deref())
         .ok_or_else(|| anyhow::anyhow!(
             "TLS material not available: pass --cert-dir or set tlsDir in the local config"
         ))?;
     let node_id = if cfg.node_id.is_empty() { "stouter-cli" } else { cfg.node_id.as_str() };
-    let material = pki::load_or_create(dir, node_id)?;
-    tls::TlsContext::new(&material)
+    pki::load_or_create(dir, node_id)
 }
 
-/// Send a single `AdminRequest` to `target` and decode the response.
-/// Returns the typed admin result; transport-level failures bubble up as
-/// `anyhow::Error`.
+/// Build a `TlsContext` for an outbound CLI connection, preferring an
+/// explicit `--cert-dir` over the local config's `tlsDir`.
+fn build_cli_tls(cfg: &Config, cert_dir: Option<&str>) -> Result<tls::TlsContext> {
+    tls::TlsContext::new(&load_cli_material(cfg, cert_dir)?)
+}
+
+/// Open an mTLS connection to a daemon, giving up after `CONNECT_TIMEOUT`.
+async fn connect_daemon(target: &str, tls_ctx: &tls::TlsContext) -> Result<tls::MeshStream> {
+    tokio::time::timeout(state::CONNECT_TIMEOUT, async {
+        let tcp = tokio::net::TcpStream::connect(target)
+            .await
+            .with_context(|| format!("connect to {target}"))?;
+        tls_ctx.connect(tcp).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("connect to {target} timed out"))?
+}
+
+/// What a daemon's `StatusRequest` says about its config.
+struct DaemonConfig {
+    dynamic_config: config::DynamicConfig,
+    require_signed_config: bool,
+}
+
+async fn fetch_daemon_config(target: &str, tls_ctx: &tls::TlsContext) -> Result<DaemonConfig> {
+    let mut stream = connect_daemon(target, tls_ctx).await?;
+    gossip::send_message(&mut stream, &Message::StatusRequest).await?;
+    match gossip::recv_message(&mut stream).await? {
+        Message::StatusResponse { dynamic_config, require_signed_config, .. } => {
+            Ok(DaemonConfig { dynamic_config, require_signed_config })
+        }
+        _ => anyhow::bail!("unexpected response from {target}"),
+    }
+}
+
+/// Send one `AdminRequest` and decode the typed result.
+async fn send_admin(
+    target: &str,
+    tls_ctx: &tls::TlsContext,
+    op: AdminOp,
+) -> Result<std::result::Result<u64, (AdminErrCode, String)>> {
+    let mut stream = connect_daemon(target, tls_ctx).await?;
+    gossip::send_message(&mut stream, &Message::AdminRequest { op }).await?;
+    match gossip::recv_message(&mut stream).await? {
+        Message::AdminResponse { result: AdminResult::Ok { new_version } } => Ok(Ok(new_version)),
+        Message::AdminResponse { result: AdminResult::Err { code, message } } => Ok(Err((code, message))),
+        _ => anyhow::bail!("unexpected response from daemon"),
+    }
+}
+
+/// Times a signed change is re-made after the config changed under it.
+const PUSH_ATTEMPTS: usize = 3;
+
+/// `next`, signed with the CLI's certificate, as a push onto `base_version`.
+fn signed_push(mut next: config::DynamicConfig, base_version: u64, material: &pki::PkiMaterial) -> Result<AdminOp> {
+    next.changed_by = tls::cert_cn(&material.node_cert_der).unwrap_or_else(|| "stouter-cli".into());
+    let config = signing::sign(&next, &material.node_cert_der, &material.node_key)?;
+    Ok(AdminOp::ConfigPush { config, base_version })
+}
+
+/// Make the change `op` on the daemon at `target`. Returns the typed admin
+/// result; transport-level failures bubble up as `anyhow::Error`.
+///
+/// A daemon with `requireSignedConfig` only takes signed changes: the CLI
+/// then reads its config, applies `op` itself, signs the result and pushes
+/// it, re-doing that if the config changed meanwhile.
 async fn try_admin_rpc(
     target: &str,
     op: AdminOp,
     cfg: &Config,
     cert_dir: Option<&str>,
 ) -> Result<std::result::Result<u64, (AdminErrCode, String)>> {
-    let tls_ctx = build_cli_tls(cfg, cert_dir)?;
-    let tcp = tokio::net::TcpStream::connect(target)
-        .await
-        .with_context(|| format!("connect to {target}"))?;
-    let mut stream = tls_ctx.connect(tcp).await?;
-
-    gossip::send_message(&mut stream, &Message::AdminRequest { op }).await?;
-    match gossip::recv_message(&mut stream).await? {
-        Message::AdminResponse { result: AdminResult::Ok { new_version } } => Ok(Ok(new_version)),
-        Message::AdminResponse { result: AdminResult::Err { code, message } } => {
-            Ok(Err((code, message)))
+    let material = load_cli_material(cfg, cert_dir)?;
+    let tls_ctx = tls::TlsContext::new(&material)?;
+    for attempt in 1..=PUSH_ATTEMPTS {
+        let daemon = fetch_daemon_config(target, &tls_ctx).await?;
+        if !daemon.require_signed_config {
+            return send_admin(target, &tls_ctx, op).await;
         }
-        _ => anyhow::bail!("unexpected response from daemon"),
+        let current = daemon.dynamic_config;
+        let mut next = current.clone();
+        if let Err(e) = op.clone().apply(&mut next) {
+            return Ok(Err(((&e).into(), e.to_string())));
+        }
+        if let Some(problem) = config::new_problem(&current, &next) {
+            return Ok(Err((AdminErrCode::Validation, problem)));
+        }
+        let push = signed_push(next, current.version, &material)?;
+        match send_admin(target, &tls_ctx, push).await? {
+            Err((AdminErrCode::Conflict, _)) if attempt < PUSH_ATTEMPTS => continue,
+            result => return Ok(result),
+        }
     }
+    unreachable!("the last attempt always returns")
 }
 
 /// Like `try_admin_rpc`, but on `AdminResult::Err` exits the process with a
@@ -965,7 +1103,7 @@ async fn run_admin_rpc(
             eprintln!("error: {message}");
             let exit_code = match code {
                 AdminErrCode::Unauthorized => 3,
-                AdminErrCode::Validation | AdminErrCode::NotFound => 2,
+                AdminErrCode::Validation | AdminErrCode::NotFound | AdminErrCode::Conflict => 2,
                 AdminErrCode::Internal => 1,
             };
             std::process::exit(exit_code);
@@ -980,15 +1118,7 @@ async fn fetch_remote_dynamic_config(
     cert_dir: Option<&str>,
 ) -> Result<config::DynamicConfig> {
     let tls_ctx = build_cli_tls(cfg, cert_dir)?;
-    let tcp = tokio::net::TcpStream::connect(target)
-        .await
-        .with_context(|| format!("connect to {target}"))?;
-    let mut stream = tls_ctx.connect(tcp).await?;
-    gossip::send_message(&mut stream, &Message::StatusRequest).await?;
-    match gossip::recv_message(&mut stream).await? {
-        Message::StatusResponse { dynamic_config, .. } => Ok(dynamic_config),
-        _ => anyhow::bail!("unexpected response from {target}"),
-    }
+    Ok(fetch_daemon_config(target, &tls_ctx).await?.dynamic_config)
 }
 
 fn print_status(
@@ -1073,12 +1203,36 @@ fn parse_routes(service: &str, arg: &str) -> Result<Vec<config::Route>> {
 /// Save a change the CLI made to the local config file: refused if it
 /// introduces a config problem (a domain claimed twice, routes left pointing
 /// at a removed service, ...), and stamped with who made it.
-fn save_local_change(cfg: &mut Config, before: &config::DynamicConfig, path: &str) -> Result<()> {
+///
+/// With `requireSignedConfig` the change is signed with the CLI's
+/// certificate, which must be an admin's, or peers (and the local daemon)
+/// would refuse it.
+fn save_local_change(
+    cfg: &mut Config,
+    before: &config::DynamicConfig,
+    path: &str,
+    cert_dir: Option<&str>,
+) -> Result<()> {
     if let Some(problem) = config::new_problem(before, &cfg.dynamic_config) {
         anyhow::bail!("{problem}");
     }
-    cfg.dynamic_config.changed_by =
-        if cfg.node_id.is_empty() { config::get_hostname() } else { cfg.node_id.clone() };
+    if cfg.require_signed_config {
+        let material = load_cli_material(cfg, cert_dir)?;
+        let signer = tls::cert_cn(&material.node_cert_der).unwrap_or_default();
+        if !cfg.admin_cns.contains(&signer) {
+            anyhow::bail!(
+                "this cluster accepts only signed config changes (requireSignedConfig), and the certificate \
+                 in use ('{signer}') is not in adminCns: pass --cert-dir with an admin's certificate"
+            );
+        }
+        cfg.dynamic_config.changed_by = signer;
+        cfg.dynamic_config = signing::sign(&cfg.dynamic_config, &material.node_cert_der, &material.node_key)?;
+    } else {
+        cfg.dynamic_config.changed_by =
+            if cfg.node_id.is_empty() { config::get_hostname() } else { cfg.node_id.clone() };
+        // An edit invalidates any signature the config carried.
+        cfg.dynamic_config.signature = None;
+    }
     cfg.save(path)
 }
 

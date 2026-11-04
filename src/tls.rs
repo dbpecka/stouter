@@ -87,6 +87,9 @@ pub struct TlsContext {
     acceptor: tokio_rustls::TlsAcceptor,
     connector: tokio_rustls::TlsConnector,
     server_name: ServerName<'static>,
+    /// Checks a certificate chains to the cluster CA, as for a client
+    /// connecting; also used to check who signed a config.
+    cert_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
 }
 
 impl TlsContext {
@@ -106,7 +109,7 @@ impl TlsContext {
                 .build()
                 .map_err(|e| anyhow::anyhow!("build client verifier: {e}"))?;
         let server_config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
+            .with_client_cert_verifier(client_verifier.clone())
             .with_single_cert(cert_chain.clone(), private_key.clone_key())
             .context("build server TLS config")?;
 
@@ -124,7 +127,17 @@ impl TlsContext {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
             connector: tokio_rustls::TlsConnector::from(Arc::new(client_config)),
             server_name,
+            cert_verifier: client_verifier,
         })
+    }
+
+    /// Check that `cert` (DER) was issued by the cluster CA and is currently
+    /// valid; returns its Common Name.
+    pub fn verify_cluster_cert(&self, cert: &rustls::pki_types::CertificateDer<'_>) -> Result<Option<String>> {
+        self.cert_verifier
+            .verify_client_cert(cert, &[], rustls::pki_types::UnixTime::now())
+            .map_err(|e| anyhow::anyhow!("certificate not valid for this cluster: {e}"))?;
+        Ok(leaf_cn(Some(std::slice::from_ref(cert))))
     }
 
     pub async fn accept(&self, stream: TcpStream) -> Result<MeshStream> {
@@ -149,6 +162,11 @@ impl TlsContext {
 /// already failed the handshake) or if the cert subject has no CN.
 fn peer_leaf_cn(tls: &tokio_rustls::server::TlsStream<TcpStream>) -> Option<String> {
     leaf_cn(tls.get_ref().1.peer_certificates())
+}
+
+/// The Common Name of a DER certificate.
+pub(crate) fn cert_cn(cert: &rustls::pki_types::CertificateDer<'_>) -> Option<String> {
+    leaf_cn(Some(std::slice::from_ref(cert)))
 }
 
 /// The Common Name of the first (leaf) certificate in `certs`.

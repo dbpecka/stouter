@@ -299,6 +299,9 @@ pub struct SharedState {
     heartbeat: AtomicU64,
     /// Nodes that left or were forgotten, by id.
     departed: Mutex<HashMap<String, Tombstone>>,
+    /// Version of the last config refused for lacking a valid signature, so
+    /// each is reported once rather than on every sync.
+    pub(crate) rejected_config_version: AtomicU64,
 }
 
 impl SharedState {
@@ -332,6 +335,7 @@ impl SharedState {
             tracer: std::sync::OnceLock::new(),
             heartbeat: AtomicU64::new(0),
             departed: Mutex::new(HashMap::new()),
+            rejected_config_version: AtomicU64::new(0),
         })
     }
 

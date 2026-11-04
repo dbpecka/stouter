@@ -18,6 +18,9 @@ service mesh. Grouped by area, not prioritized.
   deterministic tie-break for concurrent changes at one config version.
 - Node identity bound to the certificate CN for tunnels, reverse
   registrations and join/leave announcements.
+- Admin-signed configs (`requireSignedConfig`): nodes accept a config change
+  only if a certificate in `adminCns` signed it, so no node can rewrite the
+  cluster's config; `stouter config push` applies hand edits.
 - Timeouts on every connection setup, exponential backoff for reconnects,
   and pruning of pooled connections the peer has closed.
 - Health-aware load balancing: nodes with stale gossip liveness are skipped, and

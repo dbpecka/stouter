@@ -277,6 +277,29 @@ pub struct DynamicConfig {
     /// every node (see [`DynamicConfig::supersedes`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub changed_by: String,
+    /// An admin's signature over this config, when it has one. Nodes with
+    /// `requireSignedConfig` accept a change only if it is signed (see
+    /// `crate::signing`); everyone else keeps and relays it as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ConfigSignature>,
+}
+
+/// An admin's signature over a [`DynamicConfig`].
+///
+/// It carries the exact JSON text that was signed, so it verifies no matter
+/// how the config was re-encoded on the way (an older node may drop fields
+/// it doesn't know). A verified config is always decoded from that text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSignature {
+    /// The signed config (with no `signature`), as JSON text.
+    pub config_json: String,
+    /// The signer's certificate (DER, hex). It must chain to the cluster CA
+    /// and name an admin (`adminCns`).
+    pub signer_cert: String,
+    /// ECDSA P-256/SHA-256 signature (DER, hex) over a fixed prefix and
+    /// `config_json`.
+    pub signature: String,
 }
 
 /// Failure modes for in-memory mutations of `DynamicConfig`.
@@ -289,6 +312,10 @@ pub enum MutateErr {
     ServiceNotFound { group: String, node: String, name: String },
     DuplicateService { group: String, node: String, name: String },
     Invalid(String),
+    /// Not signed (validly, by an admin) where a signature is required.
+    Unauthorized(String),
+    /// A pushed config was made to an older version than `current`.
+    Conflict { current: u64 },
 }
 
 impl fmt::Display for MutateErr {
@@ -303,7 +330,10 @@ impl fmt::Display for MutateErr {
                 f,
                 "service '{name}' already exists on node '{node}' in group '{group}'"
             ),
-            MutateErr::Invalid(msg) => write!(f, "{msg}"),
+            MutateErr::Invalid(msg) | MutateErr::Unauthorized(msg) => write!(f, "{msg}"),
+            MutateErr::Conflict { current } => {
+                write!(f, "the config changed (now version {current}) since this change was made to it")
+            }
         }
     }
 }
@@ -697,6 +727,12 @@ pub struct Config {
     /// callers can use `HTTP_PROXY` instead of per-service ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_listen: Option<String>,
+    /// Accept a config change (from gossip, admin RPC or this node's own
+    /// config file) only if a certificate named in `adminCns` signed it, so
+    /// no other node can rewrite the cluster's config. Enable it on every
+    /// node once all run a version that supports it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_signed_config: bool,
 }
 
 /// Where and how much to export as OpenTelemetry spans.
@@ -768,6 +804,7 @@ impl Default for Config {
             api_port: None,
             tracing: None,
             http_listen: None,
+            require_signed_config: false,
         }
     }
 }
@@ -817,6 +854,12 @@ impl Config {
 
         if let Some(tracing) = &self.tracing {
             tracing.validate().map_err(|e| anyhow!(e))?;
+        }
+
+        if self.require_signed_config && self.admin_cns.is_empty() {
+            return Err(anyhow!(
+                "`requireSignedConfig` needs `adminCns`: without an admin, no change could ever be signed"
+            ));
         }
 
         if self.subscribe_filter.is_some()
@@ -1768,5 +1811,15 @@ mod tests {
         let mut fixed_elsewhere = broken.clone();
         fixed_elsewhere.upsert_service("g", instance("unrelated", "n3", &[]));
         assert_eq!(new_problem(&broken, &fixed_elsewhere), None);
+    }
+
+    #[test]
+    fn signed_config_requires_an_admin() {
+        let cfg = Config { require_signed_config: true, ..Config::default() };
+        assert!(cfg.validate().unwrap_err().to_string().contains("adminCns"));
+        let cfg = Config { admin_cns: vec!["admin".into()], ..cfg };
+        cfg.validate().unwrap();
+        // Off by default, and omitted from JSON unless on.
+        assert!(!serde_json::to_string(&Config::default()).unwrap().contains("requireSignedConfig"));
     }
 }

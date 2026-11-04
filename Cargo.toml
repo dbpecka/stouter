@@ -29,6 +29,8 @@ metrics-exporter-prometheus = "0.16"
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls-pemfile = "2"
+# Verifying config signatures (already rustls's own certificate verifier).
+rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 x509-parser = "0.16"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

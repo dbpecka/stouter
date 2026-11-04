@@ -44,6 +44,10 @@ pub enum Message {
         bind: String,
         dynamic_config: DynamicConfig,
         known_nodes: Vec<NodeInfo>,
+        /// The daemon accepts only admin-signed config changes, so a CLI
+        /// must sign its change and send it as `AdminOp::ConfigPush`.
+        #[serde(default)]
+        require_signed_config: bool,
     },
     /// Upgrade this TCP connection to a yamux multiplexed tunnel session.
     MuxTunnel {},
@@ -55,7 +59,7 @@ pub enum Message {
 
 /// A single admin operation. Extend this enum to add new mutating commands
 /// without changing the connection-dispatch table.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AdminOp {
     ServiceAdd {
@@ -98,9 +102,63 @@ pub enum AdminOp {
         owner_node_id: String,
         name: String,
     },
+    /// Replace the whole config with `config`, which an admin computed and
+    /// signed (required by daemons with `requireSignedConfig`). Refused with
+    /// `Conflict` unless the daemon is still at `base_version`, the version
+    /// the change was made to; the CLI then re-reads and retries.
+    ConfigPush {
+        config: DynamicConfig,
+        base_version: u64,
+    },
 }
 
 impl AdminOp {
+    /// Apply this edit to `dc`, bumping its version. The daemon applies
+    /// edits for unsigned clusters; a CLI applies them itself to sign the
+    /// result. `ConfigPush` isn't an edit and is refused.
+    pub fn apply(self, dc: &mut DynamicConfig) -> Result<u64, crate::config::MutateErr> {
+        use crate::config::{MutateErr, Service};
+        match self {
+            AdminOp::ServiceAdd {
+                group,
+                name,
+                owner_node_id,
+                port,
+                domains,
+                weight,
+                max_connections,
+                protocol,
+                request_timeout_ms,
+                health_path,
+                labels,
+                meta,
+                local_port,
+            } => {
+                let svc = Service {
+                    name,
+                    node_id: owner_node_id,
+                    node_port: port,
+                    domains,
+                    weight,
+                    max_connections,
+                    protocol,
+                    request_timeout_ms,
+                    health_path,
+                    labels,
+                    meta,
+                    local_port,
+                };
+                Ok(dc.upsert_service(&group, svc))
+            }
+            AdminOp::RoutesSet { service, routes } => dc.set_routes(&service, routes),
+            AdminOp::ServiceRename { group, owner_node_id, from, to } => {
+                dc.rename_service(&group, &owner_node_id, &from, &to)
+            }
+            AdminOp::ServiceRemove { group, owner_node_id, name } => dc.remove_service(&group, &owner_node_id, &name),
+            AdminOp::ConfigPush { .. } => Err(MutateErr::Invalid("a pushed config is not an edit".into())),
+        }
+    }
+
     /// A `ServiceAdd` carrying every field of `svc`.
     pub fn service_add(group: String, svc: crate::config::Service) -> Self {
         AdminOp::ServiceAdd {
@@ -128,13 +186,28 @@ pub enum AdminResult {
     Err { code: AdminErrCode, message: String },
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AdminErrCode {
     Unauthorized,
     Validation,
     NotFound,
     Internal,
+    /// The config changed since the change was made; re-read and retry.
+    /// (Only `ConfigPush` gets it, which older CLIs never send.)
+    Conflict,
+}
+
+impl From<&crate::config::MutateErr> for AdminErrCode {
+    fn from(err: &crate::config::MutateErr) -> Self {
+        use crate::config::MutateErr;
+        match err {
+            MutateErr::GroupNotFound { .. } | MutateErr::ServiceNotFound { .. } => AdminErrCode::NotFound,
+            MutateErr::DuplicateService { .. } | MutateErr::Invalid(_) => AdminErrCode::Validation,
+            MutateErr::Unauthorized(_) => AdminErrCode::Unauthorized,
+            MutateErr::Conflict { .. } => AdminErrCode::Conflict,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -416,9 +489,11 @@ mod tests {
             bind: "0.0.0.0:8080".into(),
             dynamic_config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![], ..Default::default() },
             known_nodes: vec![],
+            require_signed_config: true,
         };
         match msgpack_round_trip(&msg) {
-            Message::StatusResponse { mode, node_id, .. } => {
+            Message::StatusResponse { mode, node_id, require_signed_config, .. } => {
+                assert!(require_signed_config);
                 assert_eq!(mode, "node");
                 assert_eq!(node_id, "host1");
             }
