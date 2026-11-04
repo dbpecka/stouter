@@ -121,6 +121,10 @@ enum ServiceAction {
         /// `--meta traefik.scheme=h2c` for the Traefik plugin. Repeatable.
         #[arg(long = "meta", value_parser = parse_key_value)]
         meta: Vec<(String, String)>,
+        /// Fixed `127.0.0.1` port subscribers open this service's proxy on
+        /// (random when unset).
+        #[arg(long)]
+        local_port: Option<u16>,
         /// Node ID to register the service on (defaults to this node)
         #[arg(long)]
         node: Option<String>,
@@ -380,6 +384,7 @@ async fn main() -> Result<()> {
                     health_path,
                     labels,
                     meta,
+                    local_port,
                     node,
                     remote,
                 },
@@ -394,20 +399,23 @@ async fn main() -> Result<()> {
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
                 let version = run_admin_rpc(
                     &target,
-                    AdminOp::ServiceAdd {
-                        group: group_name.clone(),
-                        name: name.clone(),
-                        owner_node_id,
-                        port,
-                        domains: domains.clone(),
-                        weight,
-                        max_connections,
-                        protocol,
-                        request_timeout_ms,
-                        health_path,
-                        labels,
-                        meta,
-                    },
+                    AdminOp::service_add(
+                        group_name.clone(),
+                        Service {
+                            name: name.clone(),
+                            node_id: owner_node_id,
+                            node_port: port,
+                            domains: domains.clone(),
+                            weight,
+                            max_connections,
+                            protocol,
+                            request_timeout_ms,
+                            health_path,
+                            labels,
+                            meta,
+                            local_port,
+                        },
+                    ),
                     &cfg,
                     cli.cert_dir.as_deref(),
                 )
@@ -431,6 +439,7 @@ async fn main() -> Result<()> {
                     health_path,
                     labels,
                     meta,
+                    local_port,
                 };
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 cfg.save(&cli.config)?;
@@ -481,6 +490,9 @@ async fn main() -> Result<()> {
                     }
                     if let Some(ms) = svc.request_timeout_ms {
                         limit.push_str(&format!(" requestTimeoutMs={ms}"));
+                    }
+                    if let Some(port) = svc.local_port {
+                        limit.push_str(&format!(" localPort={port}"));
                     }
                     println!(
                         "{}/{} -> node={} port={} weight={}{}",
@@ -717,7 +729,7 @@ async fn main() -> Result<()> {
             // 1. Read the service from the source cluster.
             let src_dc =
                 fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
-            let (port, domains, weight, max_connections, protocol, request_timeout_ms, health_path, labels, meta) = src_dc
+            let src_svc = src_dc
                 .service_groups
                 .iter()
                 .find(|g| g.name == group_name)
@@ -726,19 +738,7 @@ async fn main() -> Result<()> {
                         .iter()
                         .find(|s| s.name == name && s.node_id == owner_node_id)
                 })
-                .map(|s| {
-                    (
-                        s.node_port,
-                        s.domains.clone(),
-                        s.weight,
-                        s.max_connections,
-                        s.protocol,
-                        s.request_timeout_ms,
-                        s.health_path.clone(),
-                        s.labels.clone(),
-                        s.meta.clone(),
-                    )
-                })
+                .cloned()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "service '{}' on node '{}' not found in group '{}' on {}",
@@ -752,20 +752,7 @@ async fn main() -> Result<()> {
             // 2. Add to the destination cluster.
             let add_version = match try_admin_rpc(
                 &to,
-                AdminOp::ServiceAdd {
-                    group: dest_group.clone(),
-                    name: name.clone(),
-                    owner_node_id: dest_node.clone(),
-                    port,
-                    domains: domains.clone(),
-                    weight,
-                    max_connections,
-                    protocol,
-                    request_timeout_ms,
-                    health_path,
-                    labels,
-                    meta,
-                },
+                AdminOp::service_add(dest_group.clone(), Service { node_id: dest_node.clone(), ..src_svc }),
                 &cfg,
                 to_certs,
             )

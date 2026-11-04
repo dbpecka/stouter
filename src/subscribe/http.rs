@@ -35,7 +35,7 @@ use crate::config::{labels_match, Route};
 use crate::telemetry::{Attributes, SpanEvent, SpanKind, SpanRecord};
 use crate::state::SharedState;
 
-type ProxyBody = BoxBody<Bytes, hyper::Error>;
+pub(super) type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// How long an idle pooled upstream connection is kept.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -52,7 +52,41 @@ pub(super) struct HttpProxy {
     retry_budget: RetryBudget,
 }
 
+/// The per-service HTTP proxies of this daemon, created on first use and
+/// shared by the per-service ports and the `httpListen` dispatcher.
+pub(super) struct HttpProxies {
+    state: Arc<SharedState>,
+    map: std::sync::Mutex<std::collections::HashMap<String, Arc<HttpProxy>>>,
+}
+
+impl HttpProxies {
+    pub fn new(state: Arc<SharedState>) -> Arc<Self> {
+        Arc::new(Self { state, map: Default::default() })
+    }
+
+    /// The proxy for `service_name`, creating it (with a fresh balancer) if
+    /// this is the first use.
+    pub fn get(&self, service_name: &str) -> Arc<HttpProxy> {
+        let mut map = self.map.lock().unwrap();
+        map.entry(service_name.to_string())
+            .or_insert_with(|| {
+                HttpProxy::new(service_name.to_string(), self.state.clone(), Arc::new(Balancer::new()))
+            })
+            .clone()
+    }
+
+    /// Drop proxies for services no longer in the config.
+    pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        self.map.lock().unwrap().retain(|name, _| keep(name));
+    }
+}
+
 impl HttpProxy {
+    /// The balancer this service's requests and connections are picked by.
+    pub fn balancer(&self) -> Arc<Balancer> {
+        self.balancer.clone()
+    }
+
     pub fn new(service_name: String, state: Arc<SharedState>, balancer: Arc<Balancer>) -> Arc<Self> {
         let connector = TunnelConnector {
             service_name: service_name.clone(),
@@ -82,7 +116,7 @@ impl HttpProxy {
         }
     }
 
-    async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
+    pub(super) async fn handle(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
         let start = Instant::now();
         let start_wall = SystemTime::now();
         let method = req.method().clone();
@@ -528,7 +562,7 @@ enum Outcome {
     Error(StatusCode, &'static str),
 }
 
-fn error_response(status: StatusCode, reason: &'static str) -> Response<ProxyBody> {
+pub(super) fn error_response(status: StatusCode, reason: &'static str) -> Response<ProxyBody> {
     let mut resp = Response::new(
         Full::new(Bytes::from(format!("{reason}\n")))
             .map_err(|never| match never {})
@@ -962,6 +996,26 @@ mod tests {
         let tc = TraceContext { flags: "03".into(), ..unsampled.clone() };
         assert!(tc.is_sampled());
         assert!(!unsampled.child().is_sampled());
+    }
+
+    #[test]
+    fn registry_shares_one_proxy_and_balancer_per_service() {
+        let state = SharedState::new(
+            crate::config::Config::default(),
+            String::new(),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // The hyper client needs a runtime context to be built.
+        let _guard = rt.enter();
+        let proxies = HttpProxies::new(state);
+        let (a, b) = (proxies.get("api"), proxies.get("api"));
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a.balancer(), &b.balancer()));
+        assert!(!Arc::ptr_eq(&a, &proxies.get("web")));
+        proxies.retain(|name| name == "web");
+        assert!(!Arc::ptr_eq(&a, &proxies.get("api")), "a dropped service gets a fresh proxy");
     }
 
     #[test]

@@ -73,6 +73,8 @@ pub enum AdminOp {
         labels: std::collections::BTreeMap<String, String>,
         #[serde(default)]
         meta: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        local_port: Option<u16>,
     },
     /// Replace every route for `service` (an empty list clears them).
     RoutesSet {
@@ -90,6 +92,27 @@ pub enum AdminOp {
         owner_node_id: String,
         name: String,
     },
+}
+
+impl AdminOp {
+    /// A `ServiceAdd` carrying every field of `svc`.
+    pub fn service_add(group: String, svc: crate::config::Service) -> Self {
+        AdminOp::ServiceAdd {
+            group,
+            name: svc.name,
+            owner_node_id: svc.node_id,
+            port: svc.node_port,
+            domains: svc.domains,
+            weight: svc.weight,
+            max_connections: svc.max_connections,
+            protocol: svc.protocol,
+            request_timeout_ms: svc.request_timeout_ms,
+            health_path: svc.health_path,
+            labels: svc.labels,
+            meta: svc.meta,
+            local_port: svc.local_port,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,6 +192,7 @@ mod tests {
                         health_path: None,
                         labels: Default::default(),
                         meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
+                        local_port: None,
                     }],
                 }],
             },
@@ -277,6 +301,7 @@ mod tests {
                         health_path: None,
                         labels: Default::default(),
                         meta: Default::default(),
+                        local_port: None,
                     }],
                 }],
             },
@@ -413,6 +438,7 @@ mod tests {
                 health_path: Some("/healthz".into()),
                 labels: [("version".to_string(), "v2".to_string())].into(),
                 meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
+                local_port: Some(15002),
             },
         };
         match msgpack_round_trip(&msg) {
@@ -431,6 +457,7 @@ mod tests {
                         health_path,
                         labels,
                         meta,
+                        local_port,
                     },
             } => {
                 assert_eq!(group, "web");
@@ -445,6 +472,7 @@ mod tests {
                 assert_eq!(health_path.as_deref(), Some("/healthz"));
                 assert_eq!(labels["version"], "v2");
                 assert_eq!(meta["traefik.scheme"], "h2c");
+                assert_eq!(local_port, Some(15002));
             }
             other => panic!("wrong variant: {other:?}"),
         }

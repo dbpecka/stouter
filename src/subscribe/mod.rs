@@ -1,6 +1,7 @@
 mod api;
 mod balancer;
 mod http;
+mod listener;
 mod proxy;
 
 use std::collections::{HashMap, HashSet};
@@ -29,14 +30,15 @@ struct DesiredService {
     name: String,
     domains: Vec<String>,
     meta: std::collections::BTreeMap<String, String>,
+    local_port: Option<u16>,
 }
 
 /// A running local proxy for a single service.
 struct ProxyHandle {
     /// The bare service name, used as the key in `service_ports`.
     service_name: String,
-    #[allow(dead_code)]
-    local_port: u16,
+    /// The configured `localPort` this proxy was started for (`None`: random).
+    requested_port: Option<u16>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -64,7 +66,16 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
         }
     });
 
-    tokio::spawn(manage_proxies(state.clone(), service_ports));
+    let http_proxies = http::HttpProxies::new(state.clone());
+    tokio::spawn(manage_proxies(state.clone(), service_ports, http_proxies.clone()));
+    if let Some(addr) = state.config.http_listen.clone() {
+        let (state, proxies) = (state.clone(), http_proxies.clone());
+        tokio::spawn(async move {
+            if let Err(e) = listener::run_http_listener(addr, state, proxies).await {
+                tracing::error!("HTTP listener exited: {e:#}");
+            }
+        });
+    }
     tokio::spawn(fill_tunnel_pool(state.clone()));
     tokio::spawn(maintain_mux_sessions(state.clone()));
 
@@ -116,8 +127,14 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
 async fn manage_proxies(
     state: Arc<SharedState>,
     service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>>,
+    http_proxies: Arc<http::HttpProxies>,
 ) {
     let mut proxies: HashMap<String, ProxyHandle> = HashMap::new();
+    // Last start error per service key, so a port stuck in use is reported
+    // once rather than on every pass.
+    let mut start_errors: HashMap<String, String> = HashMap::new();
+    // Last localPort conflict per service key, likewise reported once.
+    let mut port_conflicts: HashMap<String, String> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(2));
 
     loop {
@@ -150,23 +167,39 @@ async fn manage_proxies(
                 }
                 let key = format!("{}/{}", group.name, svc.name);
                 if nodes.contains_key(&svc.node_id) && seen_svc_keys.insert(key.clone()) {
+                    let local_port = match dc.local_port_for(&svc.name) {
+                        Ok(port) => {
+                            port_conflicts.remove(&key);
+                            port
+                        }
+                        Err(e) => {
+                            if port_conflicts.insert(key.clone(), e.clone()).as_ref() != Some(&e) {
+                                tracing::warn!("{e}; using a random port for {key}");
+                            }
+                            None
+                        }
+                    };
                     desired.insert(
                         key,
                         DesiredService {
                             name: svc.name.clone(),
                             domains: svc.domains.clone(),
                             meta: svc.meta.clone(),
+                            local_port,
                         },
                     );
                 }
             }
         }
 
-        // Abort proxies for services that are no longer desired.
+        // Abort proxies for services that are no longer desired, or whose
+        // configured localPort changed (a listener can't move ports).
         let removed: Vec<String> = proxies
-            .keys()
-            .filter(|name| !desired.contains_key(*name))
-            .cloned()
+            .iter()
+            .filter(|(key, handle)| {
+                desired.get(*key).is_none_or(|d| d.local_port != handle.requested_port)
+            })
+            .map(|(key, _)| key.clone())
             .collect();
 
         for key in removed {
@@ -177,8 +210,12 @@ async fn manage_proxies(
             }
         }
 
+        let configured: HashSet<&str> =
+            dc.service_groups.iter().flat_map(|g| &g.services).map(|s| s.name.as_str()).collect();
+        http_proxies.retain(|name| configured.contains(name));
+
         // Start proxies for newly desired services.
-        for (key, DesiredService { name: svc_name, domains: svc_domains, meta: svc_meta }) in desired {
+        for (key, DesiredService { name: svc_name, domains: svc_domains, meta: svc_meta, local_port: requested_port }) in desired {
             if let Some(handle) = proxies.get(&key) {
                 // Keep the API's view current when a running service's
                 // domains or meta change, without restarting its proxy.
@@ -207,15 +244,25 @@ async fn manage_proxies(
             let join_handle = tokio::spawn(proxy::run_proxy(
                 svc_name.clone(),
                 state.clone(),
+                http_proxies.clone(),
+                requested_port,
                 port_tx,
             ));
             let abort = join_handle.abort_handle();
 
             match port_rx.await {
-                Ok(local_port) => {
+                Ok(Ok(local_port)) => {
+                    start_errors.remove(&key);
                     service_ports.write().await.insert(svc_name.clone(), ServiceInfo { port: local_port, domains: svc_domains, meta: svc_meta });
-                    proxies.insert(key.clone(), ProxyHandle { service_name: svc_name, local_port, abort });
+                    proxies.insert(key.clone(), ProxyHandle { service_name: svc_name, requested_port, abort });
                     info!("Started proxy for {key} on 127.0.0.1:{local_port}");
+                }
+                Ok(Err(e)) => {
+                    abort.abort();
+                    // Retried every pass; reported once per distinct error.
+                    if start_errors.insert(key.clone(), e.clone()).as_ref() != Some(&e) {
+                        tracing::warn!("Proxy for {key} failed to start: {e}; retrying");
+                    }
                 }
                 Err(_) => {
                     abort.abort();

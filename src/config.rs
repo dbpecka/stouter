@@ -58,6 +58,10 @@ pub struct Service {
     /// plugin). Stouter itself does not interpret it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub meta: BTreeMap<String, String>,
+    /// Fixed `127.0.0.1` port subscribers open this service's proxy on,
+    /// instead of a random one. Every instance that sets it must agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
 }
 
 /// True if `labels` include every key/value in `selector`.
@@ -336,6 +340,25 @@ impl DynamicConfig {
         self.version
     }
 
+    /// The fixed local proxy port for `service`: the `localPort` its
+    /// instances set, `None` if none set one, or an error if they disagree.
+    pub fn local_port_for(&self, service: &str) -> std::result::Result<Option<u16>, String> {
+        let mut ports: Vec<u16> = self
+            .service_groups
+            .iter()
+            .flat_map(|g| &g.services)
+            .filter(|s| s.name == service)
+            .filter_map(|s| s.local_port)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        match ports.as_slice() {
+            [] => Ok(None),
+            [port] => Ok(Some(*port)),
+            many => Err(format!("instances of '{service}' set different localPorts: {many:?}")),
+        }
+    }
+
     /// Check that `service` can carry routes: it exists and every instance
     /// speaks HTTP.
     pub fn validate_route_target(&self, service: &str) -> std::result::Result<(), String> {
@@ -531,6 +554,11 @@ pub struct Config {
     /// (trace context is still propagated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracing: Option<TracingConfig>,
+    /// Subscribe modes: one HTTP listener (e.g. `127.0.0.1:15001`) that routes
+    /// each request to an `http` service by its URL host or `Host` header, so
+    /// callers can use `HTTP_PROXY` instead of per-service ports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_listen: Option<String>,
 }
 
 /// Where and how much to export as OpenTelemetry spans.
@@ -601,6 +629,7 @@ impl Default for Config {
             admin_cns: Vec::new(),
             api_port: None,
             tracing: None,
+            http_listen: None,
         }
     }
 }
@@ -675,6 +704,44 @@ impl Config {
                 .cloned()
                 .collect();
             validate_routes(service, &routes).map_err(|e| anyhow!(e))?;
+        }
+
+        // Fixed local ports: consistent per service, distinct across services,
+        // and clear of the daemon's own loopback listeners.
+        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+        let subscribes = matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe);
+        if subscribes {
+            port_owner.insert(self.api_port(), "the REST API (apiPort)");
+        }
+        if let Some(listen) = &self.http_listen {
+            let addr: std::net::SocketAddr = listen
+                .parse()
+                .map_err(|e| anyhow!("httpListen '{listen}' is not an address like 127.0.0.1:15001: {e}"))?;
+            if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+                port_owner.insert(addr.port(), "httpListen");
+            }
+            if !subscribes {
+                return Err(anyhow!("`httpListen` is only valid in subscribe or nodeSubscribe mode"));
+            }
+        }
+        let mut names: Vec<&str> = self
+            .dynamic_config
+            .service_groups
+            .iter()
+            .flat_map(|g| &g.services)
+            .map(|s| s.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            if let Some(port) = self.dynamic_config.local_port_for(name).map_err(|e| anyhow!(e))? {
+                if port == 0 {
+                    return Err(anyhow!("localPort of '{name}' must not be 0"));
+                }
+                if let Some(other) = port_owner.insert(port, name) {
+                    return Err(anyhow!("localPort {port} of '{name}' is already used by {other}"));
+                }
+            }
         }
 
         if let Some(tracing) = &self.tracing {
@@ -883,6 +950,59 @@ mod tests {
             instance("api", "n2", &["api.example.com"]),
         ]);
         cfg.validate().unwrap();
+    }
+
+    fn on_port(mut svc: Service, port: u16) -> Service {
+        svc.local_port = Some(port);
+        svc
+    }
+
+    #[test]
+    fn local_port_resolves_across_instances() {
+        let cfg = group_of(vec![
+            on_port(instance("api", "n1", &[]), 15002),
+            instance("api", "n2", &[]),
+            on_port(instance("api", "n3", &[]), 15002),
+        ]);
+        assert_eq!(cfg.dynamic_config.local_port_for("api"), Ok(Some(15002)));
+        assert_eq!(cfg.dynamic_config.local_port_for("other"), Ok(None));
+        cfg.validate().unwrap();
+
+        let cfg = group_of(vec![on_port(instance("api", "n1", &[]), 15002), on_port(instance("api", "n2", &[]), 15003)]);
+        assert!(cfg.dynamic_config.local_port_for("api").is_err());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn local_ports_must_not_collide() {
+        let two_services = group_of(vec![on_port(instance("api", "n1", &[]), 15002), on_port(instance("web", "n1", &[]), 15002)]);
+        assert!(two_services.validate().is_err());
+
+        let subscriber = |svc| Config { mode: Mode::Subscribe, ..group_of(vec![svc]) };
+        let with_api = Config { api_port: Some(15002), ..subscriber(on_port(instance("api", "n1", &[]), 15002)) };
+        assert!(with_api.validate().is_err());
+        // The API's default port counts too, but only where the API runs.
+        assert!(subscriber(on_port(instance("api", "n1", &[]), 5381)).validate().is_err());
+        assert!(group_of(vec![on_port(instance("api", "n1", &[]), 5381)]).validate().is_ok());
+
+        let with_listener = Config {
+            mode: Mode::Subscribe,
+            http_listen: Some("127.0.0.1:15002".into()),
+            ..group_of(vec![on_port(instance("api", "n1", &[]), 15002)])
+        };
+        assert!(with_listener.validate().is_err());
+
+        assert!(group_of(vec![on_port(instance("api", "n1", &[]), 0)]).validate().is_err());
+    }
+
+    #[test]
+    fn http_listen_validation() {
+        let ok = Config { mode: Mode::NodeSubscribe, http_listen: Some("127.0.0.1:15001".into()), ..Config::default() };
+        ok.validate().unwrap();
+        let node_mode = Config { mode: Mode::Node, http_listen: Some("127.0.0.1:15001".into()), ..Config::default() };
+        assert!(node_mode.validate().is_err());
+        let bad = Config { mode: Mode::Subscribe, http_listen: Some("localhost".into()), ..Config::default() };
+        assert!(bad.validate().is_err());
     }
 
     fn http_instance(name: &str, node: &str, labels: &[(&str, &str)]) -> Service {
@@ -1140,6 +1260,7 @@ mod tests {
                 health_path: None,
                 labels: Default::default(),
                 meta: Default::default(),
+                local_port: None,
             },
         );
         assert_eq!(v, 1);
@@ -1154,11 +1275,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let v = dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups.len(), 1);
@@ -1170,7 +1291,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let v = dc.upsert_service(
             "web",
@@ -1186,6 +1307,7 @@ mod tests {
                 health_path: Some("/h".into()),
                 labels: [("version".to_string(), "v2".to_string())].into(),
                 meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
+                local_port: None,
             },
         );
         assert_eq!(v, 2);
@@ -1208,11 +1330,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         assert_eq!(dc.service_groups[0].services.len(), 2);
     }
@@ -1222,7 +1344,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let v = dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(v, 2);
@@ -1241,7 +1363,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let err = dc.remove_service("web", "n1", "api").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -1252,11 +1374,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 1);
@@ -1268,7 +1390,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
         assert_eq!(v, 2);
@@ -1287,7 +1409,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
@@ -1298,11 +1420,11 @@ mod tests {
         let mut dc = DynamicConfig::default();
         dc.upsert_service(
             "web",
-            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         dc.upsert_service(
             "web",
-            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default() },
+            Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
         );
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::DuplicateService { .. }));
@@ -1383,6 +1505,7 @@ mod tests {
                         health_path: None,
                         labels: Default::default(),
                         meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
+                        local_port: None,
                     }],
                 }],
             },
