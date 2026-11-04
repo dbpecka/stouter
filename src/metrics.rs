@@ -50,6 +50,14 @@ pub async fn run_gauge_loop(state: Arc<SharedState>) {
                 .set(state.reverse_pool.count(&node.id) as f64);
         }
 
+        // Service health as this daemon sees it: from the local checker for
+        // our own services, from gossip for everyone else's.
+        for (node_id, service) in state.service_index.load().keys() {
+            let healthy = !state.service_unhealthy(node_id, service);
+            metrics::gauge!("stouter_service_healthy", "service" => service.clone(), "node_id" => node_id.clone())
+                .set(if healthy { 1.0 } else { 0.0 });
+        }
+
         // Mux sessions
         let mux_count = state.mux_pool.session_count();
         metrics::gauge!("stouter_mux_sessions").set(mux_count as f64);

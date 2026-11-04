@@ -20,6 +20,7 @@ pub async fn run_node(state: Arc<SharedState>) -> Result<()> {
     tokio::spawn(gossip::run_sync_loop(state.clone()));
     tokio::spawn(gossip::run_member_log(state.clone()));
     tokio::spawn(gossip::run_config_poll_loop(state.clone()));
+    tokio::spawn(crate::health::run_health_checks(state.clone()));
 
     if state.config.outbound_only {
         info!(
