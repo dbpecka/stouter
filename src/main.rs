@@ -367,12 +367,7 @@ async fn main() -> Result<()> {
 
             // Announce our presence to any already-known peers.
             if !cfg.known_nodes.is_empty() {
-                let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
-                    let material = pki::load_or_create(dir, &cfg.node_id)?;
-                    Some(tls::TlsContext::new(&material)?)
-                } else {
-                    None
-                };
+                let tls_ctx = local_tls(&cfg)?;
                 let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
                 gossip::broadcast_message(
                     &state,
@@ -517,12 +512,7 @@ async fn main() -> Result<()> {
                 let version = cfg.dynamic_config.upsert_service(&group_name, service);
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
-                let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
-                    let material = pki::load_or_create(dir, &cfg.node_id)?;
-                    Some(tls::TlsContext::new(&material)?)
-                } else {
-                    None
-                };
+                let tls_ctx = local_tls(&cfg)?;
                 let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
                 gossip::broadcast_message(
                     &state,
@@ -622,12 +612,7 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
-                let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
-                    let material = pki::load_or_create(dir, &cfg.node_id)?;
-                    Some(tls::TlsContext::new(&material)?)
-                } else {
-                    None
-                };
+                let tls_ctx = local_tls(&cfg)?;
                 let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
                 gossip::broadcast_message(
                     &state,
@@ -683,12 +668,7 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
-                let tls_ctx = if let Some(ref dir) = cfg.tls_dir {
-                    let material = pki::load_or_create(dir, &cfg.node_id)?;
-                    Some(tls::TlsContext::new(&material)?)
-                } else {
-                    None
-                };
+                let tls_ctx = local_tls(&cfg)?;
                 let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
                 gossip::broadcast_message(
                     &state,
@@ -1062,13 +1042,13 @@ async fn graceful_drain(state: std::sync::Arc<SharedState>) {
 /// The CLI's own TLS identity: from `--cert-dir`, else the local config's
 /// `tlsDir`. Also what it signs config changes with.
 fn load_cli_material(cfg: &Config, cert_dir: Option<&str>) -> Result<pki::PkiMaterial> {
-    let dir = cert_dir
-        .or(cfg.tls_dir.as_deref())
-        .ok_or_else(|| anyhow::anyhow!(
-            "TLS material not available: pass --cert-dir or set tlsDir in the local config"
-        ))?;
+    let (dir, from) = match (cert_dir, cfg.tls_dir.as_deref()) {
+        (Some(dir), _) => (dir, "--cert-dir"),
+        (None, Some(dir)) => (dir, "tlsDir in the local config"),
+        (None, None) => anyhow::bail!("TLS material not available: pass --cert-dir or set tlsDir in the local config"),
+    };
     let node_id = if cfg.node_id.is_empty() { "stouter-cli" } else { cfg.node_id.as_str() };
-    pki::load_or_create(dir, node_id)
+    pki::load_existing(dir, node_id).with_context(|| format!("the CLI's certificate (from {from})"))
 }
 
 /// Build a `TlsContext` for an outbound CLI connection, preferring an
@@ -1340,12 +1320,24 @@ fn save_local_change(
     cfg.save(path)
 }
 
+/// This host's TLS identity, from its `tlsDir`, for telling peers about a
+/// local change. `None` if it has none yet (its daemon never ran): the
+/// daemon tells them itself when it starts. Never creates a CA, as one made
+/// here would become the daemon's, cut off from the cluster's.
+fn local_tls(cfg: &Config) -> Result<Option<tls::TlsContext>> {
+    let Some(dir) = cfg.tls_dir.as_deref() else { return Ok(None) };
+    match pki::load_existing(dir, &cfg.node_id) {
+        Ok(material) => Ok(Some(tls::TlsContext::new(&material)?)),
+        Err(e) => {
+            eprintln!("note: not telling peers now ({e:#}); the daemon will when it starts");
+            Ok(None)
+        }
+    }
+}
+
 /// Push a locally changed config to the cluster.
 async fn broadcast_config(cfg: &Config, path: &str) -> Result<()> {
-    let tls_ctx = match &cfg.tls_dir {
-        Some(dir) => Some(tls::TlsContext::new(&pki::load_or_create(dir, &cfg.node_id)?)?),
-        None => None,
-    };
+    let tls_ctx = local_tls(cfg)?;
     let state = SharedState::new(cfg.clone(), path.to_string(), CancellationToken::new(), tls_ctx);
     gossip::broadcast_message(&state, Message::ConfigUpdate { config: cfg.dynamic_config.clone() }).await;
     Ok(())

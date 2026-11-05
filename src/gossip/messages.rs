@@ -89,6 +89,22 @@ pub struct SyncDigest {
     /// Content hash of the config, to tell two configs at one version apart.
     #[serde(default)]
     pub config_hash: u64,
+    /// Whether the sender wants the beats it lacks in the reply. A node
+    /// syncs with every peer each round and they'd all send the same ones,
+    /// so it asks only a few. (Absent, from a node that predates this: yes.)
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub want_beats: bool,
+    /// The beat held for each node with no address, when `want_beats`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beats: Vec<(String, u64)>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// A single admin operation. Extend this enum to add new mutating commands

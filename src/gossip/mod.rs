@@ -248,7 +248,7 @@ async fn handle_gossip_message(mut stream: MeshStream, peer_addr: String, msg: M
             // sends no digest, with everything).
             let reply = match &have {
                 Some(have) => build_sync_reply(&state, have).await,
-                None => build_sync_msg(&state).await,
+                None => build_sync_msg(&state, false).await,
             };
             if let Err(e) = send_message(&mut stream, &reply).await {
                 debug!("failed to send sync reply: {e}");
@@ -583,11 +583,17 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
                 }
             }
         }
+        // Every peer would send the same beats: ask only a few of them.
+        let beat_sources: std::collections::HashSet<&String> = {
+            use rand::seq::IndexedRandom;
+            peers.choose_multiple(&mut rand::rng(), BEAT_SOURCES).collect()
+        };
         futures::future::join_all(peers.iter().map(|addr| {
             let state = &state;
+            let want_beats = beat_sources.contains(addr);
             async move {
                 let start = std::time::Instant::now();
-                match time::timeout(Duration::from_secs(10), sync_with_peer(state, addr)).await {
+                match time::timeout(Duration::from_secs(10), sync_with_peer(state, addr, want_beats)).await {
                     Ok(Err(e)) => {
                         metrics::counter!("stouter_gossip_syncs_total", "result" => "error").increment(1);
                         debug!("sync with {addr} failed: {e}");
@@ -609,6 +615,11 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
         expire_silent_nodes(&state).await;
     }
 }
+
+/// Peers asked for beats each round (see `SyncDigest::want_beats`): enough
+/// that one not answering doesn't leave us without, few enough that a beat
+/// reaches each node about twice a round rather than once per peer.
+const BEAT_SOURCES: usize = 2;
 
 /// Sync rounds between retries of forgotten nodes' last addresses (about a
 /// minute).
@@ -641,10 +652,10 @@ async fn expire_silent_nodes(state: &Arc<SharedState>) {
         .await;
 }
 
-async fn sync_with_peer(state: &Arc<SharedState>, addr: &str) -> Result<()> {
+async fn sync_with_peer(state: &Arc<SharedState>, addr: &str, want_beats: bool) -> Result<()> {
     let mut stream = state.connect_mesh(addr, None).await?;
 
-    let our_sync = sync_msg_for(state, addr).await;
+    let our_sync = sync_msg_for(state, addr, want_beats).await;
     send_message(&mut stream, &our_sync).await?;
 
     let reply = recv_message(&mut stream).await?;
@@ -702,7 +713,7 @@ fn rewrite_wildcard(addr: &str, host: &str) -> Option<String> {
 pub(crate) async fn broadcast_sync(state: &Arc<SharedState>) {
     // What changed is in our own record, so a compact sync carries it to
     // peers that speak delta sync; older ones get the full one.
-    let (full, compact) = (build_sync_msg(state).await, build_compact_sync(state).await);
+    let (full, compact) = (build_sync_msg(state, false).await, build_compact_sync(state, false).await);
     let peers = peer_addrs(state).await;
     let delta_peers = state.delta_peers.lock().unwrap().clone();
     futures::future::join_all(peers.iter().map(|addr| {
@@ -1220,40 +1231,41 @@ pub async fn run_member_log(state: Arc<SharedState>) {
 
 /// A full Sync: our whole config and every node we know, as older nodes
 /// expect. Also carries our digest (so a newer peer can reply with just a
-/// delta) and beats.
+/// delta, beats included if `want_beats`) and our own beat.
 ///
 /// Always includes a `NodeInfo` for the sender itself so receivers can
 /// populate the `hostname → address` mapping that `manage_proxies` requires
 /// to match services (which store `node_id = hostname`) to connectable peers.
-async fn build_sync_msg(state: &Arc<SharedState>) -> Message {
+async fn build_sync_msg(state: &Arc<SharedState>, want_beats: bool) -> Message {
     let config = state.dynamic_config.read().await.clone();
-    let have = Some(digest(state, &config));
+    let have = Some(digest(state, &config, want_beats));
     let nodes = snapshot_nodes(state);
-    Message::Sync { config, nodes, beats: beats_to_relay(state), have, config_elided: false }
+    Message::Sync { config, nodes, beats: own_beat(state).into_iter().collect(), have, config_elided: false }
 }
 
-/// A compact Sync for a peer that speaks delta sync: our own record, beats
-/// and digest. The peer's reply fills in whatever we're missing; it learns
-/// what we have that it lacks when it syncs with us in turn.
-async fn build_compact_sync(state: &Arc<SharedState>) -> Message {
+/// A compact Sync for a peer that speaks delta sync: our own record and
+/// beat, and our digest. The peer's reply fills in whatever we're missing; it
+/// learns what we have that it lacks when it syncs with us in turn. (A peer
+/// with an address hears every NAT'd node's beat from the node itself.)
+async fn build_compact_sync(state: &Arc<SharedState>, want_beats: bool) -> Message {
     let config = state.dynamic_config.read().await.clone();
-    let have = Some(digest(state, &config));
+    let have = Some(digest(state, &config, want_beats));
     let nodes = own_entry(state).into_iter().collect();
     Message::Sync {
         config: placeholder_config(&config),
         nodes,
-        beats: beats_to_relay(state),
+        beats: own_beat(state).into_iter().collect(),
         have,
         config_elided: true,
     }
 }
 
 /// The Sync to send `addr`: compact if it speaks delta sync, else full.
-async fn sync_msg_for(state: &Arc<SharedState>, addr: &str) -> Message {
+async fn sync_msg_for(state: &Arc<SharedState>, addr: &str, want_beats: bool) -> Message {
     if state.delta_peers.lock().unwrap().contains(addr) {
-        build_compact_sync(state).await
+        build_compact_sync(state, want_beats).await
     } else {
-        build_sync_msg(state).await
+        build_sync_msg(state, want_beats).await
     }
 }
 
@@ -1282,10 +1294,17 @@ async fn build_sync_reply(state: &Arc<SharedState>, have: &messages::SyncDigest)
     let ours_newer = config.version > have.config_version
         || (config.version == have.config_version && config_hash(&config) != have.config_hash);
     let (config, config_elided) = if ours_newer { (config, false) } else { (placeholder_config(&config), true) };
+    // Beats only if asked, and only ones newer than the sender's.
+    let beats = if have.want_beats {
+        let held: std::collections::HashMap<&str, u64> = have.beats.iter().map(|(id, b)| (id.as_str(), *b)).collect();
+        beats_to_relay(state).into_iter().filter(|b| held.get(b.id.as_str()).is_none_or(|h| b.beat > *h)).collect()
+    } else {
+        Vec::new()
+    };
     Message::Sync {
         config,
         nodes,
-        beats: beats_to_relay(state),
+        beats,
         // Our digest isn't needed (the sender learns from what's here), but
         // its presence tells the sender we speak delta sync.
         have: Some(messages::SyncDigest::default()),
@@ -1301,7 +1320,7 @@ fn placeholder_config(config: &crate::config::DynamicConfig) -> crate::config::D
 
 /// What we hold: every signed node record's version (ours and departed
 /// nodes' included) and our config's version and hash.
-fn digest(state: &SharedState, config: &crate::config::DynamicConfig) -> messages::SyncDigest {
+fn digest(state: &SharedState, config: &crate::config::DynamicConfig, want_beats: bool) -> messages::SyncDigest {
     let mut records: Vec<(String, u64)> = state
         .known_nodes
         .load()
@@ -1313,7 +1332,20 @@ fn digest(state: &SharedState, config: &crate::config::DynamicConfig) -> message
     if let Some(own) = state.own_record.lock().unwrap().as_ref() {
         records.push((own.record.id.clone(), own.record.heartbeat));
     }
-    messages::SyncDigest { records, config_version: config.version, config_hash: config_hash(config) }
+    // The beat held for each node with no address (its heartbeat is its
+    // latest beat), so a peer sends only newer ones.
+    let beats = if want_beats {
+        state
+            .known_nodes
+            .load()
+            .values()
+            .filter(|n| n.addr.is_empty() && n.signed.is_some())
+            .map(|n| (n.id.clone(), n.heartbeat))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    messages::SyncDigest { records, config_version: config.version, config_hash: config_hash(config), want_beats, beats }
 }
 
 /// FNV-1a over the config's JSON: stable across processes, enough to tell
@@ -2037,6 +2069,7 @@ mod tests {
             records: records.iter().map(|(id, v)| (id.to_string(), *v)).collect(),
             config_version: config.version,
             config_hash: config_hash(config),
+            ..Default::default()
         }
     }
 
@@ -2070,7 +2103,7 @@ mod tests {
         assert!(!reply_ids(&build_sync_reply(&sub, &have).await).1, "config included");
 
         // A compact sync is our own record, a digest and a placeholder config.
-        let Message::Sync { nodes, have, config_elided, .. } = build_compact_sync(&sub).await else { unreachable!() };
+        let Message::Sync { nodes, have, config_elided, .. } = build_compact_sync(&sub, false).await else { unreachable!() };
         assert_eq!(nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["sub"]);
         assert!(have.unwrap().records.len() >= 3 && config_elided);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2097,6 +2130,41 @@ mod tests {
         merge_sync(&sub, None, vec![], vec![crate::signing::sign_beat("x", 50, &x).unwrap()], &relayed).await;
         assert!(live(&sub));
         assert_eq!(beats_to_relay(&sub).len(), 1, "and it is passed on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn beats_go_only_to_peers_that_ask_and_lack_them() {
+        let (dir, sub, x, _) = signed_nodes_setup();
+        let relayed = SyncSource::default();
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![crate::signing::sign_beat("x", 50, &x).unwrap()], &relayed).await;
+        let config = sub.dynamic_config.read().await.clone();
+        let beats_in = |reply: &Message| {
+            let Message::Sync { beats, .. } = reply else { unreachable!() };
+            beats.iter().map(|b| (b.id.clone(), b.beat)).collect::<Vec<_>>()
+        };
+        let asking = |held: &[(&str, u64)]| messages::SyncDigest {
+            want_beats: true,
+            beats: held.iter().map(|(id, b)| (id.to_string(), *b)).collect(),
+            ..digest_of(&[], &config)
+        };
+
+        // Not asked: none.
+        assert!(beats_in(&build_sync_reply(&sub, &digest_of(&[], &config)).await).is_empty());
+        // Asked: only what the peer lacks or holds older.
+        assert_eq!(beats_in(&build_sync_reply(&sub, &asking(&[])).await), [("x".to_string(), 50)]);
+        assert_eq!(beats_in(&build_sync_reply(&sub, &asking(&[("x", 40)])).await), [("x".to_string(), 50)]);
+        assert!(beats_in(&build_sync_reply(&sub, &asking(&[("x", 50)])).await).is_empty());
+        // What we send unprompted carries only our own beat, and we have none.
+        assert!(beats_in(&build_compact_sync(&sub, true).await).is_empty());
+        assert!(beats_in(&build_sync_msg(&sub, true).await).is_empty());
+        let Message::Sync { have: Some(have), .. } = build_compact_sync(&sub, true).await else { unreachable!() };
+        assert_eq!(have.beats, [("x".to_string(), 50)], "the digest says which beat we hold");
+        // A digest from a node predating the field asks for all of them.
+        let old: messages::SyncDigest = rmp_serde::from_slice(&rmp_serde::to_vec_named(&serde_json::json!({
+            "records": [], "configVersion": 0, "configHash": 0,
+        })).unwrap()).unwrap();
+        assert!(old.want_beats);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2162,13 +2230,13 @@ mod tests {
     async fn older_peers_get_full_syncs() {
         let state = state_for("me");
         // No digest from the initiator: reply with everything, config included.
-        let Message::Sync { config_elided, have, .. } = build_sync_msg(&state).await else { unreachable!() };
+        let Message::Sync { config_elided, have, .. } = build_sync_msg(&state, false).await else { unreachable!() };
         assert!(!config_elided && have.is_some());
         // Until a peer's reply carries a digest, it gets full syncs.
-        let Message::Sync { config_elided, .. } = sync_msg_for(&state, "old:1").await else { unreachable!() };
+        let Message::Sync { config_elided, .. } = sync_msg_for(&state, "old:1", false).await else { unreachable!() };
         assert!(!config_elided);
         state.delta_peers.lock().unwrap().insert("new:1".into());
-        let Message::Sync { config_elided, .. } = sync_msg_for(&state, "new:1").await else { unreachable!() };
+        let Message::Sync { config_elided, .. } = sync_msg_for(&state, "new:1", false).await else { unreachable!() };
         assert!(config_elided);
     }
 }

@@ -354,8 +354,11 @@ pub(super) async fn establish_tunnel(
 /// A node with an address is reached there, and only that node may answer:
 /// whoever else gossip says is at the address, a tunnel for `node` never
 /// goes to them. A NAT'd node that signs its record is reached only through
-/// a relay it lists there. An older NAT'd node, known from unsigned gossip,
-/// through its gossiped relay.
+/// a relay it lists there: the live one ranking highest for this subscriber
+/// (rendezvous hashing on the two ids). Each subscriber sticks to one, and
+/// across subscribers the tunnels, and the reverse connections the node
+/// keeps at each relay, are used evenly. An older NAT'd node, known from
+/// unsigned gossip, through its gossiped relay.
 pub(crate) fn tunnel_route(node: &NodeInfo, state: &SharedState) -> Option<(String, Option<String>)> {
     if !node.addr.is_empty() {
         return Some((node.addr.clone(), Some(node.id.clone())));
@@ -363,18 +366,15 @@ pub(crate) fn tunnel_route(node: &NodeInfo, state: &SharedState) -> Option<(Stri
     if node.signed.is_some() {
         let known = state.known_nodes.load();
         let now = Instant::now();
-        let relays: Vec<&NodeInfo> = node
+        let mut relays: Vec<&NodeInfo> = node
             .relays
             .iter()
             .filter_map(|id| known.get(id))
             .filter(|relay| !relay.addr.is_empty())
             .collect();
-        // Prefer a live relay we already have a session with.
-        let relay = relays
-            .iter()
-            .find(|r| crate::state::node_is_live(r, now) && state.mux_pool.contains(&r.addr))
-            .or_else(|| relays.iter().find(|r| crate::state::node_is_live(r, now)))
-            .or(relays.first())?;
+        let me = state.config.node_id.as_str();
+        relays.sort_by_key(|r| std::cmp::Reverse(crate::node::reverse::rendezvous_score(me, &r.id)));
+        let relay = relays.iter().find(|r| crate::state::node_is_live(r, now)).or(relays.first())?;
         return Some((relay.addr.clone(), Some(relay.id.clone())));
     }
     node.relay.as_ref().map(|relay| (relay.clone(), state.node_at(relay)))
@@ -566,5 +566,40 @@ mod tests {
         // An older, unsigned NAT'd node: its gossiped relay, as before.
         let old = NodeInfo { id: "o".into(), relay: Some("m:1".into()), ..Default::default() };
         assert_eq!(tunnel_route(&old, &state), Some(("m:1".into(), Some("m".into()))));
+    }
+
+    #[tokio::test]
+    async fn subscribers_spread_a_natd_nodes_tunnels_over_its_relays() {
+        let natd = NodeInfo {
+            id: "n".into(),
+            relays: vec!["r1".into(), "r2".into(), "r3".into()],
+            signed: Some(crate::config::SignedNode { record_json: String::new(), cert: String::new(), signature: String::new() }),
+            ..Default::default()
+        };
+        let mut used: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for sub in 0..60 {
+            let cfg = Config { node_id: format!("sub-{sub}"), ..Config::default() };
+            let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+            state
+                .update_known_nodes(|kn| {
+                    for r in &natd.relays {
+                        let relay = NodeInfo { id: r.clone(), addr: format!("{r}:1"), last_seen: Some(Instant::now()), ..Default::default() };
+                        kn.insert(r.clone(), relay);
+                    }
+                })
+                .await;
+            let (addr, expect) = tunnel_route(&natd, &state).unwrap();
+            // The same choice every time, so its warm connections stay put.
+            assert_eq!(tunnel_route(&natd, &state), Some((addr.clone(), expect.clone())));
+            *used.entry(addr.clone()).or_default() += 1;
+
+            // Once that relay stops being live, another is used.
+            let id = expect.unwrap();
+            state.update_known_nodes(|kn| kn.get_mut(&id).unwrap().last_seen = None).await;
+            assert_ne!(tunnel_route(&natd, &state).unwrap().0, addr);
+        }
+        // 60 subscribers over 3 relays: about 20 each, not all on one.
+        assert_eq!(used.len(), 3, "{used:?}");
+        assert!(used.values().all(|&n| (8..=32).contains(&n)), "{used:?}");
     }
 }

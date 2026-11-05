@@ -65,6 +65,25 @@ pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
     }
 }
 
+/// Like [`load_or_create`], but never creates anything: for the CLI. A
+/// directory with no certificates there is a mistyped `--cert-dir` (or a
+/// node's `tlsDir` before its daemon first ran), not a new cluster, and a
+/// CA made up on the spot would only fail the handshake later, obscurely.
+pub fn load_existing(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
+    let dir = Path::new(tls_dir);
+    let has = |name: &str| dir.join(name).is_file();
+    if has("ca.crt") && (has("ca.key") || (has("node.crt") && has("node.key"))) {
+        return load_or_create(tls_dir, node_id);
+    }
+    if !dir.is_dir() {
+        bail!("certificate directory {tls_dir} does not exist");
+    }
+    bail!(
+        "no certificates in {tls_dir}: expected ca.crt, node.crt and node.key (as written by \
+         `stouter cert issue`), or ca.crt and ca.key (the CA's own directory)"
+    )
+}
+
 /// Issue a leaf certificate for `node_id`, signed by the CA in `tls_dir`, and
 /// write `ca.crt`, `node.crt`, and `node.key` (all PEM) to `out_dir`.
 ///
@@ -303,6 +322,30 @@ mod tests {
 
         // The issued material still loads.
         load_or_create(out.to_str().unwrap(), "n2").unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_cli_never_makes_up_a_ca() {
+        let base = std::env::temp_dir().join(format!("stouter_pki_{}_{}", std::process::id(), rand::random::<u64>()));
+        // A directory that doesn't exist, or holds no certificates: refused,
+        // and nothing is created.
+        let missing = base.join("typo");
+        let err = load_existing(missing.to_str().unwrap(), "admin").err().expect("refused");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(!missing.exists());
+        std::fs::create_dir_all(&missing).unwrap();
+        let err = load_existing(missing.to_str().unwrap(), "admin").err().expect("refused");
+        assert!(err.to_string().contains("no certificates"), "{err}");
+        assert!(std::fs::read_dir(&missing).unwrap().next().is_none(), "nothing written");
+
+        // The CA's own directory, and certificates `cert issue` wrote, load.
+        let ca = base.join("ca");
+        load_or_create(ca.to_str().unwrap(), "n1").unwrap();
+        load_existing(ca.to_str().unwrap(), "admin").unwrap();
+        let issued = base.join("issued");
+        issue_cert_to_dir(ca.to_str().unwrap(), "admin", issued.to_str().unwrap()).unwrap();
+        load_existing(issued.to_str().unwrap(), "admin").unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 }

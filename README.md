@@ -197,6 +197,12 @@ Copy the resulting files to the new node's `tlsDir` before starting it.
 2. `ca.crt` + `node.crt` + `node.key` present → use pre-issued cert
 3. Nothing present → generate new CA (written to disk) and node cert (memory only)
 
+Only the daemon does step 3. CLI commands (with `--cert-dir`, or the local
+config's `tlsDir`) refuse a directory without certificates, so a mistyped path
+gives a clear error instead of a new CA that no node trusts. Local `service`
+commands on a host whose daemon has never run skip telling peers; the daemon
+does when it starts.
+
 Private keys (`ca.key`, and the `node.key` written by `cert issue`) are created
 readable by their owner only (`0600`); stouter warns at startup if an existing
 key is readable by other users.
@@ -278,8 +284,12 @@ any node is.
 
 **Liveness.** A node with an address is alive to a peer that reaches it, or
 that it syncs with itself. An `outboundOnly` node can't be reached, so every
-5 seconds it signs a small *beat*, a rising counter, which everyone relays and
-checks against the key in its record: that is how subscribers know it is up.
+5 seconds it signs a small *beat*, a rising counter, checked against the key
+in its record: that is how subscribers know it is up. It sends its beat to
+every node with an address in its own syncs. Each round a node also asks two
+of its peers for the beats it lacks, which is how beats reach nodes the NAT'd
+node can't sync with (other NAT'd nodes). A beat is never sent to a peer that
+already has it, so beats cost little even when many nodes are NAT'd.
 Heartbeats and beats have the node's *incarnation* as their high half, one
 higher every time the daemon starts (kept in `<config file>.state`, and never
 below the current Unix time), so a restarted node always outranks what it
@@ -459,7 +469,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay ranking highest for it (rendezvous hashing again, on the subscriber's and relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, instead of all going through one. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
 
 ### Multiplexing (Yamux)
 

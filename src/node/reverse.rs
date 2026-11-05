@@ -99,10 +99,11 @@ fn choose_relays<'a>(
     chosen
 }
 
-/// How strongly `nat_id` prefers `relay_id`: a hash of the pair, the same
-/// on every node and across restarts.
-fn rendezvous_score(nat_id: &str, relay_id: &str) -> u64 {
-    let bytes = nat_id.bytes().chain([0]).chain(relay_id.bytes());
+/// How strongly node `chooser` prefers relay `relay_id`: a hash of the
+/// pair, the same on every node and across restarts. A NAT'd node picks its
+/// relays by it, and a subscriber which of a NAT'd node's relays to use.
+pub(crate) fn rendezvous_score(chooser: &str, relay_id: &str) -> u64 {
+    let bytes = chooser.bytes().chain([0]).chain(relay_id.bytes());
     let mut h = bytes.fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     // FNV-1a barely mixes its last bytes: finish with an avalanche
     // (MurmurHash3's), so ids differing only at the end score unrelated.
