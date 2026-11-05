@@ -57,12 +57,19 @@ Create a `stouter.json` file:
 | `advertiseAddr` | Address peers use to reach this node |
 | `nodeId` | Unique identifier for this node |
 | `outboundOnly` | Set `true` for nodes behind NAT — disables listener, uses reverse connections |
-| `reversePoolSize` | Number of idle reverse connections to maintain per relay peer (default 64, at most 1024: relays refuse more from one node) |
+| `reversePoolSize` | Number of idle reverse connections an `outboundOnly` node keeps at each of its 3 relays (default 64, at most 1024: relays refuse more from one node) |
 | `knownNodes` | Bootstrap peer addresses for initial gossip |
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
 | `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default) disables admin RPC |
 | `apiPort` | Subscribe-mode REST API port on `127.0.0.1` (default 5381). Set per-cluster when running multiple instances on one host. |
 | `requireSignedConfig` | Accept a config change only if a certificate in `adminCns` signed it (see [Signed config changes](#signed-config-changes)). Default `false`. |
+
+The daemon won't start if one of its own settings is wrong (an invalid
+`httpListen`, a `reversePoolSize` over the limit, `requireSignedConfig` without
+`adminCns`, and so on). Problems in `dynamicConfig`, such as a service listed
+twice, are logged as warnings instead: that config is the cluster's, a newer
+version may already fix it, and a node that refused to start over it could
+never receive the fix. `stouter check` reports both kinds.
 
 ### Modes
 
@@ -96,9 +103,19 @@ stouter service list
 # Issue a signed node certificate (run on the CA node)
 stouter cert issue --node host2 --out /path/to/certs
 
+# Copy the cluster's dynamic config into the local file (to edit it by hand)
+stouter config pull --remote host1:8080
+
 # Sign the dynamic config in the local file and push it (hand edits, with requireSignedConfig)
 stouter --cert-dir /path/to/admin-certs config push --remote host1:8080
 ```
+
+`config push` replaces the cluster's dynamic config with the file's, so it
+refuses a file older than the cluster's config: pushing it would undo the
+changes made since. Run `config pull` (it keeps a copy of the file as `.bak`
+if its services or routes differ), redo the edit, and push; or pass `--force`
+to replace the cluster's config anyway. After a push the file holds the version
+pushed, so the next edit starts from it.
 
 ### Registering Services
 
@@ -226,10 +243,25 @@ once. Docker's default stop timeout is 10s; pass `-t 30` to `docker stop` (or
 ### Gossip Protocol
 
 Every 10 seconds each node connects to all known peers (all at once, each
-with a 10s timeout) and exchanges a `Sync` message containing its current
-config version and known node list. On receiving a sync:
+with a 10s timeout) and exchanges a `Sync` message. Only what changed travels:
 
-- If the peer has a higher config version, the local dynamic config is replaced.
+- The initiator sends its own record and a digest: the version of every node
+  record it holds, and its config's version and hash.
+- The peer merges that and replies with only the records the initiator lacks
+  or holds older versions of, and the config only if the peer's is newer (or
+  different at the same version).
+- A peer running an older version sends no digest; it gets full syncs (every
+  record and the config) instead, as before.
+
+A node re-signs its record only when its address, health report or relays
+change, not every round, so most rounds carry no records at all. Measured
+per node: 22 KB/s before, 4 KB/s after with 10 nodes; 91 KB/s before, 9 KB/s
+after with 20. It still grows with the cluster, as every node syncs with every
+peer each round, but in proportion to it rather than with its square.
+
+On receiving a config:
+
+- If it has a higher version, the local dynamic config is replaced.
   Two *different* configs at the same version (changes made at once on two
   nodes) are settled the same way everywhere, by the `changedBy` node that made
   each and then by content, so the cluster can't stay split.
@@ -244,18 +276,25 @@ services down or fake X's heartbeat. Once X has been seen signed, unsigned
 gossip about X is ignored; with `requireSignedConfig`, unsigned gossip about
 any node is.
 
-**Liveness.** Each node's heartbeat advances every few seconds and is relayed
-by everyone else. Its high half is the node's *incarnation*, one higher every
-time the daemon starts (kept in `<config file>.state`, and never below the
-current Unix time), so a restarted node always outranks what it gossiped
-before, even if its clock was set back meanwhile. A rising heartbeat proves a node is
-alive even to peers that can't reach it, which is how subscribers know an
-`outboundOnly` node is up. A node with no sign of life (no direct contact, no
-rising heartbeat) for 5 minutes is forgotten. A node that leaves or is
-forgotten is remembered for 30 minutes as departed, so a peer that still has a
-stale copy can't gossip it back; it rejoins as soon as it gossips a heartbeat
-newer than the one it left with (i.e. it restarted). A forgotten node may only
-have been cut off, so its last address is retried about once a minute for 24
+**Liveness.** A node with an address is alive to a peer that reaches it, or
+that it syncs with itself. An `outboundOnly` node can't be reached, so every
+5 seconds it signs a small *beat*, a rising counter, which everyone relays and
+checks against the key in its record: that is how subscribers know it is up.
+Heartbeats and beats have the node's *incarnation* as their high half, one
+higher every time the daemon starts (kept in `<config file>.state`, and never
+below the current Unix time), so a restarted node always outranks what it
+gossiped before, even if its clock was set back meanwhile. A node with no sign
+of life for 5 minutes is forgotten.
+
+**Departures.** A node shutting down signs a final record saying it left, and
+sends it to its peers with `NodeLeave`. Its peers keep that record for 30
+minutes and pass it on to anyone still listing the node, so the departure
+reaches nodes the leave message didn't (an `outboundOnly` node, which no one
+can send to, or one that was briefly cut off) within a sync round, instead of
+after the 5-minute expiry. A node that left or was forgotten is not brought
+back by a stale copy of its record; it rejoins with a newer one (it
+restarted) or by talking to its peers itself. A forgotten node may only have
+been cut off, so its last address is retried about once a minute for 24
 hours: when the network heals, the two sides find each other again even if
 neither lists the other in `knownNodes`. A daemon never lists itself as a
 peer.
@@ -264,9 +303,9 @@ Message types:
 
 | Message | Purpose |
 |---|---|
-| `Sync` | Full state exchange (config + known nodes) |
+| `Sync` | State exchange: records, beats and config, as a digest-based delta with peers that support it |
 | `ConfigUpdate` | Notify peers of a new config version |
-| `NodeJoin` / `NodeLeave` | Cluster membership changes (a node may only announce its own) |
+| `NodeJoin` / `NodeLeave` | Cluster membership changes (a node may only announce its own; a leave carries its signed final record) |
 | `TunnelRequest` | Client requesting a tunnel to a named service |
 | `ReverseRegistration` | NAT'd node registering an idle reverse connection |
 | `MuxTunnel` | Upgrade connection to yamux multiplexing |
@@ -280,8 +319,8 @@ Limits, so one peer can't exhaust a node:
   encoded (a signed config counts its signed copy too) is refused, since it
   could never reach the rest of the cluster.
 - One peer may hold at most 64 connections waiting for their first message
-  (subscribers keep 8 warm per node), 16 mux sessions, and 1024 idle reverse
-  connections. Accepted connections use TCP keepalive, so ones whose peer
+  (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, and 1024
+  idle reverse connections. Accepted connections use TCP keepalive, so ones whose peer
   vanished are closed.
 
 ### Tunnel Routing
@@ -408,7 +447,7 @@ failures health checks can't see, such as a node being unreachable.
 
 ### NAT Traversal via Reverse Connections
 
-Nodes with `"outboundOnly": true` cannot accept inbound connections. Instead, they maintain a pool of outbound connections to every reachable relay peer:
+Nodes with `"outboundOnly": true` cannot accept inbound connections. Instead, they maintain a pool of outbound connections to 3 relays, picked among the live nodes that have an address:
 
 ```
 NAT'd node                  Relay node
@@ -420,11 +459,11 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay peer at all times. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer a known peer.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
 
 ### Multiplexing (Yamux)
 
-To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessions to each peer. Multiple concurrent tunnels share a single underlying TCP connection. The mux pool is filled proactively in the background so streams are available without waiting for a new handshake.
+To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessions, and 8 warm connections, to each node their tunnels go to: the nodes hosting a service they proxy (after `subscribeFilter`), or for an `outboundOnly` one, the relay they reach it through. Multiple concurrent tunnels share a single underlying TCP connection. The mux pool is filled proactively in the background so streams are available without waiting for a new handshake. When a node no longer hosts anything proxied, its warm connections are closed, and its session once the tunnels on it finish.
 
 ### mTLS / PKI
 
@@ -452,7 +491,9 @@ any node can relay a signed config but none can alter it.
   `--remote`, they sign the change written to the local file.
 - Editing a config file by hand no longer changes anything: the node logs a
   warning. Apply the edit with
-  `stouter --cert-dir <admin certs> config push [--remote host:port]`.
+  `stouter --cert-dir <admin certs> config push [--remote host:port]`
+  (start from `stouter config pull` so the edit is on top of the cluster's
+  current config).
 - Issue the admin certificate with `stouter cert issue --node <admin CN>` and
   list that CN in `adminCns` on every node.
 

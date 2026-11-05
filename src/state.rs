@@ -87,6 +87,9 @@ pub fn node_is_live(node: &NodeInfo, now: std::time::Instant) -> bool {
 struct Tombstone {
     heartbeat: u64,
     at: std::time::Instant,
+    /// The node's signed "left" record, when it said so itself: relayed
+    /// (see `departed_records`) so the departure reaches every node.
+    record: Option<(u64, crate::config::SignedNode)>,
 }
 
 /// Whether an idle connection has been closed by its peer or is otherwise
@@ -226,6 +229,19 @@ impl<T: Send + tokio::io::AsyncRead + Unpin> StreamPool<T> {
             streams.retain_mut(|s| !idle_stream_closed(s));
             dropped += before - streams.len();
             !streams.is_empty()
+        });
+        dropped
+    }
+
+    /// Drop every idle connection for keys `keep` rejects. Returns how many.
+    pub fn retain_keys(&self, keep: impl Fn(&str) -> bool) -> usize {
+        let mut dropped = 0;
+        self.connections.lock().unwrap().retain(|key, streams| {
+            let kept = keep(key);
+            if !kept {
+                dropped += streams.len();
+            }
+            kept
         });
         dropped
     }
@@ -378,6 +394,13 @@ pub struct SharedState {
     pub(crate) own_record: Mutex<Option<OwnRecord>>,
     /// Open connections per (kind, peer CN), for the per-peer limits.
     peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
+    /// Peer addresses known to speak delta sync (their replies say so), so
+    /// syncs to them can be compact.
+    pub(crate) delta_peers: Mutex<std::collections::HashSet<String>>,
+    /// This node's last beat and when it was made (NAT'd nodes only).
+    pub(crate) own_beat: Mutex<Option<(crate::config::SignedBeat, std::time::Instant)>>,
+    /// Set at shutdown: this node's record now says it left.
+    pub leaving: std::sync::atomic::AtomicBool,
 }
 
 /// One of a peer's limited connections (see [`SharedState::try_peer_slot`]);
@@ -399,12 +422,11 @@ impl Drop for PeerSlot {
     }
 }
 
-/// This node's last record (see `gossip::snapshot_nodes`): its content, the
-/// heartbeat and signature it went out with, and when it was made.
+/// This node's last record (see `gossip::own_record`): its content, and
+/// the version and signature it went out with.
 pub(crate) struct OwnRecord {
     pub record: crate::config::NodeRecord,
     pub signed: Option<crate::config::SignedNode>,
-    pub at: std::time::Instant,
 }
 
 impl SharedState {
@@ -445,6 +467,9 @@ impl SharedState {
             forgotten: Mutex::new(HashMap::new()),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
+            delta_peers: Mutex::new(std::collections::HashSet::new()),
+            own_beat: Mutex::new(None),
+            leaving: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -545,13 +570,34 @@ impl SharedState {
 
     /// Remember that `id` departed with heartbeat `heartbeat`.
     pub fn bury(&self, id: &str, heartbeat: u64) {
+        self.bury_with(id, heartbeat, None);
+    }
+
+    /// [`Self::bury`], keeping the node's signed "left" record (at version
+    /// `record.0`) to relay.
+    pub fn bury_with(&self, id: &str, heartbeat: u64, record: Option<(u64, crate::config::SignedNode)>) {
         let mut departed = self.departed.lock().unwrap();
         departed.retain(|_, t| t.at.elapsed() < TOMBSTONE_TTL);
         let tomb = departed
             .entry(id.to_string())
-            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now() });
+            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now(), record: None });
         tomb.heartbeat = tomb.heartbeat.max(heartbeat);
         tomb.at = std::time::Instant::now();
+        if let Some(record) = record {
+            if tomb.record.as_ref().is_none_or(|(held, _)| record.0 > *held) {
+                tomb.record = Some(record);
+            }
+        }
+    }
+
+    /// Signed "left" records of departed nodes: (id, version, record).
+    pub fn departed_records(&self) -> Vec<(String, u64, crate::config::SignedNode)> {
+        let departed = self.departed.lock().unwrap();
+        departed
+            .iter()
+            .filter(|(_, t)| t.at.elapsed() < TOMBSTONE_TTL)
+            .filter_map(|(id, t)| t.record.as_ref().map(|(v, r)| (id.clone(), *v, r.clone())))
+            .collect()
     }
 
     /// Whether gossip about `id` carrying `heartbeat` is just a stale copy

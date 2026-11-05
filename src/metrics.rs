@@ -41,10 +41,9 @@ pub async fn run_gauge_loop(state: Arc<SharedState>) {
 
         // Pool sizes per node
         for node in nodes.values() {
-            let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
-            if !connect_addr.is_empty() {
-                metrics::gauge!("stouter_tunnel_pool_size", "addr" => connect_addr.to_string())
-                    .set(state.tunnel_pool.count(connect_addr) as f64);
+            if let Some((connect_addr, _)) = crate::subscribe::tunnel_route(node, &state) {
+                metrics::gauge!("stouter_tunnel_pool_size", "addr" => connect_addr.clone())
+                    .set(state.tunnel_pool.count(&connect_addr) as f64);
             }
             metrics::gauge!("stouter_reverse_pool_size", "node_id" => node.id.clone())
                 .set(state.reverse_pool.count(&node.id) as f64);

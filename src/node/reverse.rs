@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,18 +11,25 @@ use crate::gossip;
 use crate::gossip::messages::Message;
 use crate::state::{Backoff, SharedState};
 
+/// How many relays a NAT'd node registers reverse connections with. Every
+/// tunnel to it goes through one of them (or a reverse connection it holds
+/// to the subscriber), so a few give redundancy; registering with every
+/// node would make each node's idle connections grow with the cluster.
+pub const RELAY_COUNT: usize = 3;
+
 /// Background task for NAT'd nodes: maintains a pool of idle reverse
-/// connections to all known reachable peers.
+/// connections to each of up to [`RELAY_COUNT`] reachable peers, its relays
+/// (see [`choose_relays`]).
 ///
-/// Spawns `pool_size` persistent worker tasks per peer. Each worker loops:
+/// Spawns `pool_size` persistent worker tasks per relay. Each worker loops:
 /// open connection → wait for tunnel dispatch → handle tunnel → reconnect.
-/// A peer's workers stop when it is no longer a known peer (it left, was
-/// forgotten, or moved to another address), so they don't keep dialling a
+/// A relay's workers stop when it is no longer one (it left, stopped
+/// answering, or moved to another address), so they don't keep dialling a
 /// dead address forever.
 pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
     let pool_size = state.config.pool_size();
-    // Workers per relay address; cancelling the token stops them.
-    let mut relays: HashMap<String, CancellationToken> = HashMap::new();
+    // Relay id -> its address and the token stopping its workers.
+    let mut relays: HashMap<String, (String, CancellationToken)> = HashMap::new();
     let mut interval = time::interval(Duration::from_secs(5));
 
     loop {
@@ -31,35 +38,79 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
             _ = state.shutdown.cancelled() => break,
         }
 
-        let peers: HashSet<String> = state
-            .known_nodes
-            .load()
+        let known = state.known_nodes.load();
+        let now = std::time::Instant::now();
+        let candidates: Vec<(&str, &str)> = known
             .values()
-            .filter(|n| n.relay.is_none() && !n.addr.is_empty())
-            .map(|n| n.addr.clone())
+            .filter(|n| n.relay.is_none() && !n.addr.is_empty() && n.id != state.config.node_id)
+            .filter(|n| crate::state::node_is_live(n, now))
+            .map(|n| (n.id.as_str(), n.addr.as_str()))
+            .collect();
+        let current: Vec<(&str, &str)> = relays.iter().map(|(id, (addr, _))| (id.as_str(), addr.as_str())).collect();
+        let chosen: Vec<(String, String)> = choose_relays(&state.config.node_id, &candidates, &current, RELAY_COUNT)
+            .into_iter()
+            .map(|(id, addr)| (id.to_string(), addr.to_string()))
             .collect();
 
-        relays.retain(|addr, workers| {
-            let keep = peers.contains(addr);
+        relays.retain(|id, (addr, workers)| {
+            let keep = chosen.iter().any(|(c_id, c_addr)| c_id == id && c_addr == addr);
             if !keep {
-                info!("stopping reverse connections to {addr}: no longer a known peer");
+                info!("stopping reverse connections to relay {id} at {addr}: no longer reachable there");
                 workers.cancel();
             }
             keep
         });
 
-        for peer_addr in peers {
-            if relays.contains_key(&peer_addr) {
+        for (id, addr) in chosen {
+            if relays.contains_key(&id) {
                 continue;
             }
+            info!("registering reverse connections with relay {id} at {addr}");
             let workers = state.shutdown.child_token();
             for slot in 0..pool_size {
-                let (state, addr, stop) = (state.clone(), peer_addr.clone(), workers.clone());
+                let (state, addr, stop) = (state.clone(), addr.clone(), workers.clone());
                 tokio::spawn(async move { reverse_worker(state, addr, slot, stop).await });
             }
-            relays.insert(peer_addr, workers);
+            relays.insert(id, (addr, workers));
         }
     }
+}
+
+/// The relays (id, address) a NAT'd node `nat_id` should use, out of the
+/// live reachable `candidates`: the `current` ones still among them, so the
+/// set (which goes into its signed record, and which subscribers hold mux
+/// sessions to) doesn't churn as nodes come and go; then, to fill up to
+/// `count`, the candidates ranking highest for `nat_id` by rendezvous
+/// hashing, which spreads NAT'd nodes evenly over the cluster.
+fn choose_relays<'a>(
+    nat_id: &str,
+    candidates: &[(&'a str, &'a str)],
+    current: &[(&str, &str)],
+    count: usize,
+) -> Vec<(&'a str, &'a str)> {
+    let mut chosen: Vec<(&str, &str)> =
+        candidates.iter().copied().filter(|c| current.contains(c)).collect();
+    chosen.sort_by_key(|(id, _)| std::cmp::Reverse(rendezvous_score(nat_id, id)));
+    chosen.truncate(count);
+    let mut rest: Vec<(&str, &str)> = candidates.iter().copied().filter(|c| !chosen.contains(c)).collect();
+    rest.sort_by_key(|(id, _)| std::cmp::Reverse(rendezvous_score(nat_id, id)));
+    let missing = count.saturating_sub(chosen.len());
+    chosen.extend(rest.into_iter().take(missing));
+    chosen
+}
+
+/// How strongly `nat_id` prefers `relay_id`: a hash of the pair, the same
+/// on every node and across restarts.
+fn rendezvous_score(nat_id: &str, relay_id: &str) -> u64 {
+    let bytes = nat_id.bytes().chain([0]).chain(relay_id.bytes());
+    let mut h = bytes.fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    // FNV-1a barely mixes its last bytes: finish with an avalanche
+    // (MurmurHash3's), so ids differing only at the end score unrelated.
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
 }
 
 /// A single reverse connection worker. Loops until `stop` (shutdown, or the
@@ -148,5 +199,68 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
             Ok(())
         }
         other => bail!("unexpected message on reverse connection: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(chosen: &[(&str, &str)]) -> Vec<String> {
+        let mut ids: Vec<String> = chosen.iter().map(|(id, _)| id.to_string()).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_natd_node_picks_a_few_relays_and_keeps_them() {
+        let names: Vec<String> = (0..10).map(|i| format!("node-{i}")).collect();
+        let addrs: Vec<String> = (0..10).map(|i| format!("10.0.0.{i}:7000")).collect();
+        let all: Vec<(&str, &str)> = names.iter().map(String::as_str).zip(addrs.iter().map(String::as_str)).collect();
+
+        let first = choose_relays("nat-a", &all, &[], RELAY_COUNT);
+        assert_eq!(first.len(), RELAY_COUNT);
+        // The same pick whatever order the candidates come in.
+        let mut reversed = all.clone();
+        reversed.reverse();
+        assert_eq!(ids(&choose_relays("nat-a", &reversed, &[], RELAY_COUNT)), ids(&first));
+
+        // A node joining that would rank higher doesn't displace them.
+        let mut more = all.clone();
+        let extra: Vec<(String, String)> =
+            (10..40).map(|i| (format!("node-{i}"), format!("10.0.0.{i}:7000"))).collect();
+        more.extend(extra.iter().map(|(id, addr)| (id.as_str(), addr.as_str())));
+        assert_eq!(ids(&choose_relays("nat-a", &more, &first, RELAY_COUNT)), ids(&first));
+
+        // One that stops being live is replaced; the others stay.
+        let lost = first[0];
+        let without: Vec<(&str, &str)> = all.iter().copied().filter(|c| *c != lost).collect();
+        let next = choose_relays("nat-a", &without, &first, RELAY_COUNT);
+        assert_eq!(next.len(), RELAY_COUNT);
+        assert!(!next.contains(&lost));
+        assert!(first[1..].iter().all(|r| next.contains(r)));
+
+        // One that moved is a different relay: it's picked afresh.
+        let moved: Vec<(&str, &str)> =
+            all.iter().map(|&(id, addr)| if id == lost.0 { (id, "10.9.9.9:7000") } else { (id, addr) }).collect();
+        assert!(!choose_relays("nat-a", &moved, &first, RELAY_COUNT).contains(&lost));
+
+        // Fewer candidates than wanted: all of them.
+        assert_eq!(choose_relays("nat-a", &all[..2], &[], RELAY_COUNT).len(), 2);
+    }
+
+    #[test]
+    fn natd_nodes_spread_over_the_relays() {
+        let names: Vec<String> = (0..10).map(|i| format!("node-{i}.example.com")).collect();
+        let all: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "addr")).collect();
+        let mut load: HashMap<&str, usize> = HashMap::new();
+        for nat in 0..200 {
+            for (id, _) in choose_relays(&format!("nat-{nat}.example.com"), &all, &[], RELAY_COUNT) {
+                *load.entry(id).or_default() += 1;
+            }
+        }
+        // 600 registrations over 10 relays: about 60 each.
+        assert_eq!(load.len(), 10, "every relay gets some: {load:?}");
+        assert!(load.values().all(|&n| (30..=90).contains(&n)), "{load:?}");
     }
 }

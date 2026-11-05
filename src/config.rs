@@ -345,6 +345,18 @@ impl fmt::Display for MutateErr {
 impl std::error::Error for MutateErr {}
 
 impl DynamicConfig {
+    /// Whether `self` and `other` configure the same services and routes,
+    /// whatever their version, author and signature.
+    pub fn same_settings(&self, other: &DynamicConfig) -> bool {
+        let bare = |dc: &DynamicConfig| DynamicConfig {
+            version: 0,
+            changed_by: String::new(),
+            signature: None,
+            ..dc.clone()
+        };
+        bare(self) == bare(other)
+    }
+
     /// Whether this config should replace `current`: it has a higher
     /// version, or the same version with different content that wins the
     /// tie-break (higher `changedBy`, then the larger serialized form).
@@ -670,6 +682,27 @@ pub struct NodeInfo {
     /// through.
     #[serde(skip)]
     pub relays: Vec<String>,
+    /// Local-only: the version (`heartbeat`) of the signed record held.
+    #[serde(skip)]
+    pub record_version: u64,
+    /// Local-only: the latest beat verified for a node with no address,
+    /// relayed so peers that can't reach it know it's alive.
+    #[serde(skip)]
+    pub beat: Option<SignedBeat>,
+}
+
+/// Proof that a node (one with no address, which peers can't contact) was
+/// alive at `beat`, signed by it. Much smaller than its record, which
+/// changes only when something in it does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedBeat {
+    pub id: String,
+    /// Ordered like heartbeats.
+    pub beat: u64,
+    /// ECDSA P-256/SHA-256 signature (DER, hex) by the key of the node's
+    /// record certificate.
+    pub signature: String,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -683,13 +716,19 @@ pub struct NodeRecord {
     pub id: String,
     /// Where peers connect to it; empty for an `outboundOnly` node.
     pub addr: String,
-    /// Orders records: a node's newer record always has a higher one.
+    /// Orders records: a node's newer record always has a higher one. It
+    /// changes only when the record does (or the node restarts); liveness
+    /// comes from direct contact or, for a node with no address, beats.
     pub heartbeat: u64,
     #[serde(default)]
     pub health: ServiceHealth,
     /// Node ids of the relays it holds reverse connections to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
+    /// The node's last record: it left the cluster. Relayed like any other,
+    /// so the departure reaches nodes the leave message didn't.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub left: bool,
 }
 
 /// A [`NodeRecord`] signed by its node: the exact JSON text, the node's
@@ -862,43 +901,36 @@ impl Default for Config {
 impl Config {
     /// Load configuration from a JSON file at `path`.
     pub fn load(path: &str) -> Result<Self> {
-        let data = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&data)?;
+        let data = std::fs::read_to_string(path).with_context(|| format!("failed to read config file '{path}'"))?;
+        let config: Self = serde_json::from_str(&data).with_context(|| format!("invalid JSON in '{path}'"))?;
         Ok(config)
     }
 
-    /// Validate structural invariants of the dynamic config:
-    /// - service group names are unique
-    /// - service names within a group are unique
-    /// - domain names are globally unique across all services
+    /// Everything wrong with the config: [`Config::validate_local`]'s error,
+    /// else the first of [`Config::config_problems`]. What `stouter check`
+    /// reports.
     pub fn validate(&self) -> Result<()> {
-        if let Some(problem) = self.dynamic_config.problems().into_iter().next() {
-            return Err(anyhow!(problem));
+        self.validate_local()?;
+        match self.config_problems().into_iter().next() {
+            Some(problem) => Err(anyhow!(problem)),
+            None => Ok(()),
         }
+    }
 
-        // Fixed local ports must stay clear of the daemon's own loopback
-        // listeners.
-        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+    /// Check this node's own settings (everything but `dynamicConfig`): a
+    /// problem here is the operator's to fix, so the daemon won't start
+    /// with one.
+    pub fn validate_local(&self) -> Result<()> {
         let subscribes = matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe);
-        if subscribes {
-            port_owner.insert(self.api_port(), "the REST API (apiPort)");
-        }
         if let Some(listen) = &self.http_listen {
             let addr: std::net::SocketAddr = listen
                 .parse()
                 .map_err(|e| anyhow!("httpListen '{listen}' is not an address like 127.0.0.1:15001: {e}"))?;
-            if addr.ip().is_loopback() || addr.ip().is_unspecified() {
-                port_owner.insert(addr.port(), "httpListen");
-            }
             if !subscribes {
                 return Err(anyhow!("`httpListen` is only valid in subscribe or nodeSubscribe mode"));
             }
-        }
-        for name in self.dynamic_config.service_names() {
-            if let Ok(Some(port)) = self.dynamic_config.local_port_for(name) {
-                if let Some(other) = port_owner.get(&port) {
-                    return Err(anyhow!("localPort {port} of '{name}' is already used by {other}"));
-                }
+            if (addr.ip().is_loopback() || addr.ip().is_unspecified()) && addr.port() == self.api_port() {
+                return Err(anyhow!("httpListen port {} is already used by the REST API (apiPort)", addr.port()));
             }
         }
 
@@ -919,15 +951,43 @@ impl Config {
             ));
         }
 
-        if self.subscribe_filter.is_some()
-            && !matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe)
-        {
+        if self.subscribe_filter.is_some() && !subscribes {
             return Err(anyhow!(
                 "`subscribeFilter` is only valid in subscribe or nodeSubscribe mode"
             ));
         }
 
         Ok(())
+    }
+
+    /// Problems with the dynamic config, as it stands here: its own (see
+    /// [`DynamicConfig::problems`]: e.g. duplicate group, service or domain
+    /// names), and fixed `localPort`s that collide with this daemon's own
+    /// listeners. The dynamic config is the cluster's, so a daemon starts
+    /// with these, logging them: a newer version may already fix them, and
+    /// refusing to start would strand the node over someone else's change.
+    pub fn config_problems(&self) -> Vec<String> {
+        let mut problems = self.dynamic_config.problems();
+
+        // Fixed local ports must stay clear of the daemon's own loopback
+        // listeners.
+        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+        if matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe) {
+            port_owner.insert(self.api_port(), "the REST API (apiPort)");
+            if let Some(Ok(addr)) = self.http_listen.as_deref().map(str::parse::<std::net::SocketAddr>) {
+                if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+                    port_owner.insert(addr.port(), "httpListen");
+                }
+            }
+        }
+        for name in self.dynamic_config.service_names() {
+            if let Ok(Some(port)) = self.dynamic_config.local_port_for(name) {
+                if let Some(other) = port_owner.get(&port) {
+                    problems.push(format!("localPort {port} of '{name}' is already used by {other}"));
+                }
+            }
+        }
+        problems
     }
 
     /// Load a config file and validate its structural invariants.
@@ -1425,6 +1485,36 @@ mod tests {
     fn validate_rejects_same_service_twice_on_one_node() {
         let cfg = group_of(vec![instance("api", "n1", &[]), instance("api", "n1", &[])]);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn only_a_nodes_own_settings_stop_it_starting() {
+        // A problem in the cluster's config: reported, but not the node's
+        // to fix, so it starts.
+        let dup = group_of(vec![instance("api", "n1", &[]), instance("api", "n1", &[])]);
+        dup.validate_local().unwrap();
+        assert_eq!(dup.config_problems().len(), 1, "{:?}", dup.config_problems());
+        assert!(dup.validate().is_err(), "`stouter check` still reports it");
+
+        // A fixed localPort on a port this daemon itself listens on: a
+        // problem with the config here, so likewise.
+        let mut taken = group_of(vec![on_port(instance("api", "n1", &[]), 5381)]);
+        taken.mode = Mode::Subscribe;
+        taken.validate_local().unwrap();
+        assert!(taken.config_problems()[0].contains("apiPort"), "{:?}", taken.config_problems());
+
+        // The node's own settings: refused.
+        let mut pool = group_of(vec![]);
+        pool.reverse_pool_size = Some(u16::MAX);
+        assert!(pool.validate_local().is_err());
+        let mut listen = group_of(vec![]);
+        listen.mode = Mode::Subscribe;
+        listen.http_listen = Some("not an address".into());
+        assert!(listen.validate_local().is_err());
+        listen.http_listen = Some(format!("127.0.0.1:{}", listen.api_port()));
+        assert!(listen.validate_local().is_err(), "httpListen on the API's port");
+        listen.http_listen = Some("127.0.0.1:15001".into());
+        listen.validate_local().unwrap();
     }
 
     #[test]

@@ -277,8 +277,9 @@ async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// An established tunnel to a remote node, ready for proxying.
 pub(super) enum Tunnel {
-    /// A stream on a pooled yamux session.
-    Mux(Compat<yamux::Stream>),
+    /// A stream on a pooled yamux session, and a handle keeping that
+    /// session running while the stream is in use.
+    Mux(Compat<yamux::Stream>, #[allow(dead_code)] crate::mux::MuxHandle),
     /// A dedicated mTLS connection (boxed: a TLS stream is large).
     Mesh(Box<MeshStream>),
 }
@@ -290,7 +291,7 @@ impl AsyncRead for Tunnel {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_read(cx, buf),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
@@ -303,7 +304,7 @@ impl AsyncWrite for Tunnel {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_write(cx, buf),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
@@ -313,7 +314,7 @@ impl AsyncWrite for Tunnel {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_flush(cx),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
@@ -323,7 +324,7 @@ impl AsyncWrite for Tunnel {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_shutdown(cx),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
@@ -355,7 +356,7 @@ pub(super) async fn establish_tunnel(
 /// goes to them. A NAT'd node that signs its record is reached only through
 /// a relay it lists there. An older NAT'd node, known from unsigned gossip,
 /// through its gossiped relay.
-fn tunnel_route(node: &NodeInfo, state: &SharedState) -> Option<(String, Option<String>)> {
+pub(crate) fn tunnel_route(node: &NodeInfo, state: &SharedState) -> Option<(String, Option<String>)> {
     if !node.addr.is_empty() {
         return Some((node.addr.clone(), Some(node.id.clone())));
     }
@@ -421,12 +422,12 @@ async fn establish_tunnel_untimed(
     let expect = expect.as_deref();
 
     // A stream on a mux session, if it is with the node we must reach.
-    if let Some(yamux_stream) = state.mux_pool.open_stream(&addr, expect).await {
+    if let Some((yamux_stream, session)) = state.mux_pool.open_stream(&addr, expect).await {
         let mut compat = yamux_stream.compat();
         send_and_check_tunnel(&mut compat, &msg).await?;
         metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
             .record(connect_start.elapsed().as_secs_f64());
-        return Ok(Tunnel::Mux(compat));
+        return Ok(Tunnel::Mux(compat, session));
     }
 
     // A warm pooled connection to that node, else a new one.

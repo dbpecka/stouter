@@ -26,7 +26,7 @@ use tokio_rustls::rustls::sign::SigningKey;
 use tokio_rustls::rustls::{self, SignatureScheme};
 use tracing::{debug, warn};
 
-use crate::config::{ConfigSignature, DynamicConfig, NodeRecord, SignedNode};
+use crate::config::{ConfigSignature, DynamicConfig, NodeRecord, SignedBeat, SignedNode};
 use crate::state::SharedState;
 use crate::tls::TlsContext;
 
@@ -34,6 +34,7 @@ use crate::tls::TlsContext;
 /// state can't be passed off as a signature on another.
 const CONFIG_DOMAIN: &[u8] = b"stouter signed config v1\n";
 const NODE_DOMAIN: &[u8] = b"stouter node record v1\n";
+const BEAT_DOMAIN: &[u8] = b"stouter node beat v1\n";
 
 /// A signing key and the certificate vouching for it.
 pub struct Signer {
@@ -171,6 +172,35 @@ pub fn verify_node(signed: &SignedNode, tls: &TlsContext) -> Result<NodeRecord> 
         bail!("a record for node '{}' signed by '{signer}'", record.id);
     }
     Ok(record)
+}
+
+// ---------------------------------------------------------------------------
+// Beats
+// ---------------------------------------------------------------------------
+
+fn beat_text(id: &str, beat: u64) -> String {
+    format!("{id}\n{beat}")
+}
+
+/// A beat for node `id`, signed by it.
+pub fn sign_beat(id: &str, beat: u64, signer: &Signer) -> Result<SignedBeat> {
+    let signature = signer.sign(BEAT_DOMAIN, &beat_text(id, beat))?;
+    Ok(SignedBeat { id: id.to_string(), beat, signature })
+}
+
+/// Check that `beat` was signed with the key of `cert` (hex DER): the
+/// certificate of the node's record, already verified when the record was.
+pub fn verify_beat(beat: &SignedBeat, cert: &str) -> Result<()> {
+    let cert = CertificateDer::from(unhex(cert).context("certificate")?);
+    let end_entity = webpki::EndEntityCert::try_from(&cert).map_err(|e| anyhow!("certificate: {e:?}"))?;
+    let signature = unhex(&beat.signature).context("signature")?;
+    end_entity
+        .verify_signature(
+            webpki::aws_lc_rs::ECDSA_P256_SHA256,
+            &[BEAT_DOMAIN, beat_text(&beat.id, beat.beat).as_bytes()].concat(),
+            &signature,
+        )
+        .map_err(|_| anyhow!("the beat's signature does not verify"))
 }
 
 fn hex(bytes: &[u8]) -> String {

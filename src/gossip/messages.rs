@@ -10,10 +10,26 @@ use crate::config::{DynamicConfig, NodeInfo};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Message {
-    /// Full state synchronisation: send our current config and known peer list.
+    /// State synchronisation: our config and known nodes.
+    ///
+    /// Between nodes that both send `have` (this version on), a sync is a
+    /// delta: the initiator sends its own record, its digest and beats; the
+    /// reply carries only records the initiator lacks or holds older, and
+    /// the config only if it's newer. Older nodes always send and get
+    /// everything, and ignore the new fields.
     Sync {
         config: DynamicConfig,
         nodes: Vec<NodeInfo>,
+        /// Liveness of nodes with no address (see `SignedBeat`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        beats: Vec<crate::config::SignedBeat>,
+        /// What the sender holds, so a reply can leave out the rest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        have: Option<SyncDigest>,
+        /// `config` is a placeholder: the sender's isn't newer than what
+        /// the receiver has (per its digest). Never sent to older nodes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        config_elided: bool,
     },
     /// Announce an updated dynamic configuration.
     ConfigUpdate { config: DynamicConfig },
@@ -26,6 +42,10 @@ pub enum Message {
         id: String,
         #[serde(default)]
         heartbeat: u64,
+        /// Its final signed record (`left: true`), which peers relay on to
+        /// nodes this message doesn't reach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<crate::config::SignedNode>,
     },
     /// Request to tunnel traffic to a service on a specific node.
     TunnelRequest {
@@ -55,6 +75,20 @@ pub enum Message {
     AdminRequest { op: AdminOp },
     /// Reply to an `AdminRequest`.
     AdminResponse { result: AdminResult },
+}
+
+/// What a `Sync` sender holds: the version of each node record (departed
+/// nodes' last ones included) and of its config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDigest {
+    #[serde(default)]
+    pub records: Vec<(String, u64)>,
+    #[serde(default)]
+    pub config_version: u64,
+    /// Content hash of the config, to tell two configs at one version apart.
+    #[serde(default)]
+    pub config_hash: u64,
 }
 
 /// A single admin operation. Extend this enum to add new mutating commands
@@ -354,9 +388,9 @@ mod tests {
 
     #[test]
     fn node_leave_round_trip() {
-        let msg = Message::NodeLeave { id: "n1".into(), heartbeat: 7 };
+        let msg = Message::NodeLeave { id: "n1".into(), heartbeat: 7, record: None };
         match msgpack_round_trip(&msg) {
-            Message::NodeLeave { id, heartbeat } => assert_eq!((id.as_str(), heartbeat), ("n1", 7)),
+            Message::NodeLeave { id, heartbeat, .. } => assert_eq!((id.as_str(), heartbeat), ("n1", 7)),
             _ => panic!("wrong variant"),
         }
     }
@@ -400,6 +434,9 @@ mod tests {
     fn sync_round_trip() {
         let msg = Message::Sync {
             config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![], ..Default::default() },
+            beats: vec![],
+            have: None,
+            config_elided: false,
             nodes: vec![NodeInfo {
                 id: "n1".into(),
                 addr: "10.0.0.1:8080".into(),
@@ -413,7 +450,7 @@ mod tests {
             }],
         };
         match msgpack_round_trip(&msg) {
-            Message::Sync { config, nodes } => {
+            Message::Sync { config, nodes, .. } => {
                 assert_eq!(config.version, 1);
                 assert_eq!(nodes.len(), 1);
                 assert_eq!(nodes[0].id, "n1");

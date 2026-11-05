@@ -4,6 +4,8 @@ mod http;
 mod listener;
 mod proxy;
 
+pub(crate) use proxy::tunnel_route;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -315,20 +317,39 @@ async fn manage_proxies(
     }
 }
 
-/// Connect addresses for every known node (its relay's, if it has one),
-/// without duplicates: several NAT'd nodes can share one relay.
-fn node_connect_addrs(state: &SharedState) -> Vec<String> {
-    let mut addrs: Vec<String> = Vec::new();
-    for node in state.known_nodes.load().values() {
-        let addr = node.relay.as_deref().unwrap_or(&node.addr);
-        if !addr.is_empty() && !addrs.iter().any(|a| a == addr) {
-            addrs.push(addr.to_string());
-        }
-    }
-    addrs
+/// Ids of the nodes hosting a service this daemon proxies (by name, as a
+/// proxy routes: see `proxy::service_backends`), other than itself.
+fn proxied_nodes(dc: &crate::config::DynamicConfig, config: &crate::config::Config) -> HashSet<String> {
+    let filter = config.subscribe_filter.as_ref().filter(|f| !f.is_empty());
+    let services = || dc.service_groups.iter().flat_map(|g| g.services.iter().map(move |s| (g, s)));
+    let names: HashSet<&str> = services()
+        .filter(|(g, s)| filter.is_none_or(|f| f.allows(&g.name, &s.name)))
+        .map(|(_, s)| s.name.as_str())
+        .collect();
+    services()
+        .filter(|(_, s)| names.contains(s.name.as_str()) && s.node_id != config.node_id)
+        .map(|(_, s)| s.node_id.clone())
+        .collect()
 }
 
-/// Background task that maintains warm TCP connections to known nodes.
+/// Where this daemon's tunnels go: the connect address (see
+/// `proxy::tunnel_route`) of each node hosting a service it proxies,
+/// without duplicates, as several NAT'd nodes can share a relay. Only these
+/// get warm connections and mux sessions, so a subscriber's idle
+/// connections grow with what it proxies, not with the cluster.
+async fn tunnel_addrs(state: &SharedState) -> HashSet<String> {
+    let wanted = proxied_nodes(&*state.dynamic_config.read().await, &state.config);
+    let known = state.known_nodes.load();
+    wanted
+        .iter()
+        .filter_map(|id| known.get(id))
+        .filter_map(|node| proxy::tunnel_route(node, state))
+        .map(|(addr, _)| addr)
+        .collect()
+}
+
+/// Background task that maintains warm TCP connections to the nodes this
+/// daemon's tunnels go to (see [`tunnel_addrs`]).
 ///
 /// These pre-established connections eliminate TCP handshake latency on
 /// the proxy hot path. An address that can't be reached is retried with
@@ -340,8 +361,14 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
 
     while !state.shutdown.is_cancelled() {
         let now = tokio::time::Instant::now();
-        let known = node_connect_addrs(&state);
-        backoff.retain(|addr| known.iter().any(|a| a == addr));
+        let known = tunnel_addrs(&state).await;
+        backoff.retain(|addr| known.contains(addr));
+        // Tunnels no longer go there (the service moved, the node left, or
+        // its relay changed): close what is warm for them.
+        let dropped = state.tunnel_pool.retain_keys(|addr| known.contains(addr));
+        if dropped > 0 {
+            tracing::debug!("closed {dropped} warm connection(s) no tunnel needs");
+        }
         let wanted: Vec<String> = known
             .into_iter()
             .filter(|addr| state.tunnel_pool.count(addr) < POOL_TARGET && backoff.ready(addr, now))
@@ -379,7 +406,8 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
     }
 }
 
-/// Background task that maintains yamux multiplexed sessions to known nodes.
+/// Background task that maintains yamux multiplexed sessions to the nodes
+/// this daemon's tunnels go to (see [`tunnel_addrs`]).
 ///
 /// Checks every 5 seconds for nodes without a live mux session and
 /// establishes one, all addresses at once and with backoff for ones that
@@ -389,8 +417,12 @@ async fn maintain_mux_sessions(state: Arc<SharedState>) {
     let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
     while !state.shutdown.is_cancelled() {
         let now = tokio::time::Instant::now();
-        let known = node_connect_addrs(&state);
-        backoff.retain(|addr| known.iter().any(|a| a == addr));
+        let known = tunnel_addrs(&state).await;
+        backoff.retain(|addr| known.contains(addr));
+        let dropped = state.mux_pool.retain(|addr| known.contains(addr));
+        if dropped > 0 {
+            info!("closing {dropped} mux session(s) no tunnel needs");
+        }
         let wanted: Vec<String> = known
             .into_iter()
             .filter(|addr| !state.mux_pool.contains(addr) && backoff.ready(addr, now))
@@ -416,5 +448,57 @@ async fn maintain_mux_sessions(state: Arc<SharedState>) {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             _ = state.shutdown.cancelled() => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, DynamicConfig, SubscribeFilter};
+
+    fn dc() -> DynamicConfig {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "serviceGroups": [
+                {"name": "web", "services": [
+                    {"name": "api", "nodeId": "a", "nodePort": 1},
+                    {"name": "api", "nodeId": "b", "nodePort": 1},
+                    {"name": "ui", "nodeId": "c", "nodePort": 1},
+                ]},
+                {"name": "batch", "services": [
+                    {"name": "jobs", "nodeId": "d", "nodePort": 1},
+                    {"name": "api", "nodeId": "e", "nodePort": 1},
+                    {"name": "own", "nodeId": "me", "nodePort": 1},
+                ]},
+            ],
+        }))
+        .unwrap()
+    }
+
+    fn sorted(ids: HashSet<String>) -> Vec<String> {
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn warm_connections_go_only_to_nodes_hosting_proxied_services() {
+        let all = Config { node_id: "me".into(), ..Config::default() };
+        // No filter: every service's nodes, but never ourselves.
+        assert_eq!(sorted(proxied_nodes(&dc(), &all)), ["a", "b", "c", "d", "e"]);
+
+        // A filter limits them to what it lets through; a proxy routes by
+        // service name, so that's "api" in any group (e is in "batch").
+        let filtered = Config {
+            subscribe_filter: Some(SubscribeFilter { services: vec!["api".into()], ..Default::default() }),
+            ..all.clone()
+        };
+        assert_eq!(sorted(proxied_nodes(&dc(), &filtered)), ["a", "b", "e"]);
+
+        let by_group = Config {
+            subscribe_filter: Some(SubscribeFilter { service_groups: vec!["batch".into()], ..Default::default() }),
+            ..all
+        };
+        assert_eq!(sorted(proxied_nodes(&dc(), &by_group)), ["a", "b", "d", "e"]);
     }
 }

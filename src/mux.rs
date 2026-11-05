@@ -73,11 +73,14 @@ impl MuxPool {
     /// Try to open a new yamux stream on an existing session for `addr`.
     ///
     /// Returns `None` if no session exists. Removes dead sessions on error.
+    /// With the stream comes a handle to its session: hold it as long as
+    /// the stream, since a session ends once nothing holds a handle to it
+    /// (the pool may drop its own: see [`MuxPool::retain`]).
     ///
     /// With `expect`, only if the session is with that node: sessions are
     /// keyed by address, and a tunnel must reach the node it is meant for
     /// whatever gossip says about who is at that address.
-    pub async fn open_stream(&self, addr: &str, expect: Option<&str>) -> Option<yamux::Stream> {
+    pub async fn open_stream(&self, addr: &str, expect: Option<&str>) -> Option<(yamux::Stream, MuxHandle)> {
         let handle = {
             let sessions = self.sessions.lock().unwrap();
             sessions.get(addr)?.clone()
@@ -90,7 +93,7 @@ impl MuxPool {
         }
 
         match handle.open_stream().await {
-            Ok(stream) => Some(stream),
+            Ok(stream) => Some((stream, handle)),
             Err(e) => {
                 debug!("mux open_stream to {addr} failed: {e}, removing session");
                 self.sessions.lock().unwrap().remove(addr);
@@ -128,10 +131,14 @@ impl MuxPool {
         self.sessions.lock().unwrap().len()
     }
 
-    /// Remove a session entry.
-    #[allow(dead_code)]
-    pub fn remove(&self, addr: &str) {
-        self.sessions.lock().unwrap().remove(addr);
+    /// Drop the sessions for addresses `keep` rejects. A session still
+    /// carrying tunnels lives on until they finish (each holds a handle),
+    /// then closes; an idle one closes now.
+    pub fn retain(&self, keep: impl Fn(&str) -> bool) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|addr, _| keep(addr));
+        before - sessions.len()
     }
 }
 

@@ -73,13 +73,13 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let connected_nodes: Vec<serde_json::Value> = nodes
         .values()
         .map(|node| {
-            let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
+            let connect_addr = super::tunnel_route(node, &state.shared).map(|(addr, _)| addr).unwrap_or_default();
             serde_json::json!({
                 "id": node.id,
                 "addr": node.addr,
                 "relay": node.relay,
                 "live": crate::state::node_is_live(node, now),
-                "tunnel_pool": state.shared.tunnel_pool.count(connect_addr),
+                "tunnel_pool": state.shared.tunnel_pool.count(&connect_addr),
                 "reverse_pool": state.shared.reverse_pool.count(&node.id),
             })
         })

@@ -79,8 +79,25 @@ enum ConfigAction {
     /// Sign the dynamic config in the local config file with your (admin)
     /// certificate and push it to a daemon, replacing the cluster's. How to
     /// apply a hand edit where `requireSignedConfig` is on.
+    ///
+    /// Refused if the cluster's config changed since the version the file
+    /// holds, as pushing would undo those changes: `config pull` first.
+    /// The file is then updated to the version pushed.
     Push {
         /// Address `host:port` of the daemon to push to (defaults to this
+        /// host's daemon).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Push even though the cluster's config is newer than the file's,
+        /// replacing whatever changed since.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Write the cluster's current dynamic config into the local config
+    /// file, keeping its other settings: where to start an edit to push.
+    /// A file whose services or routes differ is first copied to `.bak`.
+    Pull {
+        /// Address `host:port` of the daemon to read from (defaults to this
         /// host's daemon).
         #[arg(long)]
         remote: Option<String>,
@@ -273,6 +290,18 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         None => {
             let cfg = Config::load(&cli.config)?;
+            // This node's own settings must be right to start. Problems in
+            // the cluster-wide dynamic config are only reported: a newer
+            // version may fix them, and a node that won't start over one
+            // can't receive it.
+            cfg.validate_local().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
+            for problem in cfg.config_problems() {
+                tracing::warn!(
+                    "{}: dynamic config version {}: {problem} (starting anyway: `stouter check` lists problems)",
+                    cli.config,
+                    cfg.dynamic_config.version
+                );
+            }
             let shutdown = CancellationToken::new();
 
             let tls_dir = cfg.tls_dir.as_deref().ok_or_else(|| {
@@ -287,7 +316,6 @@ async fn main() -> Result<()> {
             // Orders this process's heartbeats above any earlier process's.
             let _ = state.incarnation.set(state::incarnation_for(&cli.config));
             if cfg.require_signed_config {
-                cfg.validate().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
                 if let Err(e) = signing::admit(&state, cfg.dynamic_config.clone()) {
                     tracing::warn!(
                         "starting with a config that isn't admin-signed ({e:#}); peers requiring signatures \
@@ -297,7 +325,6 @@ async fn main() -> Result<()> {
             }
 
             if let Some(tracing_cfg) = &cfg.tracing {
-                tracing_cfg.validate().map_err(anyhow::Error::msg)?;
                 let _ = state.tracer.set(telemetry::Tracer::start(tracing_cfg, &cfg.node_id));
             }
 
@@ -870,7 +897,7 @@ async fn main() -> Result<()> {
         // config push
         // -----------------------------------------------------------------
         Some(Commands::Config {
-            action: ConfigAction::Push { remote },
+            action: ConfigAction::Push { remote, force },
         }) => {
             let cfg = Config::load(&cli.config)?;
             let target = remote.unwrap_or_else(|| cfg.local_target());
@@ -881,22 +908,64 @@ async fn main() -> Result<()> {
             let mut pushed = None;
             for attempt in 1..=PUSH_ATTEMPTS {
                 let current = fetch_daemon_config(&target, &tls_ctx).await?.dynamic_config;
+                if current.same_settings(&desired) {
+                    println!("{target} already has the config in {} (version {})", cli.config, current.version);
+                    return Ok(());
+                }
+                if let Some(refusal) = stale_push(&current, &desired, &cli.config, force) {
+                    anyhow::bail!("{refusal}");
+                }
                 let next = config::DynamicConfig { version: current.version + 1, ..desired.clone() };
                 if let Some(problem) = config::new_problem(&current, &next) {
                     anyhow::bail!("{problem}");
                 }
                 let push = signed_push(next, current.version, &material)?;
+                let AdminOp::ConfigPush { config: signed, .. } = &push else { unreachable!("signed_push makes a ConfigPush") };
+                let signed = signed.clone();
                 match send_admin(&target, &tls_ctx, push).await? {
                     Ok(version) => {
-                        pushed = Some(version);
+                        pushed = Some((version, signed));
                         break;
                     }
                     Err((AdminErrCode::Conflict, _)) if attempt < PUSH_ATTEMPTS => continue,
                     Err((_, message)) => anyhow::bail!("push to {target} failed: {message}"),
                 }
             }
-            let version = pushed.expect("the last attempt breaks or bails");
+            let (version, signed) = pushed.expect("the last attempt breaks or bails");
             println!("Pushed the config in {} to {target} (version {version})", cli.config);
+            // The file now holds what the cluster has, so the next edit
+            // starts from (and is checked against) this version. Re-read,
+            // in case a local daemon rewrote the file meanwhile.
+            let saved = Config::load(&cli.config).and_then(|mut file| {
+                file.dynamic_config = signed;
+                file.save(&cli.config)
+            });
+            if let Err(e) = saved {
+                eprintln!("warning: could not update {} to version {version}: {e:#}", cli.config);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // config pull
+        // -----------------------------------------------------------------
+        Some(Commands::Config {
+            action: ConfigAction::Pull { remote },
+        }) => {
+            let mut cfg = Config::load(&cli.config)?;
+            let target = remote.unwrap_or_else(|| cfg.local_target());
+            let material = load_cli_material(&cfg, cli.cert_dir.as_deref())?;
+            let tls_ctx = tls::TlsContext::new(&material)?;
+            let current = fetch_daemon_config(&target, &tls_ctx).await?.dynamic_config;
+            let version = current.version;
+            if !cfg.dynamic_config.same_settings(&current) {
+                // It may hold edits not pushed yet: keep them.
+                let backup = format!("{}.bak", cli.config);
+                std::fs::copy(&cli.config, &backup).with_context(|| format!("copy {} to {backup}", cli.config))?;
+                println!("Saved the previous config (version {}) to {backup}", cfg.dynamic_config.version);
+            }
+            cfg.dynamic_config = current;
+            cfg.save(&cli.config)?;
+            println!("Wrote the config from {target} (version {version}) to {}", cli.config);
         }
 
         // -----------------------------------------------------------------
@@ -965,12 +1034,12 @@ async fn graceful_drain(state: std::sync::Arc<SharedState>) {
     // Broadcast NodeLeave so peers stop routing to us.
     if !state.config.node_id.is_empty() {
         info!("broadcasting NodeLeave for {}", state.config.node_id);
+        // Our record now says we left; gossip relays it to nodes the leave
+        // message doesn't reach.
+        let (heartbeat, record) = gossip::final_record(&state);
         gossip::broadcast_message(
             &state,
-            Message::NodeLeave {
-                id: state.config.node_id.clone(),
-                heartbeat: state.next_heartbeat(),
-            },
+            Message::NodeLeave { id: state.config.node_id.clone(), heartbeat, record },
         )
         .await;
     }
@@ -1061,6 +1130,20 @@ async fn send_admin(
         Message::AdminResponse { result: AdminResult::Err { code, message } } => Ok(Err((code, message))),
         _ => anyhow::bail!("unexpected response from daemon"),
     }
+}
+
+/// Why pushing `desired` (the file's config, `path`) over `current` (the
+/// cluster's) must not go ahead: the cluster's changed since the version
+/// the file holds, and pushing would silently undo those changes.
+fn stale_push(current: &config::DynamicConfig, desired: &config::DynamicConfig, path: &str, force: bool) -> Option<String> {
+    (current.version > desired.version && !force).then(|| {
+        format!(
+            "the cluster's config is at version {}, but {path} holds version {}: pushing it would undo the changes made \
+             since. Run `stouter config pull` (it keeps a copy of the file) and make your edit on top, or pass --force \
+             to replace the cluster's config anyway",
+            current.version, desired.version
+        )
+    })
 }
 
 /// Times a signed change is re-made after the config changed under it.
@@ -1271,6 +1354,32 @@ async fn broadcast_config(cfg: &Config, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_push_from_a_file_behind_the_cluster_is_refused_unless_forced() {
+        let at = |version| config::DynamicConfig { version, ..Default::default() };
+        // The file holds what the cluster had at 4; the cluster moved on.
+        let refusal = stale_push(&at(5), &at(4), "stouter.json", false).expect("refused");
+        assert!(refusal.contains("version 5") && refusal.contains("version 4") && refusal.contains("config pull"), "{refusal}");
+        assert!(stale_push(&at(5), &at(4), "stouter.json", true).is_none(), "--force");
+        // Up to date, or ahead (a daemon behind the rest): fine.
+        assert!(stale_push(&at(5), &at(5), "stouter.json", false).is_none());
+        assert!(stale_push(&at(5), &at(6), "stouter.json", false).is_none());
+    }
+
+    #[test]
+    fn same_settings_ignores_version_author_and_signature() {
+        let a: config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 3, "changedBy": "admin-1",
+            "serviceGroups": [{"name": "g", "services": [{"name": "s", "nodeId": "n", "nodePort": 1}]}],
+        }))
+        .unwrap();
+        let b = config::DynamicConfig { version: 9, changed_by: "admin-2".into(), ..a.clone() };
+        assert!(a.same_settings(&b));
+        let mut c = a.clone();
+        c.service_groups[0].services[0].node_port = 2;
+        assert!(!a.same_settings(&c));
+    }
 
     #[test]
     fn parse_routes_fills_in_service_and_validates() {
