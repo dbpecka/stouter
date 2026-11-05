@@ -66,10 +66,18 @@ Create a `stouter.json` file:
 
 The daemon won't start if one of its own settings is wrong (an invalid
 `httpListen`, a `reversePoolSize` over the limit, `requireSignedConfig` without
-`adminCns`, and so on). Problems in `dynamicConfig`, such as a service listed
+`adminCns`, an empty `nodeId` or one with a `:` in it, which peers would take
+for an address, and so on). Problems in `dynamicConfig`, such as a service listed
 twice, are logged as warnings instead: that config is the cluster's, a newer
 version may already fix it, and a node that refused to start over it could
 never receive the fix. `stouter check` reports both kinds.
+
+A setting stouter doesn't know (a typo such as `requireSignedConfg`, which
+would otherwise leave signing off without a word, or one from a newer
+version) is logged as a warning at startup and fails `stouter check`; it is
+kept when the file is rewritten. A hand edit to `dynamicConfig` gets the
+same checks as a change made with the CLI: one that would break the config
+is refused, with a warning.
 
 CLI commands that change the local file (`init`, `service add` without
 `--remote`, and so on) refuse a file they can't parse instead of starting
@@ -243,6 +251,14 @@ pooled connections and mux sessions don't count, so an idle daemon exits at
 once. Docker's default stop timeout is 10s; pass `-t 30` to `docker stop` (or
 `--stop-timeout 30` to `docker run`) to give long transfers the full window.
 
+Keep `tlsDir` on a mounted volume (inside the config directory, or mounted
+itself): in the container's own filesystem, the CA node's CA would be
+replaced with the container, and no other node would trust the new one.
+`deploy.sh` mounts the config's `tlsDir` when it lies outside the config
+directory. It also takes only cluster names of letters, digits, `-` and `_`
+(they become remote paths), and uploads the repository it is in, wherever
+it's run from.
+
 ---
 
 ## Architecture
@@ -320,7 +336,8 @@ Heartbeats and beats have the node's *incarnation* as their high half, one
 higher every time the daemon starts (kept in `<config file>.state`, and never
 below the current Unix time), so a restarted node always outranks what it
 gossiped before, even if its clock was set back meanwhile. A node with no sign
-of life for 5 minutes is forgotten.
+of life for 5 minutes is forgotten. (So is an entry a relay made when an
+older NAT'd node registered with it, once its registrations stop.)
 
 **Departures.** A node shutting down signs a final record saying it left, and
 sends it to its peers with `NodeLeave`. Its peers keep that record for 30
@@ -335,7 +352,8 @@ forgotten node may only have
 been cut off, so its last address is retried about once a minute for 24
 hours: when the network heals, the two sides find each other again even if
 neither lists the other in `knownNodes`. A daemon never lists itself as a
-peer.
+peer. A reverse registration from a node that left (one of its workers,
+still connecting as it shut down) is refused, rather than bring it back.
 
 Message types:
 
@@ -367,6 +385,19 @@ Limits, so one peer can't exhaust a node:
 - A failed `accept` (such as no file descriptors left) is retried after a
   short, growing wait and logged, on the mesh listener, local proxies and
   `httpListen` alike: it never stops the daemon or a proxy.
+- A tunnel's error message is read only up to 64 KiB and within 5 seconds:
+  its length comes from the peer, and a 4 GiB one used to abort the daemon.
+- Signatures in a sync are checked before the node list is locked, and at
+  most 256 records for nodes not yet known are checked per sync (the rest
+  wait for the next one). A peer sending junk can't stall gossip or reverse
+  registrations behind its checks.
+- Peers that don't answer a sync are retried with backoff, from one round
+  up to about 3 minutes, so a dead address costs a dial every few minutes,
+  not every 10 seconds. One that syncs with us, or whose newer signed record
+  reaches us (it restarted), is tried again at once.
+- Without `requireSignedConfig`, any cluster member can make up nodes; at
+  most 1024 nodes known only from unsigned gossip are held, and at most 512
+  forgotten addresses are retried. `requireSignedConfig` closes this.
 
 ### Tunnel Routing
 
@@ -492,7 +523,7 @@ failures health checks can't see, such as a node being unreachable.
 
 ### NAT Traversal via Reverse Connections
 
-Nodes with `"outboundOnly": true` cannot accept inbound connections. Instead, they maintain a pool of outbound connections to 3 relays, picked among the live nodes that have an address:
+Nodes with `"outboundOnly": true` cannot accept inbound connections. Instead, they maintain a pool of outbound connections to 3 relays, picked among the live nodes that have an address, other than `subscribe`-mode ones (often client machines, which would then carry other subscribers' traffic) unless there are no others:
 
 ```
 NAT'd node                  Relay node

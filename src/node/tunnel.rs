@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncWriteExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::state::SharedState;
@@ -15,12 +15,44 @@ const MAX_SKEW_MS: u64 = 30_000;
 /// length, then the UTF-8 message bytes.
 pub(crate) async fn send_tunnel_error<W: AsyncWrite + Unpin>(stream: &mut W, msg: &str) {
     let _ = stream.write_all(&[0x01]).await;
-    let b = msg.as_bytes();
+    let mut end = msg.len().min(MAX_TUNNEL_ERROR_LEN);
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    let b = &msg.as_bytes()[..end];
     let _ = stream
         .write_all(&(b.len() as u32).to_be_bytes())
         .await;
     let _ = stream.write_all(b).await;
     let _ = stream.flush().await;
+}
+
+/// Longest tunnel error message read from a peer. Its length comes first,
+/// as four bytes the peer chooses: taken on trust, a peer could make us
+/// allocate 4 GiB, and a failed allocation aborts the daemon.
+pub(crate) const MAX_TUNNEL_ERROR_LEN: usize = 64 * 1024;
+
+/// How long a peer gets to send the rest of a tunnel error once it has
+/// said the tunnel failed.
+const TUNNEL_ERROR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Read a tunnel error message (after its status byte): its length, then
+/// that many bytes, within [`TUNNEL_ERROR_TIMEOUT`] and at most
+/// [`MAX_TUNNEL_ERROR_LEN`] long.
+pub(crate) async fn read_tunnel_error<R: AsyncRead + Unpin>(stream: &mut R) -> Result<String> {
+    tokio::time::timeout(TUNNEL_ERROR_TIMEOUT, async {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.context("read tunnel error length")?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_TUNNEL_ERROR_LEN {
+            anyhow::bail!("tunnel error message of {len} bytes, over the {MAX_TUNNEL_ERROR_LEN}-byte limit");
+        }
+        let mut bytes = vec![0u8; len];
+        stream.read_exact(&mut bytes).await.context("read tunnel error message")?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("tunnel error message not sent in time"))?
 }
 
 /// Refuse a new tunnel once shutdown has begun, so a draining node only
@@ -120,5 +152,38 @@ pub(crate) async fn connect_local_service(
             Ok(s)
         }
         Err(e) => Err(format!("failed to connect to local service at {local_addr}: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_peer_cant_make_us_allocate_what_it_likes_for_an_error() {
+        // A status of failure, then a length of 4 GiB.
+        let mut huge: &[u8] = &[0xff, 0xff, 0xff, 0xff, b'x'];
+        let err = read_tunnel_error(&mut huge).await.expect_err("refused");
+        assert!(err.to_string().contains("over the"), "{err}");
+
+        // An ordinary error reads fine, and an overlong one is cut when sent.
+        let mut sent = Vec::new();
+        send_tunnel_error(&mut sent, "service 'api' not found on this node").await;
+        let mut reader = &sent[1..];
+        assert_eq!(read_tunnel_error(&mut reader).await.unwrap(), "service 'api' not found on this node");
+        let mut long = Vec::new();
+        send_tunnel_error(&mut long, &"é".repeat(MAX_TUNNEL_ERROR_LEN)).await;
+        let mut reader = &long[1..];
+        assert!(read_tunnel_error(&mut reader).await.unwrap().len() <= MAX_TUNNEL_ERROR_LEN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_finishes_its_error_is_given_up_on() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64);
+        theirs.write_all(&10u32.to_be_bytes()).await.unwrap();
+        // ...and then nothing.
+        let err = read_tunnel_error(&mut ours).await.expect_err("timed out");
+        assert!(err.to_string().contains("in time"), "{err}");
+        drop(theirs);
     }
 }

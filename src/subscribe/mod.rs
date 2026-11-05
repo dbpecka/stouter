@@ -359,15 +359,18 @@ async fn tunnel_addrs(state: &SharedState) -> HashSet<String> {
 /// daemon's tunnels go to (see [`tunnel_addrs`]).
 ///
 /// These pre-established connections eliminate TCP handshake latency on
-/// the proxy hot path. An address that can't be reached is retried with
-/// exponential backoff, rather than as fast as the loop spins.
+/// the proxy hot path. Each address is refilled on its own, one connection
+/// at a time: a slow address (one that times out) doesn't hold up the
+/// others. One that can't be reached is retried with exponential backoff,
+/// rather than as fast as the loop spins.
 async fn fill_tunnel_pool(state: Arc<SharedState>) {
     /// Target number of warm connections per node address.
     const POOL_TARGET: usize = 8;
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    let mut connecting: HashSet<String> = HashSet::new();
 
-    while !state.shutdown.is_cancelled() {
-        let now = tokio::time::Instant::now();
+    loop {
         let known = tunnel_addrs(&state).await;
         backoff.retain(|addr| known.contains(addr));
         // Tunnels no longer go there (the service moved, the node left, or
@@ -376,82 +379,85 @@ async fn fill_tunnel_pool(state: Arc<SharedState>) {
         if dropped > 0 {
             tracing::debug!("closed {dropped} warm connection(s) no tunnel needs");
         }
-        let wanted: Vec<String> = known
-            .into_iter()
-            .filter(|addr| state.tunnel_pool.count(addr) < POOL_TARGET && backoff.ready(addr, now))
-            .collect();
-
-        if wanted.is_empty() {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                _ = state.shutdown.cancelled() => break,
-            }
-            continue;
-        }
-
-        // One new connection per address per round, all at once, so a slow
-        // address doesn't hold up the others.
-        let attempts = wanted.iter().map(|addr| {
-            let state = &state;
-            async move { state.connect_mesh(addr, state.node_at(addr).as_deref()).await }
-        });
-        let results = futures::future::join_all(attempts).await;
-        for (addr, result) in wanted.iter().zip(results) {
-            match result {
-                Ok(stream) => {
-                    backoff.succeeded(addr);
-                    state.tunnel_pool.push(addr.clone(), stream);
-                }
-                Err(e) => {
-                    let wait = backoff.failed(addr, now);
-                    tracing::debug!("warm connection to {addr} failed, retrying in {}s: {e:#}", wait.as_secs());
-                }
+        let now = tokio::time::Instant::now();
+        for addr in known {
+            if !connecting.contains(&addr) && state.tunnel_pool.count(&addr) < POOL_TARGET && backoff.ready(&addr, now) {
+                connecting.insert(addr.clone());
+                let state = state.clone();
+                attempts.push(async move {
+                    let result = state.connect_mesh(&addr, state.node_at(&addr).as_deref()).await;
+                    (addr, result)
+                });
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The next attempt to finish (then refill that address again at
+        // once), or a second's wait to look again.
+        tokio::select! {
+            Some((addr, result)) = futures::StreamExt::next(&mut attempts), if !attempts.is_empty() => {
+                connecting.remove(&addr);
+                match result {
+                    Ok(stream) => {
+                        backoff.succeeded(&addr);
+                        state.tunnel_pool.push(addr, stream);
+                    }
+                    Err(e) => {
+                        let wait = backoff.failed(&addr, tokio::time::Instant::now());
+                        tracing::debug!("warm connection to {addr} failed, retrying in {}s: {e:#}", wait.as_secs());
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = state.shutdown.cancelled() => break,
+        }
     }
 }
-
 /// Background task that maintains yamux multiplexed sessions to the nodes
 /// this daemon's tunnels go to (see [`tunnel_addrs`]).
 ///
-/// Checks every 5 seconds for nodes without a live mux session and
-/// establishes one, all addresses at once and with backoff for ones that
+/// Looks every 5 seconds (and whenever a session attempt finishes) for nodes
+/// without a live mux session and starts establishing one, each on its own
+/// so a slow address doesn't hold up the others, with backoff for ones that
 /// keep failing. Ended sessions are dropped by `MuxPool::contains` and the
 /// pool sweeper, so they are replaced within a round.
 async fn maintain_mux_sessions(state: Arc<SharedState>) {
     let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
-    while !state.shutdown.is_cancelled() {
-        let now = tokio::time::Instant::now();
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    let mut connecting: HashSet<String> = HashSet::new();
+    loop {
         let known = tunnel_addrs(&state).await;
         backoff.retain(|addr| known.contains(addr));
         let dropped = state.mux_pool.retain(|addr| known.contains(addr));
         if dropped > 0 {
             info!("closing {dropped} mux session(s) no tunnel needs");
         }
-        let wanted: Vec<String> = known
-            .into_iter()
-            .filter(|addr| !state.mux_pool.contains(addr) && backoff.ready(addr, now))
-            .collect();
-
-        let attempts = wanted.iter().map(|addr| crate::mux::establish_mux_session(addr, &state));
-        let results = futures::future::join_all(attempts).await;
-        for (addr, result) in wanted.iter().zip(results) {
-            match result {
-                Ok(handle) => {
-                    info!("mux session established to {addr}");
-                    backoff.succeeded(addr);
-                    state.mux_pool.insert(addr.clone(), handle);
-                }
-                Err(e) => {
-                    let wait = backoff.failed(addr, now);
-                    tracing::debug!("failed to establish mux to {addr}, retrying in {}s: {e:#}", wait.as_secs());
-                }
+        let now = tokio::time::Instant::now();
+        for addr in known {
+            if !connecting.contains(&addr) && !state.mux_pool.contains(&addr) && backoff.ready(&addr, now) {
+                connecting.insert(addr.clone());
+                let state = state.clone();
+                attempts.push(async move {
+                    let result = crate::mux::establish_mux_session(&addr, &state).await;
+                    (addr, result)
+                });
             }
         }
 
         tokio::select! {
+            Some((addr, result)) = futures::StreamExt::next(&mut attempts), if !attempts.is_empty() => {
+                connecting.remove(&addr);
+                match result {
+                    Ok(handle) => {
+                        info!("mux session established to {addr}");
+                        backoff.succeeded(&addr);
+                        state.mux_pool.insert(addr, handle);
+                    }
+                    Err(e) => {
+                        let wait = backoff.failed(&addr, tokio::time::Instant::now());
+                        tracing::debug!("failed to establish mux to {addr}, retrying in {}s: {e:#}", wait.as_secs());
+                    }
+                }
+            }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             _ = state.shutdown.cancelled() => break,
         }
@@ -486,6 +492,58 @@ mod tests {
         let mut ids: Vec<String> = ids.into_iter().collect();
         ids.sort();
         ids
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_address_doesnt_hold_up_warm_connections_to_others() {
+        use crate::state::test_support::{tls_state, tls_state_with};
+        let dir = std::env::temp_dir().join(format!("stouter_fill_{}_{}", std::process::id(), rand::random::<u64>()));
+        // "good" answers handshakes; "slow" takes connections and says nothing.
+        let good = tls_state(&dir, "good");
+        let good_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (tcp, _) = good_listener.accept().await.unwrap();
+                if let Ok(mesh) = good.tls_accept(tcp).await {
+                    held.push(mesh);
+                }
+            }
+        });
+        let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(slow_listener.accept().await.unwrap().0);
+            }
+        });
+
+        let cfg = Config {
+            node_id: "sub".into(),
+            mode: crate::config::Mode::Subscribe,
+            dynamic_config: serde_json::from_value(serde_json::json!({"version": 1, "serviceGroups": [{"name": "g", "services": [
+                {"name": "a", "nodeId": "good", "nodePort": 1},
+                {"name": "b", "nodeId": "slow", "nodePort": 1},
+            ]}]}))
+            .unwrap(),
+            ..Config::default()
+        };
+        let sub = tls_state_with(&dir, cfg, String::new());
+        sub.update_known_nodes(|kn| {
+            for (id, addr) in [("good", &good_addr), ("slow", &slow_addr)] {
+                kn.insert(id.into(), crate::config::NodeInfo { id: id.into(), addr: addr.clone(), ..Default::default() });
+            }
+        })
+        .await;
+        tokio::spawn(fill_tunnel_pool(sub.clone()));
+        // Well inside the 10s a handshake to "slow" waits before giving up.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(sub.tunnel_pool.count(&good_addr), 8);
+        assert_eq!(sub.tunnel_pool.count(&slow_addr), 0);
+        sub.shutdown.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

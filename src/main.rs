@@ -299,6 +299,9 @@ async fn main() -> Result<()> {
             // version may fix them, and a node that won't start over one
             // can't receive it.
             cfg.validate_local().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
+            for unknown in cfg.unknown_settings() {
+                tracing::warn!("{}: {unknown}", cli.config);
+            }
             for problem in cfg.config_problems() {
                 tracing::warn!(
                     "{}: dynamic config version {}: {problem} (starting anyway: `stouter check` lists problems)",

@@ -40,12 +40,7 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
 
         let known = state.known_nodes.load();
         let now = std::time::Instant::now();
-        let candidates: Vec<(&str, &str)> = known
-            .values()
-            .filter(|n| n.relay.is_none() && !n.addr.is_empty() && n.id != state.config.node_id)
-            .filter(|n| crate::state::node_is_live(n, now))
-            .map(|n| (n.id.as_str(), n.addr.as_str()))
-            .collect();
+        let candidates = relay_candidates(&known, &state.config.node_id, now);
         let current: Vec<(&str, &str)> = relays.iter().map(|(id, (addr, _))| (id.as_str(), addr.as_str())).collect();
         let chosen: Vec<(String, String)> = choose_relays(&state.config.node_id, &candidates, &current, RELAY_COUNT)
             .into_iter()
@@ -74,6 +69,29 @@ pub async fn run_reverse_pool_loop(state: Arc<SharedState>) {
             relays.insert(id, (addr, workers));
         }
     }
+}
+
+/// The nodes (id, address) a NAT'd node `own_id` may pick as relays: live
+/// ones it can reach. Not subscribers, while there are other nodes: a
+/// subscriber is often a client machine, and as a relay it would carry other
+/// subscribers' traffic. (A cluster of only subscribers and NAT'd nodes still
+/// works.)
+fn relay_candidates<'a>(
+    known: &'a HashMap<String, crate::config::NodeInfo>,
+    own_id: &str,
+    now: std::time::Instant,
+) -> Vec<(&'a str, &'a str)> {
+    let reachable: Vec<&crate::config::NodeInfo> = known
+        .values()
+        .filter(|n| n.relay.is_none() && !n.addr.is_empty() && n.id != own_id)
+        .filter(|n| crate::state::node_is_live(n, now))
+        .collect();
+    let prefer_nodes = reachable.iter().any(|n| !n.subscriber);
+    reachable
+        .into_iter()
+        .filter(|n| !(prefer_nodes && n.subscriber))
+        .map(|n| (n.id.as_str(), n.addr.as_str()))
+        .collect()
 }
 
 /// The relays (id, address) a NAT'd node `nat_id` should use, out of the
@@ -163,6 +181,11 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
         node_id: state.config.node_id.clone(),
         timestamp_ms,
     };
+    // Shutting down (perhaps since the connect began): a registration now
+    // would reach the relay after our leave message.
+    if stop.is_cancelled() {
+        return Ok(());
+    }
     gossip::send_message(&mut stream, &msg).await?;
 
     // While this connection waits at the relay, the relay is one we use: it
@@ -248,6 +271,26 @@ mod tests {
 
         // Fewer candidates than wanted: all of them.
         assert_eq!(choose_relays("nat-a", &all[..2], &[], RELAY_COUNT).len(), 2);
+    }
+
+    #[test]
+    fn subscribers_are_relays_only_when_there_is_nothing_else() {
+        let now = std::time::Instant::now();
+        let node = |id: &str, subscriber: bool| crate::config::NodeInfo {
+            id: id.into(),
+            addr: format!("{id}:1"),
+            last_seen: Some(now),
+            subscriber,
+            ..Default::default()
+        };
+        let mut known: HashMap<String, crate::config::NodeInfo> =
+            [node("n1", false), node("n2", false), node("laptop", true)].into_iter().map(|n| (n.id.clone(), n)).collect();
+        let mut ids: Vec<&str> = relay_candidates(&known, "nat", now).into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, ["n1", "n2"]);
+        // Only subscribers left: better one of them than no relay at all.
+        known.retain(|id, _| id == "laptop");
+        assert_eq!(relay_candidates(&known, "nat", now), [("laptop", "laptop:1")]);
     }
 
     #[test]

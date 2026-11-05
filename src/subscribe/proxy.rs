@@ -286,18 +286,7 @@ async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
         .context("read tunnel status byte")?;
 
     if status[0] != 0x00 {
-        let mut len_buf = [0u8; 4];
-        stream
-            .read_exact(&mut len_buf)
-            .await
-            .context("read tunnel error length")?;
-        let err_len = u32::from_be_bytes(len_buf) as usize;
-        let mut err_bytes = vec![0u8; err_len];
-        stream
-            .read_exact(&mut err_bytes)
-            .await
-            .context("read tunnel error message")?;
-        let msg = String::from_utf8_lossy(&err_bytes);
+        let msg = crate::node::tunnel::read_tunnel_error(stream).await?;
         bail!("node rejected tunnel: {msg}");
     }
 

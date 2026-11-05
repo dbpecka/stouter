@@ -689,6 +689,14 @@ pub struct NodeInfo {
     /// through.
     #[serde(skip)]
     pub relays: Vec<String>,
+    /// Local-only: what its signed record says of it (`NodeRecord::subscriber`).
+    #[serde(skip)]
+    pub subscriber: bool,
+    /// Local-only: this entry was made by a reverse registration here (we
+    /// relay for the node), so registrations show whether it's alive and
+    /// it can expire like any other (see `gossip::expire_silent_nodes`).
+    #[serde(skip)]
+    pub registered_here: bool,
     /// Local-only: the version (`heartbeat`) of the signed record held.
     #[serde(skip)]
     pub record_version: u64,
@@ -736,6 +744,12 @@ pub struct NodeRecord {
     /// so the departure reaches nodes the leave message didn't.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub left: bool,
+    /// A subscribe-mode node: it uses services, hosts none, and is often
+    /// a client machine, so NAT'd nodes don't pick it as a relay (other
+    /// subscribers' traffic would go through it) while there are others.
+    /// Absent from older nodes' records: they may be anything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subscriber: bool,
 }
 
 /// A [`NodeRecord`] signed by its node: the exact JSON text, the node's
@@ -829,6 +843,12 @@ pub struct Config {
     /// node once all run a version that supports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_signed_config: bool,
+    /// Settings this version doesn't know: most likely a typo (a
+    /// `requireSignedConfg` would leave signing off without a word), or one
+    /// from a newer version. Kept as they are when the file is rewritten;
+    /// the daemon warns of them, and `stouter check` fails on them.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 /// Where and how much to export as OpenTelemetry spans.
@@ -901,6 +921,7 @@ impl Default for Config {
             tracing: None,
             http_listen: None,
             require_signed_config: false,
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -928,6 +949,9 @@ impl Config {
     /// reports.
     pub fn validate(&self) -> Result<()> {
         self.validate_local()?;
+        if let Some(problem) = self.unknown_settings().into_iter().next() {
+            return Err(anyhow!(problem));
+        }
         match self.config_problems().into_iter().next() {
             Some(problem) => Err(anyhow!(problem)),
             None => Ok(()),
@@ -939,6 +963,18 @@ impl Config {
     /// with one.
     pub fn validate_local(&self) -> Result<()> {
         let subscribes = matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe);
+        // Peers know a node by its id (its certificate's CN), and ignore one
+        // that looks like an address rather than a name.
+        if self.node_id.is_empty() {
+            return Err(anyhow!("`nodeId` is empty: set it to this host's name (`stouter init` does)"));
+        }
+        if self.node_id.contains(':') || self.node_id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(anyhow!(
+                "`nodeId` '{}' isn't a name: no ':' (peers would take it for an address and ignore the node), \
+                 spaces or control characters",
+                self.node_id
+            ));
+        }
         if let Some(listen) = &self.http_listen {
             let addr: std::net::SocketAddr = listen
                 .parse()
@@ -975,6 +1011,15 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Settings in the file this version doesn't know (see [`Config::unknown`]),
+    /// as messages.
+    pub fn unknown_settings(&self) -> Vec<String> {
+        self.unknown
+            .keys()
+            .map(|key| format!("unknown setting '{key}' (a typo? it is ignored)"))
+            .collect()
     }
 
     /// Problems with the dynamic config, as it stands here: its own (see
@@ -1156,6 +1201,11 @@ pub fn get_hostname() -> String {
 mod tests {
     use super::*;
 
+    /// The default config, for a node with a name (as every node has).
+    fn named() -> Config {
+        Config { node_id: "n1".into(), ..Config::default() }
+    }
+
     #[test]
     fn config_default_values() {
         let cfg = Config::default();
@@ -1171,7 +1221,7 @@ mod tests {
         let cfg = Config {
             bind: "10.0.0.1:9090".into(),
             advertise_addr: None,
-            ..Config::default()
+            ..named()
         };
         assert_eq!(cfg.peer_addr(), "10.0.0.1:9090");
     }
@@ -1181,7 +1231,7 @@ mod tests {
         let cfg = Config {
             bind: "0.0.0.0:8080".into(),
             advertise_addr: Some("1.2.3.4:9090".into()),
-            ..Config::default()
+            ..named()
         };
         assert_eq!(cfg.peer_addr(), "1.2.3.4:9090");
     }
@@ -1193,7 +1243,7 @@ mod tests {
             bind: "10.0.0.1:8080".into(),
             advertise_addr: Some("external:8080".into()),
             known_nodes: vec!["peer1:8080".into()],
-            ..Config::default()
+            ..named()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
@@ -1248,7 +1298,7 @@ mod tests {
                 service_groups: vec!["web".into()],
                 services: vec![],
             }),
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_err());
     }
@@ -1261,7 +1311,7 @@ mod tests {
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
                 ..Default::default()
             },
-            ..Config::default()
+            ..named()
         }
     }
 
@@ -1326,11 +1376,11 @@ mod tests {
 
     #[test]
     fn http_listen_validation() {
-        let ok = Config { mode: Mode::NodeSubscribe, http_listen: Some("127.0.0.1:15001".into()), ..Config::default() };
+        let ok = Config { mode: Mode::NodeSubscribe, http_listen: Some("127.0.0.1:15001".into()), ..named() };
         ok.validate().unwrap();
-        let node_mode = Config { mode: Mode::Node, http_listen: Some("127.0.0.1:15001".into()), ..Config::default() };
+        let node_mode = Config { mode: Mode::Node, http_listen: Some("127.0.0.1:15001".into()), ..named() };
         assert!(node_mode.validate().is_err());
-        let bad = Config { mode: Mode::Subscribe, http_listen: Some("localhost".into()), ..Config::default() };
+        let bad = Config { mode: Mode::Subscribe, http_listen: Some("localhost".into()), ..named() };
         assert!(bad.validate().is_err());
     }
 
@@ -1469,7 +1519,7 @@ mod tests {
             let bad = TracingConfig { otlp_endpoint: endpoint.into(), sample_ratio: ratio, ..tc.clone() };
             assert!(bad.validate().is_err(), "{endpoint} {ratio}");
         }
-        let cfg = Config { tracing: Some(TracingConfig { sample_ratio: 2.0, ..tc }), ..Config::default() };
+        let cfg = Config { tracing: Some(TracingConfig { sample_ratio: 2.0, ..tc }), ..named() };
         assert!(cfg.validate().is_err());
     }
 
@@ -1536,6 +1586,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_settings_are_reported_and_kept() {
+        let text = r#"{"mode": "node", "bind": "127.0.0.1:1", "nodeId": "n1", "knownNodes": [],
+            "requireSignedConfg": true, "dynamicConfig": {"version": 1, "serviceGroups": []}}"#;
+        let cfg: Config = serde_json::from_str(text).unwrap();
+        // The typo leaves signing off: say so, and fail `stouter check`.
+        assert!(!cfg.require_signed_config);
+        assert_eq!(cfg.unknown_settings().len(), 1);
+        assert!(cfg.unknown_settings()[0].contains("requireSignedConfg"));
+        assert!(cfg.validate().is_err());
+        cfg.validate_local().unwrap();
+        // And a rewrite of the file keeps it (it may be a newer version's).
+        let saved = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(saved["requireSignedConfg"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_node_id_must_be_a_name() {
+        for bad in ["", "10.0.0.5:8080", "my node", "node\t1"] {
+            let cfg = Config { node_id: bad.into(), ..named() };
+            assert!(cfg.validate_local().is_err(), "{bad:?}");
+        }
+        for good in ["n1", "host-2.example.com", "node_3"] {
+            Config { node_id: good.into(), ..named() }.validate_local().unwrap();
+        }
+    }
+
+    #[test]
     fn a_config_file_that_doesnt_parse_is_never_replaced_by_defaults() {
         let dir = std::env::temp_dir().join(format!("stouter_load_{}_{}", std::process::id(), rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1599,7 +1676,7 @@ mod tests {
                 service_groups: vec!["web".into()],
                 services: vec![],
             }),
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -1608,7 +1685,7 @@ mod tests {
     fn nodesubscribe_mode_serde_round_trip() {
         let cfg = Config {
             mode: Mode::NodeSubscribe,
-            ..Config::default()
+            ..named()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"nodeSubscribe\""));
@@ -1624,7 +1701,7 @@ mod tests {
                 service_groups: vec!["web".into()],
                 services: vec![],
             }),
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -1634,7 +1711,7 @@ mod tests {
         let cfg = Config {
             mode: Mode::NodeSubscribe,
             outbound_only: true,
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -1843,7 +1920,7 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("adminCns"));
 
-        let cfg = Config { admin_cns: vec!["admin-cli".into()], ..Config::default() };
+        let cfg = Config { admin_cns: vec!["admin-cli".into()], ..named() };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"adminCns\":[\"admin-cli\"]"));
         let restored: Config = serde_json::from_str(&json).unwrap();
@@ -1866,25 +1943,25 @@ mod tests {
 
     #[test]
     fn local_target_rewrites_wildcard_v4() {
-        let cfg = Config { bind: "0.0.0.0:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "0.0.0.0:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "127.0.0.1:60001");
     }
 
     #[test]
     fn local_target_rewrites_wildcard_v6() {
-        let cfg = Config { bind: "[::]:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "[::]:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "[::1]:60001");
     }
 
     #[test]
     fn local_target_preserves_specific_address() {
-        let cfg = Config { bind: "10.0.0.5:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "10.0.0.5:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "10.0.0.5:60001");
     }
 
     #[test]
     fn local_target_preserves_unparseable_bind() {
-        let cfg = Config { bind: "myhost:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "myhost:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "myhost:60001");
     }
 
@@ -1917,7 +1994,7 @@ mod tests {
                 }],
                 ..Default::default()
             },
-            ..Config::default()
+            ..named()
         };
         cfg.save(path_str).unwrap();
         let loaded = Config::load(path_str).unwrap();
@@ -1936,11 +2013,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.json");
         let link = dir.join("stouter.json");
-        Config { node_id: "before".into(), ..Config::default() }.save(real.to_str().unwrap()).unwrap();
+        Config { node_id: "before".into(), ..named() }.save(real.to_str().unwrap()).unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        Config { node_id: "after".into(), ..Config::default() }.save(link.to_str().unwrap()).unwrap();
+        Config { node_id: "after".into(), ..named() }.save(link.to_str().unwrap()).unwrap();
 
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link kept");
         assert_eq!(Config::load(real.to_str().unwrap()).unwrap().node_id, "after");
@@ -1957,7 +2034,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stouter_new_{}_{}", std::process::id(), rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stouter.json");
-        Config { node_id: "n1".into(), ..Config::default() }.save(path.to_str().unwrap()).unwrap();
+        Config { node_id: "n1".into(), ..named() }.save(path.to_str().unwrap()).unwrap();
         assert_eq!(Config::load(path.to_str().unwrap()).unwrap().node_id, "n1");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2027,7 +2104,7 @@ mod tests {
 
     #[test]
     fn signed_config_requires_an_admin() {
-        let cfg = Config { require_signed_config: true, ..Config::default() };
+        let cfg = Config { require_signed_config: true, ..named() };
         assert!(cfg.validate().unwrap_err().to_string().contains("adminCns"));
         let cfg = Config { admin_cns: vec!["admin".into()], ..cfg };
         cfg.validate().unwrap();
@@ -2045,7 +2122,7 @@ mod tests {
         let problem = new_problem(&dc, &huge).expect("refused");
         assert!(problem.contains("too large to gossip"), "{problem}");
 
-        let cfg = Config { reverse_pool_size: Some(5000), ..Config::default() };
+        let cfg = Config { reverse_pool_size: Some(5000), ..named() };
         assert!(cfg.validate().unwrap_err().to_string().contains("reversePoolSize"));
     }
 }

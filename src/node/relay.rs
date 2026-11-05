@@ -67,6 +67,14 @@ pub async fn handle_reverse_registration(
         bail!("node {node_id} already holds {idle} idle reverse connections here (limit {MAX_IDLE_REVERSE_PER_NODE})");
     }
 
+    // A node that said it left is gone: a registration still arriving is
+    // one its workers sent as it shut down, and taking it would bring the
+    // node back as an entry nothing updates. Restarted, it is let in once
+    // its new record arrives (its first sync with us).
+    if state.has_left(&node_id) {
+        bail!("reverse registration from node {node_id}, which left");
+    }
+
     // --- Update known_nodes relay field ---
     {
         // Where peers reach us for this node. Bound to all interfaces with
@@ -80,9 +88,16 @@ pub async fn handle_reverse_registration(
         }
         let nid = node_id.clone();
         let relay_addr = our_addr.clone();
+        // A NAT'd node registers a connection per tunnel it serves, so
+        // under load many a second: each update copies the node list, so
+        // skip it while the entry already says we relay for it and was
+        // refreshed within the last second.
+        let fresh = state.known_nodes.load().get(&node_id).is_some_and(|n| {
+            n.relay.as_deref() == Some(our_addr.as_str()) && n.last_seen.is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        });
         // Whether we weren't already relaying for it: worth one line at
         // info; every further connection (one per tunnel) only at debug.
-        let newly = state
+        let newly = !fresh && state
             .update_known_nodes(|kn| {
                 let now = Instant::now();
                 if let Some(node) = kn.get_mut(&nid) {
@@ -103,6 +118,7 @@ pub async fn handle_reverse_registration(
                             relay: Some(our_addr),
                             last_seen: Some(now),
                             heard_at: Some(now),
+                            registered_here: true,
                             ..Default::default()
                         },
                     );
@@ -195,33 +211,20 @@ where
         .context("flush tunnel status to subscriber")?;
 
     if status[0] != 0x00 {
-        // Forward the error message.
-        let mut len_buf = [0u8; 4];
-        reverse_stream
-            .read_exact(&mut len_buf)
+        // Forward the error message (bounded in size and time: see
+        // `read_tunnel_error`).
+        let message = crate::node::tunnel::read_tunnel_error(&mut reverse_stream)
             .await
-            .context("read tunnel error length from reverse")?;
+            .unwrap_or_else(|e| format!("(the NAT'd node's error was unreadable: {e:#})"));
+        let bytes = message.as_bytes();
         subscriber
-            .write_all(&len_buf)
+            .write_all(&(bytes.len() as u32).to_be_bytes())
             .await
             .context("forward tunnel error length")?;
+        subscriber.write_all(bytes).await.context("forward tunnel error to subscriber")?;
+        subscriber.flush().await.context("flush tunnel error to subscriber")?;
 
-        let err_len = u32::from_be_bytes(len_buf) as usize;
-        let mut err_bytes = vec![0u8; err_len];
-        reverse_stream
-            .read_exact(&mut err_bytes)
-            .await
-            .context("read tunnel error from reverse")?;
-        subscriber
-            .write_all(&err_bytes)
-            .await
-            .context("forward tunnel error to subscriber")?;
-        subscriber
-            .flush()
-            .await
-            .context("flush tunnel error to subscriber")?;
-
-        bail!("NAT'd node rejected tunnel");
+        bail!("NAT'd node rejected tunnel: {message}");
     }
 
     // Bridge the subscriber and reverse connection streams.
@@ -261,6 +264,32 @@ mod tests {
         // it was actually reached, not the unroutable wildcard.
         assert!(gossip::is_wildcard(relay.config.peer_addr()));
         assert_eq!(relay.known_nodes.load()["mallory"].relay.as_deref(), Some(reached_at.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_registration_after_its_node_left_brings_back_no_ghost() {
+        let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let x = tls_state(&dir, "x");
+        // x left: the relay holds its signed last record.
+        let left = crate::config::NodeRecord { id: "x".into(), heartbeat: 11, left: true, ..Default::default() };
+        let signer = crate::signing::Signer::from_material(&crate::pki::load_or_create(dir.to_str().unwrap(), "x").unwrap()).unwrap();
+        relay.bury_with("x", 11, Some((11, crate::signing::sign_node(&left, &signer).unwrap())));
+
+        // One of its workers' registrations, sent as it shut down, arrives late.
+        let (_client, server_end) = mesh_pair(&x, &relay).await;
+        let err = handle_reverse_registration(server_end, "x".into(), now_ms(), relay.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("which left"), "{err}");
+        assert!(!relay.known_nodes.load().contains_key("x"));
+        assert_eq!(relay.reverse_pool.count("x"), 0);
+
+        // An entry a registration did make (an older node's) can expire:
+        // registrations keep it alive, and they stopped.
+        relay.unbury("x");
+        let (_client, server_end) = mesh_pair(&x, &relay).await;
+        handle_reverse_registration(server_end, "x".into(), now_ms(), relay.clone()).await.unwrap();
+        assert!(relay.known_nodes.load()["x"].registered_here);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

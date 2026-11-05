@@ -83,6 +83,17 @@ pub fn node_is_live(node: &NodeInfo, now: std::time::Instant) -> bool {
     node.last_seen.is_some_and(|seen| now.saturating_duration_since(seen) <= NODE_STALE_AFTER)
 }
 
+/// Most forgotten nodes whose addresses are retried (see `forgotten_addrs`);
+/// past this the longest-forgotten is dropped.
+const MAX_FORGOTTEN: usize = 512;
+
+/// Backoff for a peer address that didn't answer a sync: from one sync
+/// round, doubling to a few minutes, so a dead peer (or a made-up one) costs
+/// a dial every few minutes rather than every round. A peer that syncs with
+/// us is tried again at once (see `gossip::handle_gossip_message`).
+pub const SYNC_BACKOFF_BASE: Duration = Duration::from_secs(10);
+pub const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(160);
+
 /// A node that left or was forgotten, and its last heartbeat then.
 struct Tombstone {
     heartbeat: u64,
@@ -398,6 +409,11 @@ pub struct SharedState {
     relays: Mutex<HashMap<String, (usize, std::time::Instant)>>,
     /// Nodes forgotten for silence: last address, and when.
     forgotten: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Backoff for peer addresses that didn't answer a sync (see
+    /// `gossip::run_sync_loop`).
+    pub(crate) sync_backoff: Mutex<Backoff>,
+    /// Whether the cap on unsigned-only nodes was reported (once).
+    pub(crate) unsigned_cap_warned: std::sync::atomic::AtomicBool,
     /// The record this node last gossiped about itself, reused while fresh.
     pub(crate) own_record: Mutex<Option<OwnRecord>>,
     /// Open connections per (kind, peer CN), for the per-peer limits.
@@ -475,6 +491,8 @@ impl SharedState {
             signer: std::sync::OnceLock::new(),
             relays: Mutex::new(HashMap::new()),
             forgotten: Mutex::new(HashMap::new()),
+            sync_backoff: Mutex::new(Backoff::new(SYNC_BACKOFF_BASE, SYNC_BACKOFF_MAX)),
+            unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
             delta_peers: Mutex::new(HashMap::new()),
@@ -547,9 +565,16 @@ impl SharedState {
 
     pub async fn rebuild_service_index(&self) {
         let dc = self.dynamic_config.read().await;
-        let idx = build_service_index(&dc);
-        self.service_index.store(Arc::new(idx));
-        self.routes.store(Arc::new(build_route_index(&dc)));
+        self.index_config(&dc);
+    }
+
+    /// Rebuild the service and route indexes from `dc`, now: called with
+    /// the config's lock still held right after it changes, so nothing can
+    /// interrupt a change between taking a config and indexing it (a sync
+    /// cut off by its timeout used to leave the index on the old config).
+    pub fn index_config(&self, dc: &DynamicConfig) {
+        self.service_index.store(Arc::new(build_service_index(dc)));
+        self.routes.store(Arc::new(build_route_index(dc)));
     }
 
     /// Whether `node_id` reports `service_name` as failing its health check.
@@ -595,16 +620,24 @@ impl SharedState {
         }
     }
 
-    /// For a beat about a node buried by [`Self::bury_forgotten`]: the node,
-    /// let back in, if the beat is newer than its last and signed with the
-    /// key of its record. It is alive after all, just out of touch for a
-    /// while (it can't be reached, and we heard nothing of it).
-    pub fn revive_with_beat(&self, beat: &crate::config::SignedBeat) -> Option<NodeInfo> {
+    /// For a node buried by [`Self::bury_forgotten`]: its last heartbeat
+    /// and the certificate (hex DER) of its record, to check a beat against.
+    pub fn forgotten_cert(&self, id: &str) -> Option<(u64, String)> {
+        let departed = self.departed.lock().unwrap();
+        let tomb = departed.get(id).filter(|t| t.at.elapsed() < TOMBSTONE_TTL)?;
+        let cert = tomb.forgotten.as_ref()?.signed.as_ref()?.cert.clone();
+        Some((tomb.heartbeat, cert))
+    }
+
+    /// For a beat about a node buried by [`Self::bury_forgotten`], already
+    /// checked against its record's key (see [`Self::forgotten_cert`]): the
+    /// node, let back in, if the beat is newer than its last. It is alive
+    /// after all, just out of touch for a while (it can't be reached, and
+    /// we heard nothing of it).
+    pub fn revive(&self, beat: &crate::config::SignedBeat) -> Option<NodeInfo> {
         let mut departed = self.departed.lock().unwrap();
         let tomb = departed.get(&beat.id).filter(|t| t.at.elapsed() < TOMBSTONE_TTL)?;
-        let node = tomb.forgotten.as_ref().filter(|_| beat.beat > tomb.heartbeat)?;
-        let cert = &node.signed.as_ref()?.cert;
-        crate::signing::verify_beat(beat, cert).ok()?;
+        tomb.forgotten.as_ref().filter(|_| beat.beat > tomb.heartbeat)?;
         departed.remove(&beat.id).and_then(|t| t.forgotten)
     }
 
@@ -651,6 +684,16 @@ impl SharedState {
     }
 
     /// Forget that `id` departed (it rejoined).
+    /// Whether `id` left (we hold its signed "left" record), recently
+    /// enough that it's still buried.
+    pub fn has_left(&self, id: &str) -> bool {
+        self.departed
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|t| t.record.is_some() && t.at.elapsed() < TOMBSTONE_TTL)
+    }
+
     pub fn unbury(&self, id: &str) {
         self.departed.lock().unwrap().remove(id);
         self.forgotten.lock().unwrap().remove(id);
@@ -660,7 +703,16 @@ impl SharedState {
     /// retried for [`RECONNECT_FOR`]. (Not for a node that left: it said so.)
     pub fn remember_forgotten(&self, id: &str, addr: &str) {
         if !addr.is_empty() {
-            self.forgotten.lock().unwrap().insert(id.to_string(), (addr.to_string(), std::time::Instant::now()));
+            let mut forgotten = self.forgotten.lock().unwrap();
+            // Bounded: in a cluster without signed records, anyone could
+            // make up nodes for us to forget (and retry for a day).
+            if forgotten.len() >= MAX_FORGOTTEN && !forgotten.contains_key(id) {
+                let oldest = forgotten.iter().min_by_key(|(_, (_, at))| *at).map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    forgotten.remove(&oldest);
+                }
+            }
+            forgotten.insert(id.to_string(), (addr.to_string(), std::time::Instant::now()));
         }
     }
 
