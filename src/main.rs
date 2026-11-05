@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
         // no sub-command → run daemon based on config mode
         // -----------------------------------------------------------------
         None => {
-            let cfg = Config::load(&cli.config)?;
+            let mut cfg = Config::load(&cli.config)?;
             // This node's own settings must be right to start. Problems in
             // the cluster-wide dynamic config are only reported: a newer
             // version may fix them, and a node that won't start over one
@@ -310,19 +310,13 @@ async fn main() -> Result<()> {
             let material = pki::load_or_create(tls_dir, &cfg.node_id)?;
             let tls_ctx = tls::TlsContext::new(&material)?;
 
+            cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
+
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
             // Signs this node's own record, which peers believe only signed.
             let _ = state.signer.set(signing::Signer::from_material(&material)?);
             // Orders this process's heartbeats above any earlier process's.
             let _ = state.incarnation.set(state::incarnation_for(&cli.config));
-            if cfg.require_signed_config {
-                if let Err(e) = signing::admit(&state, cfg.dynamic_config.clone()) {
-                    tracing::warn!(
-                        "starting with a config that isn't admin-signed ({e:#}); peers requiring signatures \
-                         won't accept it until an admin pushes a signed change"
-                    );
-                }
-            }
 
             if let Some(tracing_cfg) = &cfg.tracing {
                 let _ = state.tracer.set(telemetry::Tracer::start(tracing_cfg, &cfg.node_id));
@@ -354,9 +348,13 @@ async fn main() -> Result<()> {
         // init
         // -----------------------------------------------------------------
         Some(Commands::Init) => {
-            let mut cfg = Config::load(&cli.config).unwrap_or_default();
+            let mut cfg = Config::load_or_default(&cli.config)?;
 
-            cfg.node_id = config::get_hostname();
+            // A node keeps the id it has: its certificate is issued for it,
+            // and peers know it by it.
+            if cfg.node_id.is_empty() {
+                cfg.node_id = config::get_hostname();
+            }
 
             cfg.save(&cli.config)?;
 
@@ -399,7 +397,7 @@ async fn main() -> Result<()> {
         // status
         // -----------------------------------------------------------------
         Some(Commands::Status { remote }) => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load_or_default(&cli.config)?;
             let target = remote.clone().unwrap_or_else(|| cfg.local_target());
 
             match tokio::time::timeout(state::CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&target)).await {
@@ -462,7 +460,7 @@ async fn main() -> Result<()> {
             let labels: std::collections::BTreeMap<String, String> = labels.into_iter().collect();
             let meta: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
             if let Some(target) = remote {
-                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let cfg = Config::load_or_default(&cli.config)?;
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
                 let version = run_admin_rpc(
                     &target,
@@ -492,7 +490,7 @@ async fn main() -> Result<()> {
                     name, group_name, target, version
                 );
             } else {
-                let mut cfg = Config::load(&cli.config).unwrap_or_default();
+                let mut cfg = Config::load_or_default(&cli.config)?;
                 let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
                 let service = Service {
                     name: name.clone(),
@@ -534,7 +532,7 @@ async fn main() -> Result<()> {
             action: ServiceAction::List { remote },
         }) => {
             let dc = if let Some(target) = remote {
-                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let cfg = Config::load_or_default(&cli.config)?;
                 fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?
             } else {
                 let cfg = Config::load(&cli.config)?;
@@ -583,7 +581,7 @@ async fn main() -> Result<()> {
                 },
         }) => {
             if let Some(target) = remote {
-                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let cfg = Config::load_or_default(&cli.config)?;
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
                 let version = run_admin_rpc(
                     &target,
@@ -640,7 +638,7 @@ async fn main() -> Result<()> {
                 },
         }) => {
             if let Some(target) = remote {
-                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let cfg = Config::load_or_default(&cli.config)?;
                 let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
                 let version = run_admin_rpc(
                     &target,
@@ -699,7 +697,7 @@ async fn main() -> Result<()> {
             };
             let count = routes.len();
             let version = if let Some(target) = &remote {
-                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let cfg = Config::load_or_default(&cli.config)?;
                 run_admin_rpc(
                     target,
                     AdminOp::RoutesSet { service: service.clone(), routes },
@@ -726,7 +724,7 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         Some(Commands::Route { action: RouteAction::List { remote } }) => {
             let dc = if let Some(target) = remote {
-                let cfg = Config::load(&cli.config).unwrap_or_default();
+                let cfg = Config::load_or_default(&cli.config)?;
                 fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?
             } else {
                 Config::load(&cli.config)?.dynamic_config
@@ -771,7 +769,7 @@ async fn main() -> Result<()> {
                     to_cert_dir,
                 },
         }) => {
-            let cfg = Config::load(&cli.config).unwrap_or_default();
+            let cfg = Config::load_or_default(&cli.config)?;
             let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
             let dest_group = to_group.unwrap_or_else(|| group_name.clone());
             let dest_node = to_node.unwrap_or_else(|| owner_node_id.clone());
@@ -783,8 +781,7 @@ async fn main() -> Result<()> {
             let to_certs = to_cert_dir.as_deref().or(cli.cert_dir.as_deref());
 
             // 1. Read the service from the source cluster.
-            let src_dc =
-                fetch_remote_dynamic_config(&from, &cfg, from_certs).await?;
+            let src_dc = fetch_trusted_config(&from, &cfg, from_certs).await?;
             let src_svc = src_dc
                 .service_groups
                 .iter()
@@ -887,16 +884,35 @@ async fn main() -> Result<()> {
             desired.signature = None;
             let mut pushed = None;
             for attempt in 1..=PUSH_ATTEMPTS {
-                let current = fetch_daemon_config(&target, &tls_ctx).await?.dynamic_config;
-                if current.same_settings(&desired) {
+                let daemon = fetch_daemon_config(&target, &tls_ctx).await?;
+                let reported = daemon.dynamic_config;
+                // What the cluster has, as far as we can tell. A signed
+                // cluster's config counts only as its signer made it; one
+                // that can't be verified is about to be replaced anyway.
+                let known = if daemon.require_signed_config && reported.signature.is_some() {
+                    match trusted_config(&reported, &cfg, &material, &tls_ctx) {
+                        Ok(verified) => Some(verified),
+                        Err(e) => {
+                            eprintln!("warning: can't verify the config on {target} ({e:#}); replacing it");
+                            None
+                        }
+                    }
+                } else if daemon.require_signed_config {
+                    None
+                } else {
+                    Some(reported.clone())
+                };
+                if let Some(current) = known.as_ref().filter(|current| current.same_settings(&desired)) {
                     println!("{target} already has the config in {} (version {})", cli.config, current.version);
                     return Ok(());
                 }
-                if let Some(refusal) = stale_push(&current, &desired, &cli.config, force) {
+                if let Some(refusal) = stale_push(&reported, &desired, &cli.config, force) {
                     anyhow::bail!("{refusal}");
                 }
+                let current = reported;
                 let next = config::DynamicConfig { version: current.version + 1, ..desired.clone() };
-                if let Some(problem) = config::new_problem(&current, &next) {
+                let baseline = known.unwrap_or_default();
+                if let Some(problem) = config::new_problem(&baseline, &next) {
                     anyhow::bail!("{problem}");
                 }
                 let push = signed_push(next, current.version, &material)?;
@@ -935,7 +951,21 @@ async fn main() -> Result<()> {
             let target = remote.unwrap_or_else(|| cfg.local_target());
             let material = load_cli_material(&cfg, cli.cert_dir.as_deref())?;
             let tls_ctx = tls::TlsContext::new(&material)?;
-            let current = fetch_daemon_config(&target, &tls_ctx).await?.dynamic_config;
+            let daemon = fetch_daemon_config(&target, &tls_ctx).await?;
+            let current = if !daemon.require_signed_config {
+                daemon.dynamic_config
+            } else if daemon.dynamic_config.signature.is_none() {
+                eprintln!(
+                    "warning: the config on {target} isn't admin-signed yet; review it before you sign it with \
+                     `stouter config push`"
+                );
+                daemon.dynamic_config
+            } else {
+                // Only what an admin signed: the file is what `config push`
+                // signs next.
+                trusted_config(&daemon.dynamic_config, &cfg, &material, &tls_ctx)
+                    .with_context(|| format!("won't write the config from {target} to {}", cli.config))?
+            };
             let version = current.version;
             if !cfg.dynamic_config.same_settings(&current) {
                 // It may hold edits not pushed yet: keep them.
@@ -965,6 +995,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The dynamic config a daemon starts with. With `requireSignedConfig`,
+/// what an admin signed: the signed text, not whatever the file says around
+/// the signature. Otherwise an edit to a signed config would be in force
+/// here, and served to the CLI as the config to make (and sign) the next
+/// change on. A config with no valid signature is kept, with a warning:
+/// a cluster has one until its first signed change.
+fn startup_config(cfg: &Config, tls_ctx: &tls::TlsContext, path: &str) -> config::DynamicConfig {
+    if !cfg.require_signed_config {
+        return cfg.dynamic_config.clone();
+    }
+    match signing::verify(&cfg.dynamic_config, tls_ctx, &cfg.admin_cns) {
+        Ok((signed, _)) => {
+            if signed != cfg.dynamic_config {
+                tracing::warn!(
+                    "{path}: ignoring edits to the admin-signed config (version {}) and running what was signed; \
+                     apply an edit with `stouter config push` (requireSignedConfig)",
+                    signed.version
+                );
+            }
+            signed
+        }
+        Err(e) => {
+            tracing::warn!(
+                "starting with a config that isn't admin-signed ({e:#}); peers requiring signatures won't accept it \
+                 until an admin pushes a signed change"
+            );
+            cfg.dynamic_config.clone()
+        }
+    }
 }
 
 /// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
@@ -1155,7 +1216,17 @@ async fn try_admin_rpc(
         if !daemon.require_signed_config {
             return send_admin(target, &tls_ctx, op).await;
         }
-        let current = daemon.dynamic_config;
+        // Build only on what an admin signed: signing whatever the daemon
+        // reports would let a node get its own edits admin-signed.
+        if daemon.dynamic_config.signature.is_none() {
+            anyhow::bail!(
+                "the config on {target} (version {}) isn't admin-signed yet, so there is no verified config to make \
+                 this change on: sign one first with `stouter config pull` and `stouter config push`",
+                daemon.dynamic_config.version
+            );
+        }
+        let current = trusted_config(&daemon.dynamic_config, cfg, &material, &tls_ctx)
+            .with_context(|| format!("the config on {target}"))?;
         let mut next = current.clone();
         if let Err(e) = op.clone().apply(&mut next) {
             return Ok(Err(((&e).into(), e.to_string())));
@@ -1193,6 +1264,43 @@ async fn run_admin_rpc(
             std::process::exit(exit_code);
         }
     }
+}
+
+/// `dc` (a config a daemon reported) as its admin signed it: decoded from the
+/// signed text, so edits made around the signature don't count, and signed
+/// by someone the CLI trusts itself (a CN in the local config's `adminCns`,
+/// or the CLI's own certificate). The daemon's word for who its admins are
+/// can't be taken: a node lying about the config would lie about that too.
+fn trusted_config(
+    dc: &config::DynamicConfig,
+    cfg: &Config,
+    material: &pki::PkiMaterial,
+    tls_ctx: &tls::TlsContext,
+) -> Result<config::DynamicConfig> {
+    let mut trusted = cfg.admin_cns.clone();
+    trusted.extend(tls::cert_cn(&material.node_cert_der));
+    signing::verify(dc, tls_ctx, &trusted).map(|(verified, _)| verified).map_err(|e| {
+        e.context(format!(
+            "not verified as admin-signed; to trust another admin's changes, list their certificate's CN in adminCns in \
+             the CLI's config ({})",
+            if cfg.admin_cns.is_empty() { "none listed".to_string() } else { cfg.admin_cns.join(", ") }
+        ))
+    })
+}
+
+/// A remote daemon's config, as far as the CLI can trust it (see
+/// [`trusted_config`]) when it requires signed configs.
+async fn fetch_trusted_config(target: &str, cfg: &Config, cert_dir: Option<&str>) -> Result<config::DynamicConfig> {
+    let material = load_cli_material(cfg, cert_dir)?;
+    let tls_ctx = tls::TlsContext::new(&material)?;
+    let daemon = fetch_daemon_config(target, &tls_ctx).await?;
+    if !daemon.require_signed_config {
+        return Ok(daemon.dynamic_config);
+    }
+    if daemon.dynamic_config.signature.is_none() {
+        anyhow::bail!("the config on {target} isn't admin-signed yet (requireSignedConfig)");
+    }
+    trusted_config(&daemon.dynamic_config, cfg, &material, &tls_ctx).with_context(|| format!("the config on {target}"))
 }
 
 /// Fetch the `DynamicConfig` from a remote daemon via `StatusRequest`.
@@ -1346,6 +1454,88 @@ async fn broadcast_config(cfg: &Config, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CA, and certificates for `names` issued by it: (dir, material by name).
+    fn cluster_certs(names: &[&str]) -> (std::path::PathBuf, std::collections::HashMap<String, pki::PkiMaterial>) {
+        let dir = std::env::temp_dir().join(format!("stouter_cli_{}_{}", std::process::id(), rand::random::<u64>()));
+        let ca = dir.join("ca");
+        pki::load_or_create(ca.to_str().unwrap(), "ca-node").unwrap();
+        let mut certs = std::collections::HashMap::new();
+        for name in names {
+            let out = dir.join(name);
+            pki::issue_cert_to_dir(ca.to_str().unwrap(), name, out.to_str().unwrap()).unwrap();
+            certs.insert(name.to_string(), pki::load_existing(out.to_str().unwrap(), name).unwrap());
+        }
+        (dir, certs)
+    }
+
+    fn api_on_port(port: u16) -> config::DynamicConfig {
+        serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "serviceGroups": [{"name": "web", "services": [{"name": "api", "nodeId": "n1", "nodePort": port}]}],
+        }))
+        .unwrap()
+    }
+
+    fn port_of(dc: &config::DynamicConfig) -> u16 {
+        dc.service_groups[0].services[0].node_port
+    }
+
+    #[test]
+    fn the_cli_builds_only_on_what_an_admin_signed() {
+        let (dir, certs) = cluster_certs(&["admin", "other-admin", "mallory"]);
+        let sign = |dc: &config::DynamicConfig, who: &str| {
+            signing::sign(dc, &signing::Signer::from_material(&certs[who]).unwrap()).unwrap()
+        };
+        let me = &certs["admin"];
+        let tls_ctx = tls::TlsContext::new(me).unwrap();
+        let no_admins = Config::default();
+
+        let signed = sign(&api_on_port(3000), "admin");
+        assert_eq!(port_of(&trusted_config(&signed, &no_admins, me, &tls_ctx).unwrap()), 3000);
+
+        // A node that edits the config around the signature: what was
+        // signed is what the change is made on.
+        let mut edited = signed.clone();
+        edited.service_groups[0].services[0].node_port = 6666;
+        assert_eq!(port_of(&trusted_config(&edited, &no_admins, me, &tls_ctx).unwrap()), 3000);
+
+        // Signed by a node with a cluster certificate, but not an admin we
+        // trust (whatever adminCns the daemon claims): refused.
+        let forged = sign(&api_on_port(6666), "mallory");
+        let err = trusted_config(&forged, &no_admins, me, &tls_ctx).expect_err("refused");
+        assert!(format!("{err:#}").contains("mallory"), "{err:#}");
+
+        // Another admin's change: trusted once listed in the CLI's adminCns.
+        let theirs = sign(&api_on_port(4000), "other-admin");
+        assert!(trusted_config(&theirs, &no_admins, me, &tls_ctx).is_err());
+        let listed = Config { admin_cns: vec!["other-admin".into()], ..Config::default() };
+        assert_eq!(port_of(&trusted_config(&theirs, &listed, me, &tls_ctx).unwrap()), 4000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signing_daemon_starts_with_what_was_signed() {
+        let (dir, certs) = cluster_certs(&["admin", "n1"]);
+        let tls_ctx = tls::TlsContext::new(&certs["n1"]).unwrap();
+        let signed = signing::sign(&api_on_port(3000), &signing::Signer::from_material(&certs["admin"]).unwrap()).unwrap();
+        let mut edited = signed.clone();
+        edited.service_groups[0].services[0].node_port = 6666;
+        let cfg = Config {
+            require_signed_config: true,
+            admin_cns: vec!["admin".into()],
+            dynamic_config: edited.clone(),
+            ..Config::default()
+        };
+        assert_eq!(port_of(&startup_config(&cfg, &tls_ctx, "stouter.json")), 3000, "the edit is not in force");
+        // Unsigned (a cluster before its first signed change): kept.
+        let unsigned = Config { dynamic_config: api_on_port(5000), ..cfg.clone() };
+        assert_eq!(port_of(&startup_config(&unsigned, &tls_ctx, "stouter.json")), 5000);
+        // Without requireSignedConfig the file is the config.
+        let open = Config { require_signed_config: false, ..cfg };
+        assert_eq!(port_of(&startup_config(&open, &tls_ctx, "stouter.json")), 6666);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_push_from_a_file_behind_the_cluster_is_refused_unless_forced() {

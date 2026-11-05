@@ -93,28 +93,7 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
             .with_context(|| format!("bind gossip listener to {}", state.config.bind))?;
 
         info!("Subscribe daemon listening on {}", state.config.bind);
-
-        loop {
-            let (stream, peer_addr) = tokio::select! {
-                result = listener.accept() => result.context("accept connection")?,
-                _ = state.shutdown.cancelled() => {
-                    info!("subscribe listener shutting down");
-                    break;
-                }
-            };
-            // Keepalive, so a peer that vanished without closing is noticed.
-            crate::io::configure_stream(&stream);
-            let state = state.clone();
-            let peer = peer_addr.to_string();
-            // In-flight tracking happens in `dispatch_connection`, once the
-            // connection carries work; idle pooled connections don't count.
-            tokio::spawn(async move {
-                match state.tls_accept(stream).await {
-                    Ok(mesh) => gossip::dispatch_connection(mesh, peer, state).await,
-                    Err(e) => tracing::debug!("TLS accept from {peer}: {e}"),
-                }
-            });
-        }
+        crate::node::serve_mesh(listener, state, "subscribe listener").await;
     }
 
     Ok(())
@@ -233,6 +212,18 @@ async fn manage_proxies(
                         },
                     );
                 }
+            }
+        }
+
+        // A proxy whose task ended on its own (it shouldn't: it waits out
+        // accept errors) is forgotten here, so it is started again below
+        // rather than left advertised on a port nothing listens on.
+        let ended: Vec<String> =
+            proxies.iter().filter(|(_, handle)| handle.abort.is_finished()).map(|(key, _)| key.clone()).collect();
+        for key in ended {
+            if let Some(handle) = proxies.remove(&key) {
+                service_ports.write().await.remove(&handle.service_name);
+                tracing::warn!("proxy for {key} stopped; starting it again");
             }
         }
 

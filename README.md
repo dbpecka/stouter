@@ -54,7 +54,7 @@ Create a `stouter.json` file:
 |---|---|
 | `mode` | `node`, `subscribe`, or `nodeSubscribe` |
 | `bind` | Address to listen on |
-| `advertiseAddr` | Address peers use to reach this node |
+| `advertiseAddr` | Address peers use to reach this node. Without it, with a wildcard `bind` (`0.0.0.0` or `[::]`), peers use the address they reach the node at, and pass that on to nodes that hear of it through them: those use it until the node contacts them itself (they only count it as live once its own certificate answers there). Set it when that address isn't one every peer can reach. |
 | `nodeId` | Unique identifier for this node |
 | `outboundOnly` | Set `true` for nodes behind NAT — disables listener, uses reverse connections |
 | `reversePoolSize` | Number of idle reverse connections an `outboundOnly` node keeps at each of its 3 relays (default 64, at most 1024: relays refuse more from one node) |
@@ -70,6 +70,11 @@ The daemon won't start if one of its own settings is wrong (an invalid
 twice, are logged as warnings instead: that config is the cluster's, a newer
 version may already fix it, and a node that refused to start over it could
 never receive the fix. `stouter check` reports both kinds.
+
+CLI commands that change the local file (`init`, `service add` without
+`--remote`, and so on) refuse a file they can't parse instead of starting
+over from defaults and saving those over it. `init` sets `nodeId` to the
+hostname only if it is empty.
 
 ### Modes
 
@@ -332,6 +337,13 @@ Limits, so one peer can't exhaust a node:
   (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, and 1024
   idle reverse connections. Accepted connections use TCP keepalive, so ones whose peer
   vanished are closed.
+- At most 512 TLS handshakes may be in progress at once, 128 from one IP
+  address; further connections are closed at once. Until it completes its
+  handshake a connection could be anyone's, so this keeps a host with no
+  certificate from tying up every file descriptor.
+- A failed `accept` (such as no file descriptors left) is retried after a
+  short, growing wait and logged, on the mesh listener, local proxies and
+  `httpListen` alike: it never stops the daemon or a proxy.
 
 ### Tunnel Routing
 
@@ -499,6 +511,17 @@ any node can relay a signed config but none can alter it.
   themselves, sign it with the certificate from `--cert-dir`, and push it
   (re-reading and retrying if the config changed meanwhile). Without
   `--remote`, they sign the change written to the local file.
+- The CLI makes a change only on a config it has verified itself: the text an
+  admin signed (not what a daemon reports around the signature), signed by a
+  CN in the CLI's own config's `adminCns` or by the CLI's own certificate.
+  It doesn't take the daemon's word for who the admins are: a node lying
+  about the config could lie about that too, and get its edits signed. List
+  your fellow admins in `adminCns` in the config the CLI reads. `service
+  move` checks the source cluster's config the same way, and `config pull`
+  writes only a verified config (or an unsigned one, with a warning, before
+  the first signed change).
+- A node starts from the text an admin signed, not from edits made around
+  the signature in its config file; it logs that it ignores them.
 - Editing a config file by hand no longer changes anything: the node logs a
   warning. Apply the edit with
   `stouter --cert-dir <admin certs> config push [--remote host:port]`
@@ -511,6 +534,8 @@ Turn it on everywhere at once, once every node runs a version that supports
 it. Older nodes don't relay the signature, and a node without the flag still
 adopts unsigned changes. Until an admin pushes a first signed change, nodes
 keep the config they have (and warn at startup that it isn't signed).
+Changes with `--remote` need that first signed config to build on: `stouter
+config pull` it, review it, and `stouter config push` it.
 
 ### Shared State
 

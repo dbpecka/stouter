@@ -906,6 +906,16 @@ impl Config {
         Ok(config)
     }
 
+    /// Load `path`, or the default config if there is no such file. A file
+    /// that exists but can't be read or parsed is an error, never defaults:
+    /// a command that went on and saved would replace it, settings and all.
+    pub fn load_or_default(path: &str) -> Result<Self> {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            _ => Self::load(path),
+        }
+    }
+
     /// Everything wrong with the config: [`Config::validate_local`]'s error,
     /// else the first of [`Config::config_problems`]. What `stouter check`
     /// reports.
@@ -1485,6 +1495,23 @@ mod tests {
     fn validate_rejects_same_service_twice_on_one_node() {
         let cfg = group_of(vec![instance("api", "n1", &[]), instance("api", "n1", &[])]);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn a_config_file_that_doesnt_parse_is_never_replaced_by_defaults() {
+        let dir = std::env::temp_dir().join(format!("stouter_load_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path_str = path.to_str().unwrap();
+        // No file yet: start from defaults (`init`, a first `service add`).
+        assert_eq!(Config::load_or_default(path_str).unwrap().node_id, "");
+        // A typo: an error, so nothing goes on to save over the file.
+        let broken = r#"{"nodeId": "n1", "requireSignedConfig": true, "adminCns": ["admin"],}"#;
+        std::fs::write(&path, broken).unwrap();
+        let err = Config::load_or_default(path_str).expect_err("refused");
+        assert!(format!("{err:#}").contains("invalid JSON"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

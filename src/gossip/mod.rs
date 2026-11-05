@@ -546,16 +546,22 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
 /// Our own addresses are left out (a shared bootstrap list often names every
 /// node, this one included): syncing with ourselves only wastes connections.
 async fn peer_addrs(state: &Arc<SharedState>) -> Vec<String> {
-    let own = [state.config.peer_addr().to_string(), state.config.bind.clone(), state.config.local_target()];
     let mut addrs: Vec<String> = Vec::new();
     let members = state.known_nodes.load();
     let candidates = state.bootstrap_peers.iter().chain(members.values().map(|n| &n.addr));
     for addr in candidates {
-        if !addr.is_empty() && !own.contains(addr) && !addrs.contains(addr) {
+        if dialable(state, addr) && !addrs.contains(addr) {
             addrs.push(addr.clone());
         }
     }
     addrs
+}
+
+/// Whether `addr` is somewhere to sync with: not empty, not a wildcard
+/// (which says where a node listens, not where to reach it), not us.
+fn dialable(state: &SharedState, addr: &str) -> bool {
+    let own = [state.config.peer_addr(), state.config.bind.as_str(), &state.config.local_target()];
+    !addr.is_empty() && !is_wildcard(addr) && !own.contains(&addr)
 }
 
 /// Background task: periodically push a Sync message to every known peer and
@@ -578,7 +584,7 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
         // peer, this is how the two find each other once the network heals.
         if round.is_multiple_of(FORGOTTEN_RETRY_ROUNDS) {
             for addr in state.forgotten_addrs() {
-                if !peers.contains(&addr) {
+                if dialable(&state, &addr) && !peers.contains(&addr) {
                     peers.push(addr);
                 }
             }
@@ -919,10 +925,13 @@ async fn merge_sync(
         if let Some(node) = source.cn.and_then(|cn| kn.get_mut(cn)) {
             node.heard_at = Some(now);
         }
-        // Refresh the liveness marker for the peer we just synced with directly.
+        // Refresh the liveness marker for the peer we just synced with
+        // directly: the node at that address, if it's the one whose
+        // certificate answered. (Another node now at a dead node's old
+        // address must not keep it alive.)
         if let Some(addr) = source.contact_addr {
             for node in kn.values_mut() {
-                if !node.addr.is_empty() && node.addr == addr {
+                if !node.addr.is_empty() && node.addr == addr && source.cn.is_none_or(|cn| cn == node.id) {
                     node.last_seen = Some(now);
                     node.heard_at = Some(now);
                 }
@@ -988,9 +997,28 @@ fn merge_signed(
     now: Instant,
 ) -> bool {
     let held = kn.get(&node.id).filter(|n| n.signed.is_some()).map(|n| n.record_version);
+    // A record that says only "wherever you reached me" (a wildcard): where
+    // to reach the node can improve without its record changing, so check
+    // before skipping a record we already hold.
+    let mut addr_changed = false;
+    if let Some(existing) = kn.get_mut(&node.id).filter(|n| n.signed.is_some()) {
+        let better = if source.cn == Some(node.id.as_str()) && is_wildcard(&node.addr) {
+            // From the node itself: where we reached it, or it reached us.
+            source.host.and_then(|host| rewrite_wildcard(&node.addr, host))
+        } else if is_wildcard(&existing.addr) {
+            relayed_address(&node.addr, &existing.addr)
+        } else {
+            None
+        };
+        if let Some(addr) = better.filter(|addr| *addr != existing.addr) {
+            info!("node {} address updated: {} -> {addr}", node.id, existing.addr);
+            existing.addr = addr;
+            addr_changed = true;
+        }
+    }
     match crate::signing::claimed_heartbeat(&signed) {
         Some(claimed) if held.is_none_or(|h| claimed > h) => {}
-        _ => return false,
+        _ => return addr_changed,
     }
     let Some(tls) = state.tls.as_deref() else { return false };
     let record = match crate::signing::verify_node(&signed, tls) {
@@ -1017,8 +1045,9 @@ fn merge_signed(
         return true;
     }
 
-    // A wildcard address means "wherever you reached me": only the node
-    // itself can tell us that. Relayed, keep the address we already have.
+    // A wildcard address means "wherever you reached me": the node itself
+    // tells us best. Relayed, keep an address we already have, or else take
+    // the one the relaying node reaches it at (see `relayed_address`).
     let mut addr = record.addr.clone();
     if is_wildcard(&addr) {
         if source.cn == Some(record.id.as_str()) {
@@ -1027,6 +1056,8 @@ fn merge_signed(
             }
         } else if let Some(known) = kn.get(&record.id).filter(|n| !n.addr.is_empty() && !is_wildcard(&n.addr)) {
             addr = known.addr.clone();
+        } else if let Some(relayed) = relayed_address(&node.addr, &record.addr) {
+            addr = relayed;
         }
     }
 
@@ -1099,6 +1130,20 @@ fn merge_signed(
             true
         }
     }
+}
+
+/// For a node whose signed address is the wildcard `signed`, the address a
+/// relaying node gave with its record (`envelope`: where that node reaches
+/// it), if it's a real one on the same port. Without it, a node learning of
+/// a wildcard-bound node through others would have nowhere to reach it.
+///
+/// The relaying node could name the wrong host, but no more: a tunnel or
+/// sync there must be answered by the node's own certificate, and only
+/// that counts it as live. The node's own word replaces it once it syncs.
+fn relayed_address(envelope: &str, signed: &str) -> Option<String> {
+    let port = |addr: &str| addr.rsplit_once(':').map(|(_, port)| port.to_string());
+    (!envelope.is_empty() && !is_wildcard(envelope) && port(envelope).is_some() && port(envelope) == port(signed))
+        .then(|| envelope.to_string())
 }
 
 /// Take `beat` for the node it names if it's newer than what we have and
@@ -2130,6 +2175,68 @@ mod tests {
         merge_sync(&sub, None, vec![], vec![crate::signing::sign_beat("x", 50, &x).unwrap()], &relayed).await;
         assert!(live(&sub));
         assert_eq!(beats_to_relay(&sub).len(), 1, "and it is passed on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wildcard_bound_nodes_get_an_address_peers_can_reach() {
+        let (dir, sub, x, _) = signed_nodes_setup();
+        let a = crate::state::test_support::tls_state(&dir, "a");
+        let addr_of = |state: &SharedState| state.known_nodes.load()["x"].addr.clone();
+        // x binds 0.0.0.0:8080 (the default) with no advertiseAddr. a syncs
+        // with x itself, so it knows where x is.
+        let from_x = SyncSource { cn: Some("x"), host: Some("10.0.0.5"), contact_addr: None };
+        merge_sync(&a, None, vec![record("x", "0.0.0.0:8080", 10, &x)], vec![], &from_x).await;
+        assert_eq!(addr_of(&a), "10.0.0.5:8080");
+
+        // `sub` hears of x only through a, and takes the address a reaches
+        // it at, so it can sync with x and tunnel to it.
+        let Message::Sync { nodes, .. } = build_sync_reply(&a, &messages::SyncDigest::default()).await else { unreachable!() };
+        let from_a = SyncSource { cn: Some("a"), host: Some("10.0.0.1"), contact_addr: None };
+        merge_sync(&sub, None, nodes, vec![], &from_a).await;
+        assert_eq!(addr_of(&sub), "10.0.0.5:8080");
+        assert!(peer_addrs(&sub).await.contains(&"10.0.0.5:8080".to_string()));
+
+        // x itself has the last word, even with a record `sub` already has.
+        let from_x_elsewhere = SyncSource { cn: Some("x"), host: Some("192.168.1.5"), contact_addr: None };
+        merge_sync(&sub, None, vec![record("x", "0.0.0.0:8080", 10, &x)], vec![], &from_x_elsewhere).await;
+        assert_eq!(addr_of(&sub), "192.168.1.5:8080");
+        // Relayed, a different address doesn't override it.
+        let relayed = NodeInfo { addr: "10.6.6.6:8080".into(), ..record("x", "0.0.0.0:8080", 10, &x) };
+        merge_sync(&sub, None, vec![relayed], vec![], &from_a).await;
+        assert_eq!(addr_of(&sub), "192.168.1.5:8080");
+
+        // With nothing better than the wildcard (or a relayed address on
+        // another port), there's nowhere to dial: no sync with 0.0.0.0.
+        let other = crate::state::test_support::tls_state(&dir, "other");
+        let wrong_port = NodeInfo { addr: "10.0.0.5:9999".into(), ..record("x", "0.0.0.0:8080", 10, &x) };
+        merge_sync(&other, None, vec![wrong_port], vec![], &from_a).await;
+        assert_eq!(addr_of(&other), "0.0.0.0:8080");
+        assert!(peer_addrs(&other).await.iter().all(|addr| !is_wildcard(addr)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_the_node_that_answers_at_an_address_counts_as_live() {
+        let (dir, sub, x, _) = signed_nodes_setup();
+        merge_sync(&sub, None, vec![record("x", "10.0.0.9:8080", 10, &x)], vec![], &SyncSource::default()).await;
+        age(&sub, "x", NODE_EXPIRE_AFTER + Duration::from_secs(1)).await;
+        let live = |sub: &SharedState| crate::state::node_is_live(&sub.known_nodes.load()["x"], Instant::now());
+
+        // x died; y now has its IP and port. Reaching y there says nothing
+        // about x, which is forgotten as it should be.
+        let y_there = SyncSource { cn: Some("y"), host: Some("10.0.0.9"), contact_addr: Some("10.0.0.9:8080") };
+        merge_sync(&sub, None, vec![], vec![], &y_there).await;
+        assert!(!live(&sub));
+        expire_silent_nodes(&sub).await;
+        assert!(!sub.known_nodes.load().contains_key("x"));
+
+        // Whereas x answering there is x alive.
+        merge_sync(&sub, None, vec![record("x", "10.0.0.9:8080", 11, &x)], vec![], &SyncSource::default()).await;
+        age(&sub, "x", Duration::from_secs(60)).await;
+        let x_there = SyncSource { cn: Some("x"), host: Some("10.0.0.9"), contact_addr: Some("10.0.0.9:8080") };
+        merge_sync(&sub, None, vec![], vec![], &x_there).await;
+        assert!(live(&sub));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

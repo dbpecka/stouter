@@ -60,11 +60,25 @@ pub async fn run_proxy(
     let http = proxies.get(&service_name);
     let balancer = http.balancer();
 
+    let what = format!("proxy for {service_name}");
+    let mut backoff = crate::io::AcceptBackoff::default();
     loop {
         // Stop accepting at shutdown; connections already accepted are
-        // tracked as in-flight and drained.
+        // tracked as in-flight and drained. A failed accept (such as no file
+        // descriptors left) is waited out, so the proxy keeps its port.
         let (client, _) = tokio::select! {
-            accepted = listener.accept() => accepted.context("proxy accept")?,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => {
+                    backoff.succeeded(&what);
+                    accepted
+                }
+                Err(e) => {
+                    if backoff.failed(&what, &e, &state.shutdown).await {
+                        continue;
+                    }
+                    return Ok(());
+                }
+            },
             _ = state.shutdown.cancelled() => return Ok(()),
         };
         client.set_nodelay(true).ok();

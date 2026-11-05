@@ -5,6 +5,44 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Pacing for an accept loop after `accept` fails. Such failures mostly pass
+/// on their own (out of file descriptors until connections close, a
+/// connection reset before it was taken), so the loop waits a little,
+/// longer each time, and carries on. Ending it instead would take the
+/// listener, or the whole daemon, down over a moment's shortage, which
+/// anyone able to open connections could cause on purpose.
+#[derive(Default)]
+pub struct AcceptBackoff {
+    failures: u32,
+}
+
+impl AcceptBackoff {
+    /// After a failed accept: log it (at warn the first time and as the
+    /// streak doubles), then wait 10ms, doubling to about a second. Returns
+    /// false if `stop` was cancelled meanwhile.
+    pub async fn failed(&mut self, what: &str, err: &io::Error, stop: &tokio_util::sync::CancellationToken) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures.is_power_of_two() {
+            tracing::warn!("{what}: accept failed ({err}), {} in a row; retrying", self.failures);
+        } else {
+            tracing::debug!("{what}: accept failed ({err}); retrying");
+        }
+        let wait = Duration::from_millis(5 << self.failures.min(8));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => true,
+            _ = stop.cancelled() => false,
+        }
+    }
+
+    /// After a successful accept.
+    pub fn succeeded(&mut self, what: &str) {
+        if self.failures > 0 {
+            tracing::info!("{what}: accepting again after {} failed accepts", self.failures);
+            self.failures = 0;
+        }
+    }
+}
+
 /// Buffer size for bidirectional proxy (64 KiB).
 const BUF_SIZE: usize = 65536;
 

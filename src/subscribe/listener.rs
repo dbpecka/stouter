@@ -36,9 +36,23 @@ pub(super) async fn run_http_listener(
     }
     info!("HTTP listener on {bound} (route by URL host or Host header)");
 
+    let mut backoff = crate::io::AcceptBackoff::default();
     loop {
+        // A failed accept (such as no file descriptors left) is waited out:
+        // nothing would start this listener again.
         let (client, _) = tokio::select! {
-            accepted = listener.accept() => accepted.context("httpListen accept")?,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => {
+                    backoff.succeeded("httpListen");
+                    accepted
+                }
+                Err(e) => {
+                    if backoff.failed("httpListen", &e, &state.shutdown).await {
+                        continue;
+                    }
+                    return Ok(());
+                }
+            },
             _ = state.shutdown.cancelled() => return Ok(()),
         };
         client.set_nodelay(true).ok();
