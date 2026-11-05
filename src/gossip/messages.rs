@@ -97,6 +97,11 @@ pub struct SyncDigest {
     /// The beat held for each node with no address, when `want_beats`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beats: Vec<(String, u64)>,
+    /// Keep this connection for the next sync rather than opening a new one
+    /// each round: in a sync, the sender asks; in the reply, the peer agrees
+    /// (and waits for it). Absent from older nodes, which close after one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_open: bool,
 }
 
 fn yes() -> bool {

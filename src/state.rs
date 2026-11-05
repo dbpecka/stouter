@@ -412,6 +412,9 @@ pub struct SharedState {
     /// Backoff for peer addresses that didn't answer a sync (see
     /// `gossip::run_sync_loop`).
     pub(crate) sync_backoff: Mutex<Backoff>,
+    /// Sync connections peers kept open after the last round, by address
+    /// (see `gossip::sync_with_peer`).
+    pub(crate) gossip_conns: Mutex<HashMap<String, MeshStream>>,
     /// Whether the cap on unsigned-only nodes was reported (once).
     pub(crate) unsigned_cap_warned: std::sync::atomic::AtomicBool,
     /// The record this node last gossiped about itself, reused while fresh.
@@ -492,6 +495,7 @@ impl SharedState {
             relays: Mutex::new(HashMap::new()),
             forgotten: Mutex::new(HashMap::new()),
             sync_backoff: Mutex::new(Backoff::new(SYNC_BACKOFF_BASE, SYNC_BACKOFF_MAX)),
+            gossip_conns: Mutex::new(HashMap::new()),
             unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),

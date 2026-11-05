@@ -155,11 +155,7 @@ impl HttpProxy {
 
         let (mut parts, body) = req.into_parts();
         strip_hop_by_hop(&mut parts.headers, upgrade);
-        if !parts.headers.contains_key(header::HOST) {
-            if let Ok(host) = HeaderValue::from_str(&self.service_name) {
-                parts.headers.insert(header::HOST, host);
-            }
-        }
+        set_upstream_host(&parts.uri, &mut parts.headers, &self.service_name);
         parts.headers.insert(
             HeaderName::from_static("traceparent"),
             HeaderValue::from_str(&upstream_trace.to_header()).expect("traceparent is ASCII"),
@@ -484,6 +480,29 @@ struct RoutedTo {
     label: String,
     /// Labels an instance must carry to serve the request.
     labels: BTreeMap<String, String>,
+}
+
+/// The `Host` the upstream request carries. A request in absolute form (sent
+/// through `HTTP_PROXY` to `httpListen`) names its target in the URL, and a
+/// proxy forwards that, whatever `Host` the client sent (RFC 9112 §3.2.2);
+/// one with no `Host` at all gets the service's name.
+fn set_upstream_host(uri: &Uri, headers: &mut HeaderMap, service_name: &str) {
+    let target = uri.authority().map(|authority| match authority.port() {
+        // Without any `user@` the URL may carry.
+        Some(port) => format!("{}:{port}", authority.host()),
+        None => authority.host().to_string(),
+    });
+    match target.and_then(|t| HeaderValue::from_str(&t).ok()) {
+        Some(host) => {
+            headers.insert(header::HOST, host);
+        }
+        None if !headers.contains_key(header::HOST) => {
+            if let Ok(host) = HeaderValue::from_str(service_name) {
+                headers.insert(header::HOST, host);
+            }
+        }
+        None => {}
+    }
 }
 
 /// Find the first route matching the request and pick one of its backend
@@ -891,6 +910,24 @@ mod tests {
             h.append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    #[test]
+    fn the_upstream_host_is_the_requests_target() {
+        let host_for = |uri: &str, client_host: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = client_host {
+                h.insert(header::HOST, HeaderValue::from_str(v).unwrap());
+            }
+            set_upstream_host(&uri.parse().unwrap(), &mut h, "web1");
+            h.get(header::HOST).map(|v| v.to_str().unwrap().to_string())
+        };
+        // Through HTTP_PROXY: the URL's host, whatever Host says.
+        assert_eq!(host_for("http://web1/x", Some("elsewhere")).as_deref(), Some("web1"));
+        assert_eq!(host_for("http://user@web1:8080/x", None).as_deref(), Some("web1:8080"));
+        // At the service's own port: the client's Host, or the service's name.
+        assert_eq!(host_for("/x", Some("api.example.com")).as_deref(), Some("api.example.com"));
+        assert_eq!(host_for("/x", None).as_deref(), Some("web1"));
     }
 
     #[test]

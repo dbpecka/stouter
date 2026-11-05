@@ -86,7 +86,15 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
             "Subscribe daemon running in outbound-only mode (NAT'd), node_id={}",
             state.config.node_id
         );
-        crate::node::reverse::run_reverse_pool_loop(state).await;
+        // Reverse connections are how tunnels reach a NAT'd node's services.
+        // A plain subscriber hosts none, so it holds none: it would
+        // otherwise keep `reversePoolSize` idle connections at each relay
+        // for nothing.
+        if matches!(state.config.mode, crate::config::Mode::NodeSubscribe) {
+            crate::node::reverse::run_reverse_pool_loop(state).await;
+        } else {
+            state.shutdown.cancelled().await;
+        }
     } else {
         let listener = TcpListener::bind(&state.config.bind)
             .await

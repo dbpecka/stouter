@@ -4,11 +4,19 @@ use metrics_exporter_prometheus::PrometheusHandle;
 
 use crate::state::SharedState;
 
+/// How long a gauge keeps being reported after it was last set. Every gauge
+/// is set by [`run_gauge_loop`] every 5 seconds while what it describes
+/// exists, so one not set for this long describes something gone (most
+/// often a node that left or was forgotten, whose per-node gauges would
+/// otherwise report their last value forever).
+const GAUGE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Install the Prometheus metrics recorder globally.
 ///
 /// Returns a handle that can render the `/metrics` scrape endpoint.
 pub fn install() -> PrometheusHandle {
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let builder = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .idle_timeout(metrics_util::MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT));
     builder
         .install_recorder()
         .expect("failed to install Prometheus recorder")
@@ -51,7 +59,13 @@ pub async fn run_gauge_loop(state: Arc<SharedState>) {
 
         // Service health as this daemon sees it: from the local checker for
         // our own services, from gossip for everyone else's.
+        // For instances on nodes that are here (or this one): a node that
+        // left still has its services in the config, and its gauges must
+        // go quiet so they expire (see `GAUGE_IDLE_TIMEOUT`).
         for (node_id, service) in state.service_index.load().keys() {
+            if *node_id != state.config.node_id && !nodes.contains_key(node_id) {
+                continue;
+            }
             let healthy = !state.service_unhealthy(node_id, service);
             metrics::gauge!("stouter_service_healthy", "service" => service.clone(), "node_id" => node_id.clone())
                 .set(if healthy { 1.0 } else { 0.0 });

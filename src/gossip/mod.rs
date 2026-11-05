@@ -157,11 +157,15 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
         }
     };
     // A mux session lasts as long as the peer keeps it, mostly idle, so it
-    // isn't tracked as a whole; each of its streams is.
-    let _in_flight = (!matches!(msg, Message::MuxTunnel {})).then(|| state.in_flight.track());
+    // isn't tracked as a whole; each of its streams is. A kept sync
+    // connection likewise: each sync on it is.
+    let _in_flight = (!matches!(msg, Message::MuxTunnel {} | Message::Sync { .. })).then(|| state.in_flight.track());
     match msg {
-        Message::Sync { .. }
-        | Message::ConfigUpdate { .. }
+        Message::Sync { .. } => {
+            metrics::counter!("stouter_connections_total", "type" => "gossip").increment(1);
+            serve_syncs(stream, peer_addr, msg, state, peer).await;
+        }
+        Message::ConfigUpdate { .. }
         | Message::NodeJoin { .. }
         | Message::NodeLeave { .. } => {
             metrics::counter!("stouter_connections_total", "type" => "gossip").increment(1);
@@ -229,34 +233,79 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
 // Gossip message handling
 // ---------------------------------------------------------------------------
 
+/// How long a sync connection is kept open for the peer's next sync (sent
+/// every 10 seconds).
+const GOSSIP_KEEP_OPEN: Duration = Duration::from_secs(25);
+
+/// Sync connections one peer may keep open here at once (one, and another
+/// while it replaces it).
+const MAX_KEPT_SYNCS_PER_PEER: usize = 2;
+
+/// Answer a peer's syncs on one connection: the first, and, if it asks to
+/// keep the connection (and has no more kept here than it should), each
+/// later one it sends on it, until it stops or [`GOSSIP_KEEP_OPEN`] passes
+/// with none. Each round otherwise costs an mTLS handshake per peer, both
+/// ways. Waiting between syncs isn't work in flight: shutdown doesn't wait
+/// for it.
+async fn serve_syncs(mut stream: MeshStream, peer_addr: String, mut msg: Message, state: Arc<SharedState>, peer: String) {
+    let slot = state.try_peer_slot("sync", &peer, MAX_KEPT_SYNCS_PER_PEER);
+    loop {
+        let asked = matches!(&msg, Message::Sync { have: Some(have), .. } if have.keep_open);
+        let keep = asked && slot.is_some() && !state.shutdown.is_cancelled();
+        {
+            let _in_flight = state.in_flight.track();
+            if !answer_sync(&mut stream, &peer_addr, msg, &state, keep).await || !keep {
+                return;
+            }
+        }
+        msg = tokio::select! {
+            next = time::timeout(GOSSIP_KEEP_OPEN, recv_message(&mut stream)) => match next {
+                Ok(Ok(next @ Message::Sync { .. })) => next,
+                _ => return,
+            },
+            _ = state.shutdown.cancelled() => return,
+        };
+    }
+}
+
+/// Merge a peer's sync and reply to it, saying whether we keep the
+/// connection open (`keep`). Returns whether the reply was sent.
+async fn answer_sync(stream: &mut MeshStream, peer_addr: &str, msg: Message, state: &Arc<SharedState>, keep: bool) -> bool {
+    let Message::Sync { config, nodes, beats, have, config_elided } = msg else { return false };
+    // No `contact_addr`: an inbound connection arrives from an ephemeral
+    // source port, which won't match the peer's advertised address, so it
+    // can't be used as a liveness signal here. The outbound sync loop
+    // confirms every peer independently.
+    let source = SyncSource { cn: stream.peer_cn(), host: host_of(peer_addr), contact_addr: None };
+    let config = (!config_elided).then_some(config);
+    merge_sync(state, config, nodes, beats, &source).await;
+    // It's up: if we had given up dialling it for a while, don't wait.
+    if let Some(node) = source.cn.and_then(|cn| state.known_nodes.load().get(cn).cloned()) {
+        state.sync_backoff.lock().unwrap().succeeded(&node.addr);
+    }
+
+    // Reply with what the peer lacks (or, to an older peer that sends no
+    // digest, with everything).
+    let mut reply = match &have {
+        Some(have) => build_sync_reply(state, have).await,
+        None => build_sync_msg(state, false).await,
+    };
+    if let Message::Sync { have: Some(ours), .. } = &mut reply {
+        ours.keep_open = keep;
+    }
+    match send_message(stream, &reply).await {
+        Ok(()) => true,
+        Err(e) => {
+            debug!("failed to send sync reply: {e}");
+            false
+        }
+    }
+}
+
 async fn handle_gossip_message(mut stream: MeshStream, peer_addr: String, msg: Message, state: Arc<SharedState>) {
     match msg {
-        Message::Sync { config, nodes, beats, have, config_elided } => {
-            // No `contact_addr`: an inbound connection arrives from an
-            // ephemeral source port, which won't match the peer's advertised
-            // address, so it can't be used as a liveness signal here. The
-            // outbound sync loop confirms every peer independently.
-            let source = SyncSource {
-                cn: stream.peer_cn(),
-                host: host_of(&peer_addr),
-                contact_addr: None,
-            };
-            let config = (!config_elided).then_some(config);
-            merge_sync(&state, config, nodes, beats, &source).await;
-            // It's up: if we had given up dialling it for a while, don't wait.
-            if let Some(node) = source.cn.and_then(|cn| state.known_nodes.load().get(cn).cloned()) {
-                state.sync_backoff.lock().unwrap().succeeded(&node.addr);
-            }
-
-            // Reply with what the peer lacks (or, to an older peer that
-            // sends no digest, with everything).
-            let reply = match &have {
-                Some(have) => build_sync_reply(&state, have).await,
-                None => build_sync_msg(&state, false).await,
-            };
-            if let Err(e) = send_message(&mut stream, &reply).await {
-                debug!("failed to send sync reply: {e}");
-            }
+        Message::Sync { .. } => {
+            answer_sync(&mut stream, &peer_addr, msg, &state, false).await;
         }
         other => {
             let peer_cn = stream.peer_cn().map(str::to_string);
@@ -630,6 +679,8 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
             backoff.retain(|addr| peers.iter().any(|p| p == addr) || forgotten.iter().any(|f| f == addr));
             peers.retain(|addr| backoff.ready(addr, now));
         }
+        // Connections kept for peers we no longer sync with are closed.
+        state.gossip_conns.lock().unwrap().retain(|addr, _| peers.contains(addr));
         // Every peer would send the same beats: ask only a few of them.
         let beat_sources: std::collections::HashSet<&String> = {
             use rand::seq::IndexedRandom;
@@ -710,14 +761,41 @@ async fn expire_silent_nodes(state: &Arc<SharedState>) {
         .await;
 }
 
+/// How long a sync on a kept connection may take before it is given up for
+/// a new connection: one kept from the last round may have died quietly.
+const KEPT_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
+
 async fn sync_with_peer(state: &Arc<SharedState>, addr: &str, want_beats: bool) -> Result<()> {
-    let mut stream = state.connect_mesh(addr, None).await?;
+    let mut our_sync = sync_msg_for(state, addr, want_beats).await;
+    // Ask the peer to keep the connection for the next round.
+    if let Message::Sync { have: Some(have), .. } = &mut our_sync {
+        have.keep_open = true;
+    }
+    async fn exchange(stream: &mut MeshStream, msg: &Message) -> Result<Message> {
+        send_message(stream, msg).await?;
+        recv_message(stream).await
+    }
+    // The connection the peer kept from the last round, if it still works;
+    // else a new one.
+    let kept = state.gossip_conns.lock().unwrap().remove(addr);
+    let kept = match kept {
+        Some(mut stream) => match time::timeout(KEPT_SYNC_TIMEOUT, exchange(&mut stream, &our_sync)).await {
+            Ok(Ok(reply)) => Some((stream, reply)),
+            _ => None,
+        },
+        None => None,
+    };
+    let (stream, reply) = match kept {
+        Some(kept) => kept,
+        None => {
+            let mut stream = state.connect_mesh(addr, None).await?;
+            let reply = exchange(&mut stream, &our_sync).await?;
+            (stream, reply)
+        }
+    };
 
-    let our_sync = sync_msg_for(state, addr, want_beats).await;
-    send_message(&mut stream, &our_sync).await?;
-
-    let reply = recv_message(&mut stream).await?;
     if let Message::Sync { config, nodes, beats, have, config_elided } = reply {
+        let keep = have.as_ref().is_some_and(|have| have.keep_open);
         // A digest in the reply means the peer speaks delta sync: from now
         // on, send it compact syncs. (An older peer never sends one.) It
         // also says which config the peer has, so if ours is newer the next
@@ -735,6 +813,10 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str, want_beats: bool) 
         // reachable, so pass it as the liveness `contact_addr`.
         let source = SyncSource { cn: stream.peer_cn(), host: host_of(addr), contact_addr: Some(addr) };
         merge_sync(state, (!config_elided).then_some(config), nodes, beats, &source).await;
+        // The peer waits for our next sync on this connection.
+        if keep {
+            state.gossip_conns.lock().unwrap().insert(addr.to_string(), stream);
+        }
     }
     Ok(())
 }
@@ -866,7 +948,7 @@ fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfi
     let new = config_text(dc);
     let mut known = state.file_config.lock().unwrap();
     if known.as_ref().is_some_and(|known| *known != on_disk) && on_disk != new {
-        let aside = format!("{path}.unapplied");
+        let aside = crate::config::unused_path(&format!("{path}.unapplied"));
         match crate::config::write_atomic(std::path::Path::new(&aside), text.as_bytes()) {
             Ok(()) => warn!(
                 "{path} had an edit not applied here (version {}); it is saved in {aside}, and {path} now holds \
@@ -1635,7 +1717,7 @@ fn digest(state: &SharedState, config: &crate::config::DynamicConfig, want_beats
     } else {
         Vec::new()
     };
-    messages::SyncDigest { records, config_version: config.version, config_hash: config_hash(config), want_beats, beats }
+    messages::SyncDigest { records, config_version: config.version, config_hash: config_hash(config), want_beats, beats, keep_open: false }
 }
 
 /// FNV-1a over the config's JSON: stable across processes, enough to tell
@@ -2586,6 +2668,45 @@ mod tests {
         // Nothing else runs (as when a sync is cut off by its timeout right
         // here): the index already has it.
         assert!(state.service_index.load().contains_key(&("n1".to_string(), "api".to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn syncs_reuse_one_connection_round_after_round() {
+        use crate::state::test_support::{mesh_pair, tls_state};
+        let dir = std::env::temp_dir().join(format!("stouter_kept_{}_{}", std::process::id(), rand::random::<u64>()));
+        let (a, b) = (tls_state(&dir, "a"), tls_state(&dir, "b"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (b, accepted) = (b.clone(), accepted.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, peer) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let b = b.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mesh) = b.tls_accept(tcp).await {
+                            dispatch_connection(mesh, peer.to_string(), b).await;
+                        }
+                    });
+                }
+            });
+        }
+        let connections = || accepted.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            sync_with_peer(&a, &addr, false).await.unwrap();
+        }
+        assert_eq!(connections(), 1, "three rounds, one connection");
+        assert_eq!(b.in_flight.current(), 0, "a kept connection waiting isn't work in flight");
+
+        // One that died since (the peer restarted, say): a new one, at once.
+        let (dead, other_end) = mesh_pair(&a, &b).await;
+        drop(other_end);
+        a.gossip_conns.lock().unwrap().insert(addr.clone(), dead);
+        sync_with_peer(&a, &addr, false).await.unwrap();
+        assert_eq!(connections(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

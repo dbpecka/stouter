@@ -125,14 +125,16 @@ stouter --cert-dir /path/to/admin-certs config push --remote host1:8080
 
 `config push` replaces the cluster's dynamic config with the file's, so it
 refuses a file older than the cluster's config: pushing it would undo the
-changes made since. Run `config pull` (it keeps a copy of the file as `.bak`
-if its services or routes differ), redo the edit, and push; or pass `--force`
+changes made since. Run `config pull` (if the file's services or routes
+differ, it first keeps a copy as `.bak`, or `.bak.2` and so on, never over an
+earlier one), redo the edit, and push; or pass `--force`
 to replace the cluster's config anyway. After a push the file holds the version
 pushed, so the next edit starts from it.
 
 A running daemon writes each new config into its file. If the file holds an
 edit it hasn't applied (a hand edit not yet picked up, one it refused, a
 pulled config being edited), it saves the file as `<config>.unapplied`
+(numbered like the backups)
 first and logs a warning, rather than write over the edit. `config push`
 mentions that file when the cluster already has what the config file now
 says.
@@ -254,7 +256,8 @@ once. Docker's default stop timeout is 10s; pass `-t 30` to `docker stop` (or
 Keep `tlsDir` on a mounted volume (inside the config directory, or mounted
 itself): in the container's own filesystem, the CA node's CA would be
 replaced with the container, and no other node would trust the new one.
-`deploy.sh` mounts the config's `tlsDir` when it lies outside the config
+`deploy.sh` and `docker-create.sh [config dir]` mount the config's `tlsDir`
+when it lies outside the config
 directory. It also takes only cluster names of letters, digits, `-` and `_`
 (they become remote paths), and uploads the repository it is in, wherever
 it's run from.
@@ -285,8 +288,12 @@ it's run from.
 
 ### Gossip Protocol
 
-Every 10 seconds each node connects to all known peers (all at once, each
-with a 10s timeout) and exchanges a `Sync` message. Only what changed travels:
+Every 10 seconds each node syncs with all known peers (all at once, each
+with a 10s timeout), exchanging a `Sync` message. A peer keeps the connection
+open for the next round when asked (older ones close it), so a cluster in a
+steady state opens no new connections for gossip: in a 10-node test cluster,
+540 new mTLS connections a minute before, none after. A kept connection that
+has died is replaced at once. Only what changed travels:
 
 - The initiator sends its own record and a digest: the version of every node
   record it holds, and its config's version and hash.
@@ -376,8 +383,9 @@ Limits, so one peer can't exhaust a node:
   could never reach the rest of the cluster.
 - One peer may hold at most 64 connections waiting for their first message
   (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, and 1024
-  idle reverse connections. Accepted connections use TCP keepalive, so ones whose peer
-  vanished are closed.
+  idle reverse connections, and 2 sync connections kept open between rounds.
+  Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
+  so one whose peer vanished is closed within about a minute.
 - At most 512 TLS handshakes may be in progress at once, 128 from one IP
   address; further connections are closed at once. Until it completes its
   handshake a connection could be anyone's, so this keeps a host with no
@@ -469,6 +477,8 @@ to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
   local OpenTelemetry Collector (plain `http://` only). Sampling is
   parent-based: an incoming `traceparent` keeps its decision, and new traces
   are sampled at `sampleRatio`. The backend's own spans nest under stouter's.
+  Each export, the collector's whole answer included, has 10 seconds: a
+  collector that stalls partway through doesn't hold up later exports.
 - **Access log** per request (target `stouter::access`, with trace id), and
   `stouter_http_requests_total{service,method,code}` /
   `stouter_http_request_duration_seconds{service}` metrics.
@@ -518,7 +528,9 @@ node's first report replaces anything peers held from before.
 
 Health shows up in `stouter status` (an `UNHEALTHY` marker per service) and in
 the `stouter_service_healthy{service,node_id}` gauge (1 or 0), which every
-subscriber exports for the whole cluster. Outlier ejection still applies to
+subscriber exports for the whole cluster. Gauges about a node (this one, and
+`stouter_reverse_pool_size`, `stouter_tunnel_pool_size`) stop being reported
+30 seconds after it leaves or is forgotten. Outlier ejection still applies to
 failures health checks can't see, such as a node being unreachable.
 
 ### NAT Traversal via Reverse Connections
@@ -535,7 +547,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay ranking highest for it (rendezvous hashing again, on the subscriber's and relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, instead of all going through one. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay ranking highest for it (rendezvous hashing again, on the subscriber's and relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, instead of all going through one. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel, all within 12 seconds, so the subscriber (which waits 15) hears why. An `outboundOnly` subscriber in `subscribe` mode hosts nothing, so it keeps no reverse connections. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
 
 ### Multiplexing (Yamux)
 
@@ -660,7 +672,8 @@ curl http://stock.example.com/items/42  # → the service whose domains include 
 - The target is the URL's host (sent in full when a client uses a proxy) or,
   failing that, the `Host` header. A service name matches first, then any
   service's `domains`, case-insensitively. Clients that ignore proxy settings
-  can call `http://127.0.0.1:15001/...` with `Host: inventory`.
+  can call `http://127.0.0.1:15001/...` with `Host: inventory`. The service
+  gets the URL's host as its `Host`, whatever the client's `Host` said.
 - Set both `http_proxy` and `HTTP_PROXY`: curl reads only the lowercase one,
   and many other clients read the uppercase one.
 - These variables affect **every** HTTP call the process makes. List hosts

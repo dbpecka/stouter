@@ -23,6 +23,12 @@ const RELAY_ATTEMPTS: usize = 3;
 /// Time allowed for a NAT'd node to answer a forwarded tunnel request.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a relayed tunnel may take to set up here, all attempts
+/// included: under the subscriber's setup timeout (15s, see
+/// `subscribe::proxy`), so the subscriber hears why it failed rather than
+/// timing out first.
+const RELAY_DEADLINE: Duration = Duration::from_secs(12);
+
 /// Maximum timestamp skew allowed for reverse registration authentication.
 const MAX_SKEW_MS: u64 = 30_000;
 
@@ -167,10 +173,19 @@ where
     // client data has been sent yet, so retrying is safe.
     let mut last_err: Option<anyhow::Error> = None;
     let mut ready = None;
+    // All attempts within one deadline, short of the subscriber's own (15s):
+    // otherwise its tunnel setup gives up first and never hears why.
+    let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
     for _ in 0..RELAY_ATTEMPTS {
-        let Some(mut stream) = state.reverse_pool.take(node_id, POOL_WAIT_TIMEOUT).await else {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            last_err = Some(anyhow::anyhow!("no answer in {}s", RELAY_DEADLINE.as_secs()));
+            break;
+        }
+        let Some(mut stream) = state.reverse_pool.take(node_id, POOL_WAIT_TIMEOUT.min(left)).await else {
             break;
         };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(Duration::from_millis(100));
         let attempt = async {
             gossip::send_message(&mut stream, &msg)
                 .await
@@ -182,7 +197,7 @@ where
                 .context("read tunnel status from reverse connection")?;
             anyhow::Ok(status)
         };
-        match tokio::time::timeout(STATUS_TIMEOUT, attempt).await {
+        match tokio::time::timeout(STATUS_TIMEOUT.min(left), attempt).await {
             Ok(Ok(status)) => {
                 ready = Some((stream, status));
                 break;
@@ -264,6 +279,33 @@ mod tests {
         // it was actually reached, not the unroutable wildcard.
         assert!(gossip::is_wildcard(relay.config.peer_addr()));
         assert_eq!(relay.known_nodes.load()["mallory"].relay.as_deref(), Some(reached_at.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_tunnel_fails_in_time_for_the_subscriber_to_hear_why() {
+        let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let x = tls_state(&dir, "x");
+        // x's reverse connections are there, but x never answers on them.
+        let mut held = Vec::new();
+        for _ in 0..RELAY_ATTEMPTS {
+            let (client, server_end) = mesh_pair(&x, &relay).await;
+            relay.reverse_pool.push("x".into(), server_end);
+            held.push(client);
+        }
+        tokio::time::pause();
+        let (subscriber, mut ours) = tokio::io::duplex(4096);
+        let started = tokio::time::Instant::now();
+        let err = relay_tunnel(subscriber, "x", "svc", now_ms(), &relay).await.unwrap_err();
+        // 3 tries of 5s each would be 15s, as long as the subscriber waits.
+        assert!(started.elapsed() <= RELAY_DEADLINE + Duration::from_secs(1), "{:?} ({err})", started.elapsed());
+        let mut status = [0u8; 1];
+        ours.read_exact(&mut status).await.unwrap();
+        assert_eq!(status[0], 0x01);
+        let why = crate::node::tunnel::read_tunnel_error(&mut ours).await.unwrap();
+        assert!(why.contains("node x"), "{why}");
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

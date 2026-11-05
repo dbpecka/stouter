@@ -955,8 +955,7 @@ async fn main() -> Result<()> {
                 };
                 if let Some(current) = known.as_ref().filter(|current| current.same_settings(&desired)) {
                     println!("{target} already has the config in {} (version {})", cli.config, current.version);
-                    let aside = format!("{}.unapplied", cli.config);
-                    if std::path::Path::new(&aside).exists() {
+                    if let Some(aside) = config::kept_copies(&cli.config, "unapplied").first() {
                         println!(
                             "note: {aside} holds an edit a daemon set aside instead of writing over it; if that's \
                              the edit you meant, make it again in {} and push",
@@ -1027,8 +1026,9 @@ async fn main() -> Result<()> {
             };
             let version = current.version;
             if !cfg.dynamic_config.same_settings(&current) {
-                // It may hold edits not pushed yet: keep them.
-                let backup = format!("{}.bak", cli.config);
+                // It may hold edits not pushed yet: keep them (never over
+                // an earlier backup).
+                let backup = config::unused_path(&format!("{}.bak", cli.config));
                 std::fs::copy(&cli.config, &backup).with_context(|| format!("copy {} to {backup}", cli.config))?;
                 println!("Saved the previous config (version {}) to {backup}", cfg.dynamic_config.version);
             }

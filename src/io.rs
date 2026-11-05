@@ -52,13 +52,26 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// TCP keepalive idle time for long-lived connections.
 const KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 
+/// Between keepalive probes once a connection has gone quiet, and how many
+/// unanswered ones mean the peer is gone: a vanished peer is noticed about a
+/// minute after it went quiet (with the system defaults, 75s × 9, it took
+/// over 12 minutes, holding its connections and in-flight work that long).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const KEEPALIVE_RETRIES: u32 = 3;
+
 /// Configure a TCP stream for long-lived tunnel use: enable `TCP_NODELAY`
-/// and `SO_KEEPALIVE` (30 s idle time) so intermediary NATs/firewalls don't
-/// silently drop idle connections.
+/// and `SO_KEEPALIVE` (probes after 30s idle, every 10s, 3 tries) so
+/// intermediary NATs/firewalls don't silently drop idle connections, and a
+/// peer that vanished is noticed within about a minute.
 pub fn configure_stream(stream: &TcpStream) {
     stream.set_nodelay(true).ok();
     let sock = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE_TIME);
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd", windows))]
+    let keepalive = keepalive.with_interval(KEEPALIVE_INTERVAL);
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
     let _ = sock.set_tcp_keepalive(&keepalive);
 }
 
@@ -158,6 +171,19 @@ impl Activity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_vanished_peer_is_noticed_within_about_a_minute() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        configure_stream(&stream);
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.keepalive_time().unwrap(), KEEPALIVE_TIME);
+        assert_eq!(sock.keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(sock.keepalive_retries().unwrap(), KEEPALIVE_RETRIES);
+    }
     use tokio::io::{duplex, DuplexStream};
     use tokio::time::Instant;
 

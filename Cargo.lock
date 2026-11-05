@@ -1480,6 +1480,7 @@ dependencies = [
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "rand",
  "rcgen",
  "rmp-serde",

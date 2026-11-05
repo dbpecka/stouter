@@ -6,18 +6,13 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Operating mode of this daemon instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
+    #[default]
     Node,
     Subscribe,
     NodeSubscribe,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Node
-    }
 }
 
 /// A single service exposed by a node.
@@ -1112,6 +1107,36 @@ impl Config {
     }
 }
 
+/// `base` if there is no such file, else `base.2`, `base.3`, and so on:
+/// where to keep a copy without writing over an earlier one (a second
+/// `config pull` used to replace the `.bak` of the first).
+pub(crate) fn unused_path(base: &str) -> String {
+    if !std::path::Path::new(base).exists() {
+        return base.to_string();
+    }
+    (2u32..).map(|n| format!("{base}.{n}")).find(|path| !std::path::Path::new(path).exists()).expect("some number is free")
+}
+
+/// Copies of `path` kept beside it with names starting `path.suffix` (see
+/// [`unused_path`]), newest first.
+pub(crate) fn kept_copies(path: &str, suffix: &str) -> Vec<String> {
+    let path = std::path::Path::new(path);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let prefix = format!("{}.{suffix}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+    let mut copies: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| {
+            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            (modified, entry.path().to_string_lossy().into_owned())
+        })
+        .collect();
+    copies.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    copies.into_iter().map(|(_, path)| path).collect()
+}
+
 /// Replace the contents of `path` with `data` atomically: write a temporary
 /// file beside it, flush it to disk, then rename it over `path`. Readers and
 /// a restarted daemon see the old contents or the new, never a partial file.
@@ -1610,6 +1635,22 @@ mod tests {
         for good in ["n1", "host-2.example.com", "node_3"] {
             Config { node_id: good.into(), ..named() }.validate_local().unwrap();
         }
+    }
+
+    #[test]
+    fn a_kept_copy_never_replaces_an_earlier_one() {
+        let dir = std::env::temp_dir().join(format!("stouter_copies_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json").to_str().unwrap().to_string();
+        let base = format!("{path}.bak");
+        assert_eq!(unused_path(&base), base);
+        std::fs::write(&base, "first").unwrap();
+        assert_eq!(unused_path(&base), format!("{base}.2"));
+        std::fs::write(format!("{base}.2"), "second").unwrap();
+        assert_eq!(unused_path(&base), format!("{base}.3"));
+        assert_eq!(kept_copies(&path, "bak").len(), 2);
+        assert!(kept_copies(&path, "unapplied").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

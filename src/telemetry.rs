@@ -192,7 +192,10 @@ async fn export(
     let count = spans.len() as u64;
     let body = encode_request(resource, &spans).to_string();
 
-    let result = async {
+    // One deadline for the whole exchange, the collector's answer included:
+    // a collector that stalls partway through its reply would otherwise
+    // hold up every export after this one until the daemon restarts.
+    let exchange = async {
         let uri: Uri = endpoint.parse().map_err(|e| format!("bad endpoint: {e}"))?;
         let req = Request::builder()
             .method(Method::POST)
@@ -200,18 +203,15 @@ async fn export(
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| e.to_string())?;
-        let resp = tokio::time::timeout(EXPORT_TIMEOUT, client.request(req))
-            .await
-            .map_err(|_| "timed out".to_string())?
-            .map_err(|e| e.to_string())?;
+        let resp = client.request(req).await.map_err(|e| e.to_string())?;
         let status = resp.status();
-        let body = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+        let body = resp.into_body().collect().await.map(|b| b.to_bytes()).map_err(|e| format!("reading the answer: {e}"))?;
         if !status.is_success() {
             return Err(format!("collector answered {status}: {}", String::from_utf8_lossy(&body)));
         }
         Ok(rejected_spans(&body))
-    }
-    .await;
+    };
+    let result = tokio::time::timeout(EXPORT_TIMEOUT, exchange).await.unwrap_or_else(|_| Err("timed out".to_string()));
 
     match result {
         Ok(rejected) => {
@@ -426,6 +426,28 @@ mod tests {
             (head, body)
         });
         (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_collector_that_stalls_mid_answer_is_given_up_on() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut chunk = [0u8; 65536];
+            let _ = s.read(&mut chunk).await;
+            // Headers promising 100 bytes, 2 of them, then nothing.
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{}").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(s);
+        });
+        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let mut batch = vec![span(None)];
+        let mut failing = false;
+        let started = tokio::time::Instant::now();
+        export(&client, &format!("{endpoint}/v1/traces"), &Vec::new(), &mut batch, &mut failing).await;
+        assert!(failing, "the export counts as failed");
+        assert!(started.elapsed() <= EXPORT_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[tokio::test]
