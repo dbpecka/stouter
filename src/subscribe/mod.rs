@@ -120,6 +120,9 @@ async fn manage_proxies(
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     // Known node ids as of the previous pass, to notice nodes leaving.
     let mut prev_nodes: HashSet<String> = HashSet::new();
+    // The relay each NAT'd node's tunnels went through as of the previous
+    // pass (NAT'd node id -> relay id), to notice relays leaving.
+    let mut prev_relays: HashMap<String, String> = HashMap::new();
     // Service keys skipped because their name is taken by another group,
     // so each conflict is reported once.
     let mut name_conflicts: HashSet<String> = HashSet::new();
@@ -136,21 +139,34 @@ async fn manage_proxies(
 
         // A node that left may still be draining, and our idle HTTP
         // keep-alive connections to it look like open tunnels to it: close
-        // them, so its drain doesn't wait out the pool's idle timeout.
+        // them, so its drain doesn't wait out the pool's idle timeout. The
+        // same for a relay that left: idle connections to NAT'd nodes that
+        // go through it are open tunnels through it (and the pools are
+        // keyed by service, so they would never be closed otherwise).
         {
             let gone: HashSet<&str> =
                 prev_nodes.iter().map(String::as_str).filter(|id| !nodes.contains_key(*id)).collect();
             if !gone.is_empty() {
+                let behind_gone_relay: HashSet<&str> = prev_relays
+                    .iter()
+                    .filter(|(_, relay)| gone.contains(relay.as_str()))
+                    .map(|(natd, _)| natd.as_str())
+                    .collect();
                 let index = state.service_index.load();
                 let hosted: HashSet<&str> = index
                     .keys()
-                    .filter(|(node, _)| gone.contains(node.as_str()))
+                    .filter(|(node, _)| gone.contains(node.as_str()) || behind_gone_relay.contains(node.as_str()))
                     .map(|(_, svc)| svc.as_str())
                     .collect();
                 http_proxies.reset_pools(|name| hosted.contains(name));
             }
         }
         prev_nodes = nodes.keys().cloned().collect();
+        prev_relays = nodes
+            .values()
+            .filter(|node| node.addr.is_empty())
+            .filter_map(|node| Some((node.id.clone(), proxy::tunnel_route(node, &state)?.1?)))
+            .collect();
 
         // Build the desired set: "group/service" keys where at least one
         // node is reachable, with what proxy setup and the REST API need.

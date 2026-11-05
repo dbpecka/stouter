@@ -220,8 +220,11 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
         .iter()
         .filter(|((_, svc), _)| svc == service_name)
         .filter_map(|((node_id, _), svc)| {
-            kn.get(node_id).map(|node| Backend {
-                node: node.clone(),
+            // A node never lists itself among its peers, but an instance on
+            // this node (`nodeSubscribe`) is a backend too, reached directly.
+            let node = kn.get(node_id).cloned().or_else(|| own_node(state).filter(|own| own.id == *node_id))?;
+            Some(Backend {
+                node,
                 weight: svc.weight,
                 max_connections: svc.max_connections,
                 request_timeout: svc.request_timeout_ms.map(Duration::from_millis),
@@ -232,6 +235,18 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
 
     backends.sort_by(|a, b| a.node.id.cmp(&b.node.id));
     backends
+}
+
+/// This node, as a backend for services it hosts itself: only a
+/// `nodeSubscribe` node both hosts services and proxies them. It is live
+/// (it's us); its services' health comes from its own checker.
+pub(super) fn own_node(state: &SharedState) -> Option<NodeInfo> {
+    matches!(state.config.mode, crate::config::Mode::NodeSubscribe).then(|| NodeInfo {
+        id: state.config.node_id.clone(),
+        last_seen: Some(Instant::now()),
+        heard_at: Some(Instant::now()),
+        ..Default::default()
+    })
 }
 
 /// Drop nodes whose gossip liveness marker is stale, then nodes whose health
@@ -296,6 +311,8 @@ pub(super) enum Tunnel {
     Mux(Compat<yamux::Stream>, #[allow(dead_code)] crate::mux::MuxHandle),
     /// A dedicated mTLS connection (boxed: a TLS stream is large).
     Mesh(Box<MeshStream>),
+    /// A service on this node itself (`nodeSubscribe`), reached directly.
+    Local(TcpStream),
 }
 
 impl AsyncRead for Tunnel {
@@ -307,6 +324,7 @@ impl AsyncRead for Tunnel {
         match self.get_mut() {
             Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_read(cx, buf),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -320,6 +338,7 @@ impl AsyncWrite for Tunnel {
         match self.get_mut() {
             Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_write(cx, buf),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -330,6 +349,7 @@ impl AsyncWrite for Tunnel {
         match self.get_mut() {
             Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_flush(cx),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -340,6 +360,7 @@ impl AsyncWrite for Tunnel {
         match self.get_mut() {
             Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_shutdown(cx),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -399,6 +420,15 @@ async fn establish_tunnel_untimed(
     service_name: String,
     state: &Arc<SharedState>,
 ) -> Result<Tunnel> {
+    // Our own instance (a `nodeSubscribe` node): no tunnel needed.
+    if node.id == state.config.node_id {
+        let connect_start = Instant::now();
+        let stream = crate::node::tunnel::connect_local_service(&service_name, state).await.map_err(anyhow::Error::msg)?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "local")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Local(stream));
+    }
+
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time before Unix epoch")?
@@ -580,6 +610,38 @@ mod tests {
         // An older, unsigned NAT'd node: its gossiped relay, as before.
         let old = NodeInfo { id: "o".into(), relay: Some("m:1".into()), ..Default::default() };
         assert_eq!(tunnel_route(&old, &state), Some(("m:1".into(), Some("m".into()))));
+    }
+
+    #[tokio::test]
+    async fn a_node_subscribe_node_reaches_its_own_instances_directly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut conn, _) = backend.accept().await.unwrap();
+            conn.write_all(b"from me").await.unwrap();
+        });
+        let dc: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "serviceGroups": [{"name": "g", "services": [{"name": "web", "nodeId": "me", "nodePort": port}]}],
+        }))
+        .unwrap();
+        let cfg = Config { node_id: "me".into(), mode: crate::config::Mode::NodeSubscribe, dynamic_config: dc, ..Config::default() };
+        let state = SharedState::new(cfg.clone(), String::new(), CancellationToken::new(), None);
+
+        // Our own instance is a backend (live), though we're not a peer of ours.
+        let backends = service_backends("web", &state);
+        assert_eq!(ids(&prefer_healthy(backends.clone(), "web", &state)), ["me"]);
+        // And reached straight at its port, no tunnel.
+        let mut tunnel = establish_tunnel(&backends[0].node, "web".into(), &state).await.unwrap();
+        assert!(matches!(tunnel, Tunnel::Local(_)));
+        let mut got = String::new();
+        tunnel.read_to_string(&mut got).await.unwrap();
+        assert_eq!(got, "from me");
+
+        // A plain subscriber hosts nothing itself: no such backend.
+        let plain = SharedState::new(Config { mode: crate::config::Mode::Subscribe, ..cfg }, String::new(), CancellationToken::new(), None);
+        assert!(service_backends("web", &plain).is_empty());
     }
 
     #[tokio::test]

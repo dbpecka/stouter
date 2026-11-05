@@ -161,7 +161,8 @@ enum ServiceAction {
         /// (random when unset).
         #[arg(long)]
         local_port: Option<u16>,
-        /// Node ID to register the service on (defaults to this node)
+        /// Node ID to register the service on (defaults to this node; with
+        /// `--remote`, the node at that address)
         #[arg(long)]
         node: Option<String>,
         /// Address `host:port` of a remote daemon to mutate via admin RPC.
@@ -184,7 +185,8 @@ enum ServiceAction {
         group: String,
         #[arg(long)]
         name: String,
-        /// Owner node ID in the source cluster (defaults to this node)
+        /// Owner node ID in the source cluster (defaults to the node at
+        /// `--from`)
         #[arg(long)]
         node: Option<String>,
         /// Destination group name (defaults to `--group`)
@@ -219,7 +221,8 @@ enum ServiceAction {
         from: String,
         #[arg(long = "to")]
         to: String,
-        /// Node ID the service is registered on (defaults to this node)
+        /// Node ID the service is registered on (defaults to this node; with
+        /// `--remote`, the node at that address)
         #[arg(long)]
         node: Option<String>,
         /// Address `host:port` of a remote daemon to mutate via admin RPC.
@@ -232,7 +235,8 @@ enum ServiceAction {
         group: String,
         #[arg(long)]
         name: String,
-        /// Node ID the service is registered on (defaults to this node)
+        /// Node ID the service is registered on (defaults to this node; with
+        /// `--remote`, the node at that address)
         #[arg(long)]
         node: Option<String>,
         /// Address `host:port` of a remote daemon to mutate via admin RPC.
@@ -459,9 +463,9 @@ async fn main() -> Result<()> {
             }
             let labels: std::collections::BTreeMap<String, String> = labels.into_iter().collect();
             let meta: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
-            if let Some(target) = remote {
+            if let Some(target) = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await? {
                 let cfg = Config::load_or_default(&cli.config)?;
-                let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let owner_node_id = owner_node(node, Some(&target), &cfg, cli.cert_dir.as_deref()).await?;
                 let version = run_admin_rpc(
                     &target,
                     AdminOp::service_add(
@@ -491,7 +495,7 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let mut cfg = Config::load_or_default(&cli.config)?;
-                let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let node_id = owner_node(node, None, &cfg, cli.cert_dir.as_deref()).await?;
                 let service = Service {
                     name: name.clone(),
                     node_id,
@@ -580,9 +584,9 @@ async fn main() -> Result<()> {
                     remote,
                 },
         }) => {
-            if let Some(target) = remote {
+            if let Some(target) = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await? {
                 let cfg = Config::load_or_default(&cli.config)?;
-                let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let owner_node_id = owner_node(node, Some(&target), &cfg, cli.cert_dir.as_deref()).await?;
                 let version = run_admin_rpc(
                     &target,
                     AdminOp::ServiceRename {
@@ -601,7 +605,7 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let mut cfg = Config::load(&cli.config)?;
-                let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let node_id = owner_node(node, None, &cfg, cli.cert_dir.as_deref()).await?;
 
                 let before = cfg.dynamic_config.clone();
                 let version = cfg
@@ -637,9 +641,9 @@ async fn main() -> Result<()> {
                     remote,
                 },
         }) => {
-            if let Some(target) = remote {
+            if let Some(target) = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await? {
                 let cfg = Config::load_or_default(&cli.config)?;
-                let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let owner_node_id = owner_node(node, Some(&target), &cfg, cli.cert_dir.as_deref()).await?;
                 let version = run_admin_rpc(
                     &target,
                     AdminOp::ServiceRemove {
@@ -657,7 +661,7 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let mut cfg = Config::load(&cli.config)?;
-                let node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+                let node_id = owner_node(node, None, &cfg, cli.cert_dir.as_deref()).await?;
 
                 let before = cfg.dynamic_config.clone();
                 let version = cfg
@@ -696,6 +700,7 @@ async fn main() -> Result<()> {
                 RouteAction::List { .. } => unreachable!("matched above"),
             };
             let count = routes.len();
+            let remote = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
             let version = if let Some(target) = &remote {
                 let cfg = Config::load_or_default(&cli.config)?;
                 run_admin_rpc(
@@ -770,14 +775,14 @@ async fn main() -> Result<()> {
                 },
         }) => {
             let cfg = Config::load_or_default(&cli.config)?;
-            let owner_node_id = node.unwrap_or_else(|| cfg.node_id.clone());
+            let from_certs = from_cert_dir.as_deref().or(cli.cert_dir.as_deref());
+            let owner_node_id = owner_node(node, Some(&from), &cfg, from_certs).await?;
             let dest_group = to_group.unwrap_or_else(|| group_name.clone());
             let dest_node = to_node.unwrap_or_else(|| owner_node_id.clone());
 
             // Each cluster has its own CA, so each side needs its own cert
             // dir. Fall back through: per-side flag → global --cert-dir →
             // local tlsDir.
-            let from_certs = from_cert_dir.as_deref().or(cli.cert_dir.as_deref());
             let to_certs = to_cert_dir.as_deref().or(cli.cert_dir.as_deref());
 
             // 1. Read the service from the source cluster.
@@ -802,7 +807,23 @@ async fn main() -> Result<()> {
                     )
                 })?;
 
-            // 2. Add to the destination cluster.
+            // 2. Add to the destination cluster, which mustn't have it yet:
+            //    the add would replace that instance, and a rollback (below)
+            //    would then delete it.
+            let dest_dc = fetch_trusted_config(&to, &cfg, to_certs).await?;
+            if let Some(existing) = dest_dc
+                .service_groups
+                .iter()
+                .filter(|g| g.name == dest_group)
+                .flat_map(|g| &g.services)
+                .find(|s| s.name == name && s.node_id == dest_node)
+            {
+                anyhow::bail!(
+                    "{to} already has '{dest_group}/{name}' on node '{dest_node}' (port {}); remove it there first, or \
+                     move to another --to-node or --to-group",
+                    existing.node_port
+                );
+            }
             let add_version = match try_admin_rpc(
                 &to,
                 AdminOp::service_add(dest_group.clone(), Service { node_id: dest_node.clone(), ..src_svc }),
@@ -830,12 +851,39 @@ async fn main() -> Result<()> {
             )
             .await;
 
+            // No answer (a timeout, a dropped connection) leaves it open
+            // whether the remove happened: look before rolling back, or the
+            // service could end up in neither cluster.
+            let remove_result = match remove_result {
+                Err(e) => {
+                    let still_there = fetch_trusted_config(&from, &cfg, from_certs).await.map(|dc| {
+                        dc.service_groups
+                            .iter()
+                            .filter(|g| g.name == group_name)
+                            .flat_map(|g| &g.services)
+                            .any(|s| s.name == name && s.node_id == owner_node_id)
+                    });
+                    match still_there {
+                        Ok(false) => Ok(Ok(None)),
+                        Ok(true) => Err(e),
+                        Err(check) => anyhow::bail!(
+                            "move failed: no answer to the remove on {from} ({e:#}), and can't check whether it \
+                             happened ({check:#}). The service is now on {to}; check {from} and remove it from one \
+                             of the two"
+                        ),
+                    }
+                }
+                answered => answered.map(|result| result.map(Some)),
+            };
+
             match remove_result {
                 Ok(Ok(remove_version)) => {
-                    println!(
-                        "Moved '{}/{}' from {} (v{}) to {} (v{})",
-                        group_name, name, from, remove_version, to, add_version
-                    );
+                    // No version when the answer was lost but the remove happened.
+                    let source = match remove_version {
+                        Some(version) => format!("{from} (v{version})"),
+                        None => from.clone(),
+                    };
+                    println!("Moved '{group_name}/{name}' from {source} to {to} (v{add_version})");
                 }
                 outcome => {
                     eprintln!(
@@ -904,6 +952,14 @@ async fn main() -> Result<()> {
                 };
                 if let Some(current) = known.as_ref().filter(|current| current.same_settings(&desired)) {
                     println!("{target} already has the config in {} (version {})", cli.config, current.version);
+                    let aside = format!("{}.unapplied", cli.config);
+                    if std::path::Path::new(&aside).exists() {
+                        println!(
+                            "note: {aside} holds an edit a daemon set aside instead of writing over it; if that's \
+                             the edit you meant, make it again in {} and push",
+                            cli.config
+                        );
+                    }
                     return Ok(());
                 }
                 if let Some(refusal) = stale_push(&reported, &desired, &cli.config, force) {
@@ -1303,6 +1359,52 @@ async fn fetch_trusted_config(target: &str, cfg: &Config, cert_dir: Option<&str>
     trusted_config(&daemon.dynamic_config, cfg, &material, &tls_ctx).with_context(|| format!("the config on {target}"))
 }
 
+/// Where a config change goes: `--remote` if given; else the daemon running
+/// on this host for this config, if one answers (so the change is made
+/// where the config is in force, not in its file behind its back, where a
+/// change the daemon makes at the same time could undo it); else `None`:
+/// edit the file.
+async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Option<&str>) -> Result<Option<String>> {
+    if remote.is_some() {
+        return Ok(remote);
+    }
+    let cfg = Config::load_or_default(config_path)?;
+    // A daemon with no listener (outboundOnly) can't be asked.
+    if cfg.outbound_only || cfg.node_id.is_empty() {
+        return Ok(None);
+    }
+    let target = cfg.local_target();
+    let Ok(tls_ctx) = build_cli_tls(&cfg, cert_dir) else { return Ok(None) };
+    let asked = tokio::time::timeout(Duration::from_secs(2), daemon_request(&target, &tls_ctx, &Message::StatusRequest));
+    match asked.await {
+        Ok(Ok(Message::StatusResponse { node_id, .. })) if node_id == cfg.node_id => Ok(Some(target)),
+        _ => Ok(None),
+    }
+}
+
+/// The node a service command is about: `--node` if given, else the node at
+/// `remote` (it says, in its status) with `--remote`, else this host's
+/// node. Never empty: a service on node "" is one no node hosts.
+async fn owner_node(node: Option<String>, remote: Option<&str>, cfg: &Config, cert_dir: Option<&str>) -> Result<String> {
+    if let Some(node) = node {
+        return Ok(node);
+    }
+    let owner = match remote {
+        Some(target) => {
+            let tls_ctx = build_cli_tls(cfg, cert_dir)?;
+            match daemon_request(target, &tls_ctx, &Message::StatusRequest).await? {
+                Message::StatusResponse { node_id, .. } => node_id,
+                _ => anyhow::bail!("unexpected response from {target}"),
+            }
+        }
+        None => cfg.node_id.clone(),
+    };
+    if owner.is_empty() {
+        anyhow::bail!("no node to put the service on: pass --node, or set nodeId in the local config");
+    }
+    Ok(owner)
+}
+
 /// Fetch the `DynamicConfig` from a remote daemon via `StatusRequest`.
 async fn fetch_remote_dynamic_config(
     target: &str,
@@ -1407,6 +1509,12 @@ fn save_local_change(
 ) -> Result<()> {
     if let Some(problem) = config::new_problem(before, &cfg.dynamic_config) {
         anyhow::bail!("{problem}");
+    }
+    // The file must still hold the config the change was made on: saving
+    // over a newer one (a daemon's, a hand edit's) would undo it.
+    let now = Config::load_or_default(path)?.dynamic_config;
+    if now != *before {
+        anyhow::bail!("{path} changed while this command ran (it now holds version {}); run it again", now.version);
     }
     if cfg.require_signed_config {
         let material = load_cli_material(cfg, cert_dir)?;

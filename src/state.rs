@@ -90,6 +90,9 @@ struct Tombstone {
     /// The node's signed "left" record, when it said so itself: relayed
     /// (see `departed_records`) so the departure reaches every node.
     record: Option<(u64, crate::config::SignedNode)>,
+    /// A node forgotten for silence, as it was then: one with no address is
+    /// let back in by a newer beat it signed (see `revive_with_beat`).
+    forgotten: Option<NodeInfo>,
 }
 
 /// Whether an idle connection has been closed by its peer or is otherwise
@@ -350,6 +353,11 @@ impl InFlightTracker {
 pub struct SharedState {
     pub config: Arc<Config>,
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
+    /// The dynamic config (as JSON) that the config file holds as far as
+    /// this daemon knows: what it last wrote there or took from there. The
+    /// file saying something else means an edit nobody applied, which a
+    /// write must not silently overwrite (see `gossip::persist_state_with`).
+    pub(crate) file_config: Mutex<Option<String>>,
     pub known_nodes: ArcSwap<HashMap<String, NodeInfo>>,
     known_nodes_write: tokio::sync::Mutex<()>,
     pub service_index: ArcSwap<HashMap<(String, String), Service>>,
@@ -395,8 +403,9 @@ pub struct SharedState {
     /// Open connections per (kind, peer CN), for the per-peer limits.
     peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
     /// Peer addresses known to speak delta sync (their replies say so), so
-    /// syncs to them can be compact.
-    pub(crate) delta_peers: Mutex<std::collections::HashSet<String>>,
+    /// syncs to them can be compact, with the (version, hash) of the config
+    /// each had as of its last reply: one that's behind gets ours.
+    pub(crate) delta_peers: Mutex<HashMap<String, (u64, u64)>>,
     /// This node's last beat and when it was made (NAT'd nodes only).
     pub(crate) own_beat: Mutex<Option<(crate::config::SignedBeat, std::time::Instant)>>,
     /// Set at shutdown: this node's record now says it left.
@@ -443,6 +452,7 @@ impl SharedState {
 
         Arc::new(Self {
             config: Arc::new(config),
+            file_config: Mutex::new(serde_json::to_string(&dynamic_config).ok()),
             dynamic_config: Arc::new(RwLock::new(dynamic_config)),
             known_nodes: ArcSwap::from_pointee(HashMap::new()),
             known_nodes_write: tokio::sync::Mutex::new(()),
@@ -467,7 +477,7 @@ impl SharedState {
             forgotten: Mutex::new(HashMap::new()),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
-            delta_peers: Mutex::new(std::collections::HashSet::new()),
+            delta_peers: Mutex::new(HashMap::new()),
             own_beat: Mutex::new(None),
             leaving: std::sync::atomic::AtomicBool::new(false),
         })
@@ -573,6 +583,31 @@ impl SharedState {
         self.bury_with(id, heartbeat, None);
     }
 
+    /// Bury `node`, forgotten for silence, keeping it as it was: a node
+    /// with no address can't be contacted to see it's back, and its record
+    /// may not change for a long time, so only a newer beat can show it.
+    pub fn bury_forgotten(&self, node: &NodeInfo) {
+        self.bury(&node.id, node.heartbeat);
+        if node.signed.is_some() && node.addr.is_empty() {
+            if let Some(tomb) = self.departed.lock().unwrap().get_mut(&node.id) {
+                tomb.forgotten = Some(node.clone());
+            }
+        }
+    }
+
+    /// For a beat about a node buried by [`Self::bury_forgotten`]: the node,
+    /// let back in, if the beat is newer than its last and signed with the
+    /// key of its record. It is alive after all, just out of touch for a
+    /// while (it can't be reached, and we heard nothing of it).
+    pub fn revive_with_beat(&self, beat: &crate::config::SignedBeat) -> Option<NodeInfo> {
+        let mut departed = self.departed.lock().unwrap();
+        let tomb = departed.get(&beat.id).filter(|t| t.at.elapsed() < TOMBSTONE_TTL)?;
+        let node = tomb.forgotten.as_ref().filter(|_| beat.beat > tomb.heartbeat)?;
+        let cert = &node.signed.as_ref()?.cert;
+        crate::signing::verify_beat(beat, cert).ok()?;
+        departed.remove(&beat.id).and_then(|t| t.forgotten)
+    }
+
     /// [`Self::bury`], keeping the node's signed "left" record (at version
     /// `record.0`) to relay.
     pub fn bury_with(&self, id: &str, heartbeat: u64, record: Option<(u64, crate::config::SignedNode)>) {
@@ -580,7 +615,7 @@ impl SharedState {
         departed.retain(|_, t| t.at.elapsed() < TOMBSTONE_TTL);
         let tomb = departed
             .entry(id.to_string())
-            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now(), record: None });
+            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now(), record: None, forgotten: None });
         tomb.heartbeat = tomb.heartbeat.max(heartbeat);
         tomb.at = std::time::Instant::now();
         if let Some(record) = record {

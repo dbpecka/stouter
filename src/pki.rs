@@ -42,6 +42,9 @@ pub struct PkiMaterial {
 ///    pre-issued cert written by `cert issue` on another node.
 /// 3. Nothing present → generate a new CA (written to disk) and a fresh node
 ///    cert (in memory only).
+///
+/// Anything else (some of the files, not a usable set) is an error, never a
+/// new CA.
 pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
     let dir = Path::new(tls_dir);
     std::fs::create_dir_all(dir)
@@ -58,6 +61,21 @@ pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
         Ok(PkiMaterial { ca_cert_der, node_cert_der, node_key })
     } else if ca_cert_path.exists() && node_cert_path.exists() && node_key_path.exists() {
         load_issued(&ca_cert_path, &node_cert_path, &node_key_path)
+    } else if [&ca_cert_path, &ca_key_path, &node_cert_path, &node_key_path].iter().any(|p| p.exists()) {
+        // Some of the files, not a usable set: most likely a copy that
+        // missed one. Making a new CA here would overwrite the cluster's
+        // `ca.crt` and cut this node off from it for good (its own new
+        // `ca.key` then outranks the issued certificate).
+        let have: Vec<&str> = ["ca.crt", "ca.key", "node.crt", "node.key"]
+            .into_iter()
+            .filter(|name| dir.join(name).exists())
+            .collect();
+        bail!(
+            "{tls_dir} has {} but not a complete set: it needs ca.crt with ca.key (the CA's own directory), or \
+             ca.crt with node.crt and node.key (from `stouter cert issue`). Copy the missing file(s), or empty the \
+             directory to start a new cluster with a new CA",
+            have.join(", ")
+        )
     } else {
         let (ca_cert_der, ca_cert_rcgen, ca_key) = generate_ca(&ca_cert_path, &ca_key_path)?;
         let (node_cert_der, node_key) = generate_node_cert(node_id, &ca_cert_rcgen, &ca_key)?;
@@ -322,6 +340,23 @@ mod tests {
 
         // The issued material still loads.
         load_or_create(out.to_str().unwrap(), "n2").unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_tls_dir_missing_a_file_is_refused_not_given_a_new_ca() {
+        let base = std::env::temp_dir().join(format!("stouter_pki_{}_{}", std::process::id(), rand::random::<u64>()));
+        let ca = base.join("ca");
+        load_or_create(ca.to_str().unwrap(), "n1").unwrap();
+        let issued = base.join("issued");
+        issue_cert_to_dir(ca.to_str().unwrap(), "n2", issued.to_str().unwrap()).unwrap();
+        // A copy that missed node.key.
+        std::fs::remove_file(issued.join("node.key")).unwrap();
+        let ca_before = std::fs::read(issued.join("ca.crt")).unwrap();
+        let err = load_or_create(issued.to_str().unwrap(), "n2").err().expect("refused");
+        assert!(err.to_string().contains("not a complete set"), "{err}");
+        assert_eq!(std::fs::read(issued.join("ca.crt")).unwrap(), ca_before, "the cluster's CA is untouched");
+        assert!(!issued.join("ca.key").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

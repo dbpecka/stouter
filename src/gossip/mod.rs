@@ -269,9 +269,12 @@ async fn handle_admin_request(
     use crate::config::{Mode, MutateErr};
     use messages::{AdminErrCode, AdminOp, AdminResult, Message as Msg};
 
-    // Authorization: peer's TLS CN must be in the configured allowlist.
+    // Authorization: peer's TLS CN must be in the configured allowlist, or
+    // be this node's own: the CLI on this host making a change to the config
+    // here (which it could make by editing the file anyway). With
+    // requireSignedConfig, the change must still be admin-signed.
     let allowed = match stream.peer_cn() {
-        Some(cn) => state.config.admin_cns.iter().any(|a| a == cn),
+        Some(cn) => state.config.admin_cns.iter().any(|a| a == cn) || cn == state.config.node_id,
         None => false,
     };
     if !allowed {
@@ -453,6 +456,11 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 "config poll: file version={}, in-memory version={}",
                 file_dc.version, current_version
             );
+            // Taken from the file (below, if adopted): no longer an edit
+            // waiting there.
+            let taken = |state: &SharedState, file_dc: &crate::config::DynamicConfig| {
+                *state.file_config.lock().unwrap() = Some(config_text(file_dc));
+            };
 
             if state.config.require_signed_config {
                 // Only an admin-signed config counts: the CLI's local path
@@ -462,6 +470,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 match crate::signing::admit(&state, file_dc.clone()) {
                     Ok(signed) if signed.supersedes(&dc) => {
                         info!("config file has a newer signed config: version {} -> {}", current_version, signed.version);
+                        taken(&state, &file_dc);
                         *dc = signed.clone();
                         persist_state_with(&state, &dc);
                         drop(dc);
@@ -491,6 +500,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 }
             }
 
+            let file_text = file_dc.clone();
             let mut new_dc = if file_dc.version > current_version {
                 info!(
                     "config file version advanced: {} -> {}",
@@ -527,6 +537,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             // The change entered the cluster here, unsigned.
             new_dc.changed_by = state.config.node_id.clone();
             new_dc.signature = None;
+            taken(&state, &file_text);
             *dc = new_dc.clone();
             persist_state_with(&state, &dc);
             new_dc
@@ -647,7 +658,7 @@ async fn expire_silent_nodes(state: &Arc<SharedState>) {
                 let can_tell = node.heartbeat > 0 || !node.addr.is_empty();
                 if silent && can_tell {
                     info!("forgetting node {id}: no sign of life for {}s", NODE_EXPIRE_AFTER.as_secs());
-                    state.bury(id, node.heartbeat);
+                    state.bury_forgotten(node);
                     state.remember_forgotten(id, &node.addr);
                     false
                 } else {
@@ -667,11 +678,17 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str, want_beats: bool) 
     let reply = recv_message(&mut stream).await?;
     if let Message::Sync { config, nodes, beats, have, config_elided } = reply {
         // A digest in the reply means the peer speaks delta sync: from now
-        // on, send it compact syncs. (An older peer never sends one.)
-        if have.is_some() {
-            state.delta_peers.lock().unwrap().insert(addr.to_string());
-        } else {
-            state.delta_peers.lock().unwrap().remove(addr);
+        // on, send it compact syncs. (An older peer never sends one.) It
+        // also says which config the peer has, so if ours is newer the next
+        // sync carries it: a compact sync leaves the config out, and a node
+        // no peer can dial has no other way to pass a change on.
+        match &have {
+            Some(peer) => {
+                state.delta_peers.lock().unwrap().insert(addr.to_string(), (peer.config_version, peer.config_hash));
+            }
+            None => {
+                state.delta_peers.lock().unwrap().remove(addr);
+            }
         }
         // A successful outbound sync is direct evidence the peer at `addr` is
         // reachable, so pass it as the liveness `contact_addr`.
@@ -719,11 +736,18 @@ fn rewrite_wildcard(addr: &str, host: &str) -> Option<String> {
 pub(crate) async fn broadcast_sync(state: &Arc<SharedState>) {
     // What changed is in our own record, so a compact sync carries it to
     // peers that speak delta sync; older ones get the full one.
-    let (full, compact) = (build_sync_msg(state, false).await, build_compact_sync(state, false).await);
+    let full = build_sync_msg(state, false).await;
+    let (compact, compact_with_config) =
+        (build_compact_sync(state, false, false).await, build_compact_sync(state, false, true).await);
     let peers = peer_addrs(state).await;
     let delta_peers = state.delta_peers.lock().unwrap().clone();
+    let config = state.dynamic_config.read().await.clone();
     futures::future::join_all(peers.iter().map(|addr| {
-        let msg = if delta_peers.contains(addr) { &compact } else { &full };
+        let msg = match delta_peers.get(addr) {
+            Some(peer) if config_newer_than(&config, *peer) => &compact_with_config,
+            Some(_) => &compact,
+            None => &full,
+        };
         async move {
             match time::timeout(Duration::from_secs(5), send_to_peer(addr, msg, state)).await {
                 Ok(Err(e)) => debug!("broadcast to {addr} failed: {e}"),
@@ -776,17 +800,54 @@ async fn print_dynamic_config(state: &Arc<SharedState>) {
 /// `state.dynamic_config` lock (write, for a change), so the file is written
 /// in version order (the config poll loop relies on that).
 fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) {
-    let mut cfg = match crate::config::Config::load(&state.config_path) {
-        Ok(c) => c,
+    let path = &state.config_path;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
         Err(e) => {
-            error!("failed to load config for persist: {e}");
+            error!("failed to read {path} to persist the config: {e}");
             return;
         }
     };
-    cfg.dynamic_config = dc.clone();
-    if let Err(e) = cfg.save(&state.config_path) {
-        error!("failed to persist state to {}: {e}", state.config_path);
+    let mut cfg: crate::config::Config = match serde_json::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to load config for persist: invalid JSON in {path}: {e}");
+            return;
+        }
+    };
+    // An edit to the file this node hasn't applied (made since it last wrote
+    // or read the file, or one it refused): writing over it would lose it
+    // without a word. Keep a copy, and say so.
+    let on_disk = config_text(&cfg.dynamic_config);
+    let new = config_text(dc);
+    let mut known = state.file_config.lock().unwrap();
+    if known.as_ref().is_some_and(|known| *known != on_disk) && on_disk != new {
+        let aside = format!("{path}.unapplied");
+        match crate::config::write_atomic(std::path::Path::new(&aside), text.as_bytes()) {
+            Ok(()) => warn!(
+                "{path} had an edit not applied here (version {}); it is saved in {aside}, and {path} now holds \
+                 version {} from the cluster: make the edit again on top of that{}",
+                cfg.dynamic_config.version,
+                dc.version,
+                if state.config.require_signed_config { " and push it (`stouter config push`)" } else { "" }
+            ),
+            Err(e) => {
+                error!("{path} had an edit not applied here, and it can't be saved to {aside}: {e}; not writing over it");
+                return;
+            }
+        }
     }
+    cfg.dynamic_config = dc.clone();
+    match cfg.save(path) {
+        Ok(()) => *known = Some(new),
+        Err(e) => error!("failed to persist state to {path}: {e}"),
+    }
+}
+
+/// A dynamic config as the JSON the config file would hold, for telling
+/// whether the file still says what this node last wrote there.
+fn config_text(dc: &crate::config::DynamicConfig) -> String {
+    serde_json::to_string(dc).unwrap_or_default()
 }
 
 /// Returns `true` if `id` looks like a valid node identifier (hostname).
@@ -913,9 +974,23 @@ async fn merge_sync(
             }
         }
         for beat in beats {
-            if beat.id != own_id {
-                merge_beat(kn, beat, now);
+            if beat.id == own_id {
+                continue;
             }
+            // A NAT'd node we forgot for silence is back if it beats again.
+            if !kn.contains_key(&beat.id) {
+                if let Some(mut node) = state.revive_with_beat(&beat) {
+                    info!("node {} is back: a new beat from it", beat.id);
+                    node.heartbeat = beat.beat;
+                    node.heard_at = Some(now);
+                    node.last_seen = Some(now);
+                    node.beat = Some(beat);
+                    kn.insert(node.id.clone(), node);
+                    changed = true;
+                    continue;
+                }
+            }
+            merge_beat(kn, beat, now);
         }
         // A sync from the node itself (its certificate says so) means it is
         // alive, even if we can't reach it. Its record no longer changes
@@ -1079,7 +1154,15 @@ fn merge_signed(
                 );
             }
             existing.addr = addr;
-            existing.heartbeat = existing.heartbeat.max(record.heartbeat);
+            // Beats may have raised a signed node's heartbeat past its record
+            // version, so keep the higher. But the first signed record
+            // replaces what unsigned gossip said: anyone could have claimed
+            // a huge heartbeat for it, which would then shut out its beats.
+            existing.heartbeat = if existing.signed.is_some() {
+                existing.heartbeat.max(record.heartbeat)
+            } else {
+                record.heartbeat
+            };
             existing.record_version = record.heartbeat;
             existing.health = record.health;
             existing.relays = record.relays;
@@ -1289,29 +1372,36 @@ async fn build_sync_msg(state: &Arc<SharedState>, want_beats: bool) -> Message {
 }
 
 /// A compact Sync for a peer that speaks delta sync: our own record and
-/// beat, and our digest. The peer's reply fills in whatever we're missing; it
-/// learns what we have that it lacks when it syncs with us in turn. (A peer
-/// with an address hears every NAT'd node's beat from the node itself.)
-async fn build_compact_sync(state: &Arc<SharedState>, want_beats: bool) -> Message {
+/// beat, and our digest, and our config if `with_config` (the peer is
+/// behind). The peer's reply fills in whatever we're missing; it learns
+/// what we have that it lacks when it syncs with us in turn. (A peer with
+/// an address hears every NAT'd node's beat from the node itself.)
+async fn build_compact_sync(state: &Arc<SharedState>, want_beats: bool, with_config: bool) -> Message {
     let config = state.dynamic_config.read().await.clone();
     let have = Some(digest(state, &config, want_beats));
     let nodes = own_entry(state).into_iter().collect();
-    Message::Sync {
-        config: placeholder_config(&config),
-        nodes,
-        beats: own_beat(state).into_iter().collect(),
-        have,
-        config_elided: true,
+    let (config, config_elided) = if with_config { (config, false) } else { (placeholder_config(), true) };
+    Message::Sync { config, nodes, beats: own_beat(state).into_iter().collect(), have, config_elided }
+}
+
+/// The Sync to send `addr`: compact if it speaks delta sync (with our
+/// config if it was behind as of its last reply), else full.
+async fn sync_msg_for(state: &Arc<SharedState>, addr: &str, want_beats: bool) -> Message {
+    let peer = state.delta_peers.lock().unwrap().get(addr).copied();
+    match peer {
+        Some(peer) => {
+            let behind = config_newer_than(&*state.dynamic_config.read().await, peer);
+            build_compact_sync(state, want_beats, behind).await
+        }
+        None => build_sync_msg(state, want_beats).await,
     }
 }
 
-/// The Sync to send `addr`: compact if it speaks delta sync, else full.
-async fn sync_msg_for(state: &Arc<SharedState>, addr: &str, want_beats: bool) -> Message {
-    if state.delta_peers.lock().unwrap().contains(addr) {
-        build_compact_sync(state, want_beats).await
-    } else {
-        build_sync_msg(state, want_beats).await
-    }
+/// Whether `config` is newer than the one a peer reported as (version,
+/// hash): a higher version, or the same one with different content (the
+/// peer then settles it with `supersedes`).
+fn config_newer_than(config: &crate::config::DynamicConfig, (version, hash): (u64, u64)) -> bool {
+    config.version > version || (config.version == version && config_hash(config) != hash)
 }
 
 /// Our reply to a Sync whose sender holds `have`: only the records it
@@ -1338,7 +1428,13 @@ async fn build_sync_reply(state: &Arc<SharedState>, have: &messages::SyncDigest)
     // sender then settles it with `supersedes`).
     let ours_newer = config.version > have.config_version
         || (config.version == have.config_version && config_hash(&config) != have.config_hash);
-    let (config, config_elided) = if ours_newer { (config, false) } else { (placeholder_config(&config), true) };
+    // Which config we have, for the sender to tell whether we're behind.
+    let our_config = messages::SyncDigest {
+        config_version: config.version,
+        config_hash: config_hash(&config),
+        ..Default::default()
+    };
+    let (config, config_elided) = if ours_newer { (config, false) } else { (placeholder_config(), true) };
     // Beats only if asked, and only ones newer than the sender's.
     let beats = if have.want_beats {
         let held: std::collections::HashMap<&str, u64> = have.beats.iter().map(|(id, b)| (id.as_str(), *b)).collect();
@@ -1350,17 +1446,20 @@ async fn build_sync_reply(state: &Arc<SharedState>, have: &messages::SyncDigest)
         config,
         nodes,
         beats,
-        // Our digest isn't needed (the sender learns from what's here), but
-        // its presence tells the sender we speak delta sync.
-        have: Some(messages::SyncDigest::default()),
+        // Its presence tells the sender we speak delta sync; what's in it,
+        // which config we have.
+        have: Some(our_config),
         config_elided,
     }
 }
 
-/// A stand-in for an elided config: right version, nothing else. Only ever
-/// sent to nodes that know to ignore it (`config_elided`).
-fn placeholder_config(config: &crate::config::DynamicConfig) -> crate::config::DynamicConfig {
-    crate::config::DynamicConfig { version: config.version, ..Default::default() }
+/// A stand-in for an elided config: empty, at version 0. Meant only for
+/// nodes that know to ignore it (`config_elided`), but a node too old to
+/// know that may answer at an address remembered as a newer one's (after a
+/// rollback, or a reused address): at version 0 it is never newer than
+/// anything, so it can't empty that node's config.
+fn placeholder_config() -> crate::config::DynamicConfig {
+    crate::config::DynamicConfig::default()
 }
 
 /// What we hold: every signed node record's version (ours and departed
@@ -2148,7 +2247,7 @@ mod tests {
         assert!(!reply_ids(&build_sync_reply(&sub, &have).await).1, "config included");
 
         // A compact sync is our own record, a digest and a placeholder config.
-        let Message::Sync { nodes, have, config_elided, .. } = build_compact_sync(&sub, false).await else { unreachable!() };
+        let Message::Sync { nodes, have, config_elided, .. } = build_compact_sync(&sub, false, false).await else { unreachable!() };
         assert_eq!(nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["sub"]);
         assert!(have.unwrap().records.len() >= 3 && config_elided);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2240,6 +2339,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn an_edit_in_the_config_file_is_never_silently_written_over() {
+        let dir = std::env::temp_dir().join(format!("stouter_persist_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path_str = path.to_str().unwrap().to_string();
+        let config_at = |version: u64, port: u16| -> DynamicConfig {
+            serde_json::from_value(serde_json::json!({
+                "version": version,
+                "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "n1", "nodePort": port}]}],
+            }))
+            .unwrap()
+        };
+        let cfg = Config { node_id: "n1".into(), dynamic_config: config_at(5, 3000), ..Config::default() };
+        cfg.save(&path_str).unwrap();
+        let state = SharedState::new(cfg.clone(), path_str.clone(), CancellationToken::new(), None);
+        let aside = dir.join("stouter.json.unapplied");
+        let file_port = || crate::config::Config::load(&path_str).unwrap().dynamic_config.service_groups[0].services[0].node_port;
+
+        // Nothing changed in the file: a newer config is simply written.
+        persist_state_with(&state, &config_at(6, 3000));
+        assert!(!aside.exists());
+
+        // Someone edits the file (by hand, or a CLI on a stale copy), and a
+        // newer config arrives before it's applied: it's kept, not lost.
+        let mut edited = crate::config::Config::load(&path_str).unwrap();
+        edited.dynamic_config.service_groups[0].services[0].node_port = 4444;
+        edited.save(&path_str).unwrap();
+        persist_state_with(&state, &config_at(7, 3000));
+        assert_eq!(file_port(), 3000, "the file holds the cluster's config");
+        let kept = crate::config::Config::load(aside.to_str().unwrap()).unwrap();
+        assert_eq!(kept.dynamic_config.service_groups[0].services[0].node_port, 4444, "and the edit is kept aside");
+        std::fs::remove_file(&aside).unwrap();
+
+        // A file that already says what's being written (the CLI saved the
+        // config it pushed) is no edit to keep.
+        let mut same = crate::config::Config::load(&path_str).unwrap();
+        same.dynamic_config = config_at(8, 3000);
+        same.save(&path_str).unwrap();
+        persist_state_with(&state, &config_at(8, 3000));
+        assert!(!aside.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unsigned_gossip_cant_shut_out_a_nodes_beats() {
+        let (dir, sub, x, _) = signed_nodes_setup();
+        // Before `sub` has seen x signed (say, just after a restart), a peer
+        // claims x's heartbeat is as high as it goes.
+        let claim = NodeInfo { id: "x".into(), heartbeat: u64::MAX, ..Default::default() };
+        merge_sync(&sub, None, vec![claim], vec![], &SyncSource { cn: Some("m"), ..Default::default() }).await;
+        // x's own record replaces that, so its beats count.
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![], &SyncSource::default()).await;
+        assert_eq!(sub.known_nodes.load()["x"].heartbeat, 10);
+        age(&sub, "x", Duration::from_secs(31)).await;
+        merge_sync(&sub, None, vec![], vec![crate::signing::sign_beat("x", 50, &x).unwrap()], &SyncSource::default()).await;
+        assert!(crate::state::node_is_live(&sub.known_nodes.load()["x"], Instant::now()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_natd_node_comes_back_when_it_beats() {
+        let (dir, sub, x, m) = signed_nodes_setup();
+        let beat = |n: u64, who: &crate::signing::Signer| crate::signing::sign_beat("x", n, who).unwrap();
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![beat(50, &x)], &SyncSource::default()).await;
+        // Out of touch for longer than the expiry: forgotten.
+        age(&sub, "x", NODE_EXPIRE_AFTER + Duration::from_secs(1)).await;
+        expire_silent_nodes(&sub).await;
+        assert!(!sub.known_nodes.load().contains_key("x"));
+
+        // Its record hasn't changed, so relayed it doesn't bring it back.
+        let relayed = SyncSource { cn: Some("b"), ..Default::default() };
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![], &relayed).await;
+        assert!(!sub.known_nodes.load().contains_key("x"));
+        // Nor does an old beat, or one someone else signed.
+        merge_sync(&sub, None, vec![], vec![beat(50, &x), beat(90, &m)], &relayed).await;
+        assert!(!sub.known_nodes.load().contains_key("x"));
+        // A newer beat of its own does, live at once.
+        merge_sync(&sub, None, vec![], vec![beat(60, &x)], &relayed).await;
+        let back = sub.known_nodes.load()["x"].clone();
+        assert_eq!(back.heartbeat, 60);
+        assert!(crate::state::node_is_live(&back, Instant::now()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_newer_config_reaches_a_peer_from_a_node_nobody_dials() {
+        let (a, b) = (state_for("a"), state_for("b"));
+        a.dynamic_config.write().await.version = 6;
+        b.dynamic_config.write().await.version = 5;
+        // a syncs with b, which says (in its reply) which config it has.
+        a.delta_peers.lock().unwrap().insert("b:1".into(), (0, 0));
+        let Message::Sync { have, .. } = sync_msg_for(&a, "b:1", false).await else { unreachable!() };
+        let Message::Sync { have: Some(b_has), .. } = build_sync_reply(&b, have.as_ref().unwrap()).await else {
+            unreachable!()
+        };
+        assert_eq!(b_has.config_version, 5);
+        a.delta_peers.lock().unwrap().insert("b:1".into(), (b_has.config_version, b_has.config_hash));
+
+        // So a's next sync carries its config, and b adopts it.
+        let Message::Sync { config, nodes, beats, config_elided, .. } = sync_msg_for(&a, "b:1", false).await else {
+            unreachable!()
+        };
+        assert!(!config_elided);
+        merge_sync(&b, Some(config), nodes, beats, &SyncSource { cn: Some("a"), ..Default::default() }).await;
+        assert_eq!(b.dynamic_config.read().await.version, 6);
+        // Once b has caught up, syncs leave the config out again.
+        let caught_up = b.dynamic_config.read().await.clone();
+        a.delta_peers.lock().unwrap().insert("b:1".into(), (caught_up.version, config_hash(&caught_up)));
+        let Message::Sync { config_elided, .. } = sync_msg_for(&a, "b:1", false).await else { unreachable!() };
+        assert!(config_elided);
+    }
+
+    #[tokio::test]
+    async fn an_older_node_never_takes_the_placeholder_for_a_config() {
+        // What a node from before delta sync reads from a Sync.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "camelCase")]
+        enum OldMessage {
+            Sync { config: DynamicConfig },
+        }
+        let a = state_for("a");
+        *a.dynamic_config.write().await = serde_json::from_value(serde_json::json!({
+            "version": 9, "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "a", "nodePort": 1}]}],
+        }))
+        .unwrap();
+        let bytes = encode_message(&build_compact_sync(&a, false, false).await).unwrap();
+        let OldMessage::Sync { config } = rmp_serde::from_slice(&bytes).unwrap();
+        // An older node at version 8 keeps its own.
+        let theirs = DynamicConfig { version: 8, ..a.dynamic_config.read().await.clone() };
+        assert!(!config.supersedes(&theirs));
+        assert_eq!(config.version, 0);
+    }
+
     #[tokio::test]
     async fn beats_go_only_to_peers_that_ask_and_lack_them() {
         let (dir, sub, x, _) = signed_nodes_setup();
@@ -2263,9 +2496,9 @@ mod tests {
         assert_eq!(beats_in(&build_sync_reply(&sub, &asking(&[("x", 40)])).await), [("x".to_string(), 50)]);
         assert!(beats_in(&build_sync_reply(&sub, &asking(&[("x", 50)])).await).is_empty());
         // What we send unprompted carries only our own beat, and we have none.
-        assert!(beats_in(&build_compact_sync(&sub, true).await).is_empty());
+        assert!(beats_in(&build_compact_sync(&sub, true, false).await).is_empty());
         assert!(beats_in(&build_sync_msg(&sub, true).await).is_empty());
-        let Message::Sync { have: Some(have), .. } = build_compact_sync(&sub, true).await else { unreachable!() };
+        let Message::Sync { have: Some(have), .. } = build_compact_sync(&sub, true, false).await else { unreachable!() };
         assert_eq!(have.beats, [("x".to_string(), 50)], "the digest says which beat we hold");
         // A digest from a node predating the field asks for all of them.
         let old: messages::SyncDigest = rmp_serde::from_slice(&rmp_serde::to_vec_named(&serde_json::json!({
@@ -2342,7 +2575,7 @@ mod tests {
         // Until a peer's reply carries a digest, it gets full syncs.
         let Message::Sync { config_elided, .. } = sync_msg_for(&state, "old:1", false).await else { unreachable!() };
         assert!(!config_elided);
-        state.delta_peers.lock().unwrap().insert("new:1".into());
+        state.delta_peers.lock().unwrap().insert("new:1".into(), (0, config_hash(&DynamicConfig::default())));
         let Message::Sync { config_elided, .. } = sync_msg_for(&state, "new:1", false).await else { unreachable!() };
         assert!(config_elided);
     }

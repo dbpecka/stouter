@@ -29,7 +29,7 @@ use tracing::{debug, info};
 
 use super::balancer::{Balancer, Pick};
 use super::proxy::{
-    establish_tunnel, note_tunnel_failure, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
+    establish_tunnel, note_tunnel_failure, own_node, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
 };
 use crate::config::{labels_match, Route};
 use crate::telemetry::{Attributes, SpanEvent, SpanKind, SpanRecord};
@@ -840,6 +840,7 @@ impl tower_service::Service<Uri> for TunnelConnector {
                 .load()
                 .get(&node_id)
                 .cloned()
+                .or_else(|| own_node(&state).filter(|own| own.id == node_id))
                 .ok_or_else(|| format!("unknown node {node_id}"))?;
             let tunnel = establish_tunnel(&node, service_name, &state).await?;
             Ok(TunnelIo(TokioIo::new(tunnel)))

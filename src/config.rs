@@ -359,14 +359,18 @@ impl DynamicConfig {
 
     /// Whether this config should replace `current`: it has a higher
     /// version, or the same version with different content that wins the
-    /// tie-break (higher `changedBy`, then the larger serialized form).
+    /// tie-break (higher `changedBy`, then the longer serialized form, then
+    /// the larger one).
     ///
     /// Without the tie-break, two nodes changing the config at once both
     /// make version N+1, each node keeps whichever arrived first, and the
     /// cluster stays split until the next change. Comparing `changedBy`
     /// first also keeps a newer node's config from losing to the copy an
     /// older node relays without the fields it doesn't know (and without
-    /// `changedBy`).
+    /// `changedBy`). Then the longer form: one change, as made, against a
+    /// copy of it relayed by a node that dropped fields it doesn't know (a
+    /// signature, a newer setting). The fuller copy must win, or a rolling
+    /// upgrade would erase what the newer nodes added, cluster-wide.
     pub fn supersedes(&self, current: &DynamicConfig) -> bool {
         if self.version != current.version {
             return self.version > current.version;
@@ -374,7 +378,10 @@ impl DynamicConfig {
         if self == current {
             return false;
         }
-        let key = |dc: &DynamicConfig| (dc.changed_by.clone(), serde_json::to_vec(dc).unwrap_or_default());
+        let key = |dc: &DynamicConfig| {
+            let bytes = serde_json::to_vec(dc).unwrap_or_default();
+            (dc.changed_by.clone(), bytes.len(), bytes)
+        };
         key(self) > key(current)
     }
 
@@ -1495,6 +1502,37 @@ mod tests {
     fn validate_rejects_same_service_twice_on_one_node() {
         let cfg = group_of(vec![instance("api", "n1", &[]), instance("api", "n1", &[])]);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn the_fuller_copy_of_a_change_wins_the_tie_break() {
+        // One change, and a copy relayed by a node that drops a field it
+        // doesn't know (here localPort): same version, same author.
+        let svc: Service =
+            serde_json::from_value(serde_json::json!({"name": "api", "nodeId": "n1", "nodePort": 3000, "localPort": 15002}))
+                .unwrap();
+        let full = DynamicConfig {
+            version: 5,
+            changed_by: "n1".into(),
+            service_groups: vec![ServiceGroup { name: "g".into(), services: vec![svc] }],
+            ..Default::default()
+        };
+        let mut stripped = full.clone();
+        stripped.service_groups[0].services[0].local_port = None;
+        assert!(full.supersedes(&stripped));
+        assert!(!stripped.supersedes(&full));
+
+        // Likewise a signed config against a copy without its signature.
+        let signed = DynamicConfig {
+            signature: Some(ConfigSignature {
+                config_json: serde_json::to_string(&full).unwrap(),
+                signer_cert: "00".into(),
+                signature: "00".into(),
+            }),
+            ..full.clone()
+        };
+        assert!(signed.supersedes(&full));
+        assert!(!full.supersedes(&signed));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -19,6 +19,18 @@ use crate::tls::MeshStream;
 /// Maximum timestamp skew allowed for tunnel authentication.
 const MAX_SKEW_MS: u64 = 30_000;
 
+/// How long to wait for a new stream on a session. A stream is acknowledged
+/// only once the other end first answers on it, and yamux opens no more
+/// while 256 are unacknowledged: tunnels to one slow destination (a NAT'd
+/// node with no reverse connection ready, a hung service) can hold up every
+/// other tunnel on the session. Past this, the tunnel takes a pooled or new
+/// connection instead.
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// After a stream couldn't be opened in time, how long new tunnels skip the
+/// session rather than each wait out [`OPEN_STREAM_TIMEOUT`] too.
+const SATURATED_FOR: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // MuxHandle: cloneable handle for opening outbound yamux streams
 // ---------------------------------------------------------------------------
@@ -33,6 +45,8 @@ pub struct MuxHandle {
     tx: mpsc::Sender<oneshot::Sender<StreamResult>>,
     /// The CN of the server's certificate: the node at the other end.
     peer: Option<String>,
+    /// Until when new tunnels skip this session (see [`SATURATED_FOR`]).
+    saturated_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl MuxHandle {
@@ -91,10 +105,18 @@ impl MuxPool {
                 return None;
             }
         }
+        if handle.saturated_until.lock().unwrap().is_some_and(|until| Instant::now() < until) {
+            return None;
+        }
 
-        match handle.open_stream().await {
-            Ok(stream) => Some((stream, handle)),
-            Err(e) => {
+        match tokio::time::timeout(OPEN_STREAM_TIMEOUT, handle.open_stream()).await {
+            Err(_) => {
+                debug!("mux session to {addr} has no stream free in time; using another connection");
+                *handle.saturated_until.lock().unwrap() = Some(Instant::now() + SATURATED_FOR);
+                None
+            }
+            Ok(Ok(stream)) => Some((stream, handle)),
+            Ok(Err(e)) => {
                 debug!("mux open_stream to {addr} failed: {e}, removing session");
                 self.sessions.lock().unwrap().remove(addr);
                 None
@@ -296,7 +318,7 @@ pub async fn establish_mux_session(
         drive_client_connection(connection, rx, &addr_owned).await;
     });
 
-    Ok(MuxHandle { tx, peer })
+    Ok(MuxHandle { tx, peer, saturated_until: Arc::default() })
 }
 
 /// Background task that drives a yamux client connection.
@@ -313,9 +335,10 @@ async fn drive_client_connection<T>(
     let mut pending: Option<oneshot::Sender<StreamResult>> = None;
 
     poll_fn(|cx| {
-        // Process pending outbound stream request.
-        if let Some(ref sender) = pending {
-            if sender.is_closed() {
+        // Process pending outbound stream request, dropping it once its
+        // caller gave up waiting (registering to hear of that).
+        if let Some(ref mut sender) = pending {
+            if sender.poll_closed(cx).is_ready() {
                 pending = None;
             } else if let Poll::Ready(result) = conn.poll_new_outbound(cx) {
                 let _ = pending.take().unwrap().send(result);
@@ -355,11 +378,59 @@ async fn drive_client_connection<T>(
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tunnels_to_a_slow_destination_dont_hold_up_the_session() {
+        use crate::state::test_support::tls_state;
+        let dir = std::env::temp_dir().join(format!("stouter_mux_backlog_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let sub = tls_state(&dir, "sub");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, peer) = listener.accept().await.unwrap();
+                    let relay = relay.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mesh) = relay.tls_accept(tcp).await {
+                            crate::gossip::dispatch_connection(mesh, peer.to_string(), relay).await;
+                        }
+                    });
+                }
+            });
+        }
+        let pool = MuxPool::new();
+        pool.insert(addr.clone(), establish_mux_session(&addr, &sub).await.unwrap());
+        let now_ms = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        // 256 tunnels to a NAT'd node with no reverse connection at this
+        // relay: each waits there, unanswered (so unacknowledged).
+        let mut held = vec![];
+        for _ in 0..256 {
+            let (stream, session) = pool.open_stream(&addr, None).await.unwrap();
+            let mut stream = stream.compat();
+            let request = Message::TunnelRequest { node_id: "x".into(), service_name: "svc".into(), timestamp_ms: now_ms() };
+            gossip::send_message(&mut stream, &request).await.unwrap();
+            held.push((stream, session));
+        }
+        // Another tunnel over the session gives up quickly (and goes by
+        // another connection), and the next doesn't wait at all.
+        let start = Instant::now();
+        assert!(pool.open_stream(&addr, None).await.is_none());
+        assert!(start.elapsed() < OPEN_STREAM_TIMEOUT + Duration::from_millis(500), "{:?}", start.elapsed());
+        let start = Instant::now();
+        assert!(pool.open_stream(&addr, None).await.is_none());
+        assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
+        assert!(pool.contains(&addr), "the session itself is fine");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_session_serves_only_the_node_it_is_with() {
         let pool = MuxPool::new();
         let (tx, _rx) = mpsc::channel(1);
-        pool.insert("10.0.0.1:7000".into(), MuxHandle { tx, peer: Some("m".into()) });
+        pool.insert("10.0.0.1:7000".into(), MuxHandle { tx, peer: Some("m".into()), saturated_until: Arc::default() });
         // Gossip may claim x is at m's address: x's tunnels still don't
         // ride m's session.
         assert!(pool.open_stream("10.0.0.1:7000", Some("x")).await.is_none());

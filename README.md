@@ -122,11 +122,22 @@ if its services or routes differ), redo the edit, and push; or pass `--force`
 to replace the cluster's config anyway. After a push the file holds the version
 pushed, so the next edit starts from it.
 
+A running daemon writes each new config into its file. If the file holds an
+edit it hasn't applied (a hand edit not yet picked up, one it refused, a
+pulled config being edited), it saves the file as `<config>.unapplied`
+first and logs a warning, rather than write over the edit. `config push`
+mentions that file when the cluster already has what the config file now
+says.
+
 ### Registering Services
 
 Services are organized into groups. Each service entry maps a name to a local port and optional domain names. A service is known by its name everywhere (proxies, routes, the REST API), so all instances of a service belong to one group, and a domain can belong to only one service.
 
 `stouter service add|rename|remove` and `stouter route set|clear`, local or `--remote`, refuse a change that would break the config, such as claiming another service's domain, or removing or renaming a service that still has routes (clear them first). A problem the config already had doesn't block unrelated changes.
+
+Without `--remote`, these commands make the change through this host's daemon when it is running (`outboundOnly` ones have no listener to ask), as if `--remote` named it: editing the file behind a running daemon's back could undo a change the daemon took in at the same moment. Otherwise they edit the file, refusing if it changed while they ran. The daemon accepts these changes from its own certificate; with `requireSignedConfig` they must still be signed by an admin. `--node` defaults to this host's node, or with `--remote`, to the node at that address.
+
+`stouter service move` copies a service from one cluster to another and then removes it from the source. It refuses to move onto an instance the destination already has (it would replace it, and a rollback would then delete it). If the source doesn't answer the remove, it checks whether the service is still there before rolling the add back, so the service isn't left in neither cluster.
 
 ```json
 {
@@ -202,6 +213,11 @@ Copy the resulting files to the new node's `tlsDir` before starting it.
 2. `ca.crt` + `node.crt` + `node.key` present → use pre-issued cert
 3. Nothing present → generate new CA (written to disk) and node cert (memory only)
 
+Anything else (say `ca.crt` and `node.crt` copied without `node.key`) is an
+error naming what's there and what's missing. It used to be taken as
+"nothing present", and the new CA overwrote the cluster's `ca.crt`, cutting
+the node off for good.
+
 Only the daemon does step 3. CLI commands (with `--cert-dir`, or the local
 config's `tlsDir`) refuse a directory without certificates, so a mistyped path
 gives a clear error instead of a new CA that no node trusts. Local `service`
@@ -260,7 +276,9 @@ with a 10s timeout) and exchanges a `Sync` message. Only what changed travels:
   record it holds, and its config's version and hash.
 - The peer merges that and replies with only the records the initiator lacks
   or holds older versions of, and the config only if the peer's is newer (or
-  different at the same version).
+  different at the same version). Its reply also says which config it has:
+  if the initiator's is newer, the initiator's next sync carries it. That is
+  how a change made on a node nobody can dial (an `outboundOnly` one) spreads.
 - A peer running an older version sends no digest; it gets full syncs (every
   record and the config) instead, as before.
 
@@ -275,7 +293,10 @@ On receiving a config:
 - If it has a higher version, the local dynamic config is replaced.
   Two *different* configs at the same version (changes made at once on two
   nodes) are settled the same way everywhere, by the `changedBy` node that made
-  each and then by content, so the cluster can't stay split.
+  each and then by content, so the cluster can't stay split. Between one
+  change and a copy of it relayed by an older node that dropped fields it
+  doesn't know (a signature, a newer setting), the fuller copy wins, so a
+  rolling upgrade doesn't erase them.
 - New peer addresses are merged into the known node set.
 
 **Signed node records.** What each node says about itself (its address,
@@ -308,7 +329,9 @@ reaches nodes the leave message didn't (an `outboundOnly` node, which no one
 can send to, or one that was briefly cut off) within a sync round, instead of
 after the 5-minute expiry. A node that left or was forgotten is not brought
 back by a stale copy of its record; it rejoins with a newer one (it
-restarted) or by talking to its peers itself. A forgotten node may only have
+restarted), by talking to its peers itself, or, for an `outboundOnly` node,
+which can't be reached to see it's back, by a newer beat it signed. A
+forgotten node may only have
 been cut off, so its last address is retried about once a minute for 24
 hours: when the network heals, the two sides find each other again even if
 neither lists the other in `knownNodes`. A daemon never lists itself as a
@@ -485,7 +508,7 @@ The NAT'd node replenishes its pool immediately after each use, maintaining `rev
 
 ### Multiplexing (Yamux)
 
-To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessions, and 8 warm connections, to each node their tunnels go to: the nodes hosting a service they proxy (after `subscribeFilter`), or for an `outboundOnly` one, the relay they reach it through. Multiple concurrent tunnels share a single underlying TCP connection. The mux pool is filled proactively in the background so streams are available without waiting for a new handshake. When a node no longer hosts anything proxied, its warm connections are closed, and its session once the tunnels on it finish.
+To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessions, and 8 warm connections, to each node their tunnels go to: the nodes hosting a service they proxy (after `subscribeFilter`), or for an `outboundOnly` one, the relay they reach it through. Multiple concurrent tunnels share a single underlying TCP connection. The mux pool is filled proactively in the background so streams are available without waiting for a new handshake. A stream counts against the session until the other end first answers on it, and yamux opens no more while 256 haven't been answered: tunnels to one slow destination (a NAT'd node with no reverse connection ready, a hung service) could hold up every other tunnel on the session. So a tunnel waits at most 1 second for a stream, then takes a pooled or new connection instead, and for the next 2 seconds tunnels skip that session. When a node no longer hosts anything proxied, its warm connections are closed, and its session once the tunnels on it finish.
 
 ### mTLS / PKI
 
@@ -550,7 +573,7 @@ All async tasks share a single `Arc<State>` that contains:
 | `tunnel_pool` | Pre-warmed TCP connections keyed by address |
 | `mux_pool` | Yamux sessions keyed by address |
 
-`StreamPool<T>` is a generic pooling primitive backed by a `VecDeque` with async `notify` for waiters. `InFlightTracker` counts active connections and signals a drain channel on zero for graceful shutdown.
+`StreamPool<T>` is a generic pooling primitive backed by a `VecDeque` with async `notify` for waiters. `InFlightTracker` counts active connections and signals a drain channel on zero for graceful shutdown. Subscribers close their idle HTTP keep-alive connections to a node that leaves, and to NAT'd nodes reached through a relay that leaves, so neither waits out the 30-second drain for connections nobody is using.
 
 ### Subscribe REST API
 
@@ -619,7 +642,9 @@ curl http://stock.example.com/items/42  # → the service whose domains include 
 - Requests use the same per-service proxy as the service's local port: one
   balancer, so `maxConnections`, ejection, routes, retries and tracing apply
   across both. Services on the same node (in `nodeSubscribe`) are reachable
-  too, and `subscribeFilter` applies.
+  too, connected to directly rather than through a tunnel to itself, and
+  `subscribeFilter` applies. A TCP proxy for a service hosted here and
+  elsewhere likewise counts this node's own instance among its backends.
 - Only valid in subscribe modes. Keep it on loopback; stouter warns at
   startup if not, since anything that can reach it can call every `http`
   service in the mesh.
