@@ -262,6 +262,23 @@ directory. It also takes only cluster names of letters, digits, `-` and `_`
 (they become remote paths), and uploads the repository it is in, wherever
 it's run from.
 
+### Testing
+
+`cargo test` runs the unit and in-process tests. End-to-end scripts in
+`tests/e2e/` run real daemons; each prints PASS/FAIL lines and exits
+non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
+
+| Script | Checks | Needs |
+|--------|--------|-------|
+| `caps.sh BINARY` | Per-peer connection caps under load, and that stalled handshakes from several addresses can't lock peers out | python3 |
+| `multihost.sh BINARY` | Nodes on separate hosts (network namespaces), all bound to `0.0.0.0`, find each other's real addresses and tunnel | root, iproute2, python3, curl |
+| `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
+| `deploy-host.sh [user@host]` | `deploy.sh` against a real host: the container runs and answers, a redeploy keeps the CA | ssh with keys, sudo and Docker on the host |
+
+CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, checks
+the build with Rust 1.88 (the Docker image's) and on macOS and Windows, and
+runs all four scripts, `deploy-host.sh` over ssh from the runner to itself.
+
 ---
 
 ## Architecture

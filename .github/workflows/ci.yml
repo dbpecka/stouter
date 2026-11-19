@@ -1,0 +1,108 @@
+# Build and test every pull request and every push to main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Clippy and tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
+  # The Rust the Docker image builds with (see the Dockerfile).
+  msrv:
+    name: Builds with Rust 1.88
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  # The other platforms releases are built for: the binary and the tests
+  # compile.
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-targets
+
+  e2e:
+    name: End-to-end (caps, multi-host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - name: Per-peer connection caps under load
+        run: tests/e2e/caps.sh target/debug/stouter
+      - name: Wildcard-bound nodes on separate hosts (network namespaces)
+        run: sudo tests/e2e/multihost.sh target/debug/stouter
+
+  docker:
+    name: End-to-end (deploy.sh, docker stop)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: SSH from this runner to itself, as for a remote host
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh && chmod go-w ~
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl start ssh
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+          ssh -o BatchMode=yes localhost true
+      # Builds stouter:latest on the "host" from the Dockerfile.
+      - name: deploy.sh against a real host
+        run: tests/e2e/deploy-host.sh
+      - name: docker stop with stouter as PID 1
+        run: tests/e2e/docker-stop.sh
