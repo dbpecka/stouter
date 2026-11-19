@@ -638,7 +638,7 @@ async fn peer_addrs(state: &Arc<SharedState>) -> Vec<String> {
 /// (which says where a node listens, not where to reach it), not us.
 fn dialable(state: &SharedState, addr: &str) -> bool {
     let own = [state.config.peer_addr(), state.config.bind.as_str(), &state.config.local_target()];
-    !addr.is_empty() && !is_wildcard(addr) && !own.contains(&addr)
+    !addr.is_empty() && !is_wildcard(addr) && !own.contains(&addr) && !state.own_addrs.lock().unwrap().contains(addr)
 }
 
 /// Background task: periodically push a Sync message to every known peer and
@@ -789,6 +789,13 @@ async fn sync_with_peer(state: &Arc<SharedState>, addr: &str, want_beats: bool) 
         Some(kept) => kept,
         None => {
             let mut stream = state.connect_mesh(addr, None).await?;
+            // Our own certificate answered: this address is us (a shared
+            // `knownNodes` list naming our real IP while we bind 0.0.0.0).
+            if stream.peer_cn() == Some(state.config.node_id.as_str()) {
+                debug!("{addr} is this node; not syncing with it");
+                state.own_addrs.lock().unwrap().insert(addr.to_string());
+                return Ok(());
+            }
             let reply = exchange(&mut stream, &our_sync).await?;
             (stream, reply)
         }
@@ -947,7 +954,9 @@ fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfi
     let on_disk = config_text(&cfg.dynamic_config);
     let new = config_text(dc);
     let mut known = state.file_config.lock().unwrap();
-    if known.as_ref().is_some_and(|known| *known != on_disk) && on_disk != new {
+    // (Not when the file already says what's being written, as when an edit
+    // made there was just pushed and comes back signed.)
+    if known.as_ref().is_some_and(|known| *known != on_disk) && on_disk != new && !cfg.dynamic_config.same_settings(dc) {
         let aside = crate::config::unused_path(&format!("{path}.unapplied"));
         match crate::config::write_atomic(std::path::Path::new(&aside), text.as_bytes()) {
             Ok(()) => warn!(
@@ -1020,6 +1029,10 @@ async fn merge_sync(
     // peers), so a change here writes nothing to disk.
     state.update_known_nodes(|kn| {
         let mut changed = false;
+        // Counted once, then kept up to date: counting for every entry would
+        // make a sync of many made-up nodes cost the square of their number,
+        // with the node list locked.
+        let mut unsigned = kn.values().filter(|n| n.signed.is_none()).count();
         for mut node in nodes {
             if !is_valid_node_id(&node.id) {
                 debug!("ignoring node with invalid id: {:?}", node.id);
@@ -1085,6 +1098,12 @@ async fn merge_sync(
                     }
                 }
             } else {
+                // One that signed its records, now departed: unsigned gossip
+                // about it is no more believed than while it was here.
+                if source.cn != Some(node.id.as_str()) && state.buried_signed(&node.id) {
+                    debug!("ignoring unsigned gossip about departed node {}", node.id);
+                    continue;
+                }
                 // A node that left or was forgotten comes back only with a
                 // heartbeat newer than the one it departed with, or by
                 // talking to us itself.
@@ -1095,7 +1114,7 @@ async fn merge_sync(
                 // Without signed records anyone can make up nodes, each one
                 // an address every node dials: hold only so many that never
                 // signed (an older version's), plenty for any real cluster.
-                if kn.values().filter(|n| n.signed.is_none()).count() >= MAX_UNSIGNED_NODES {
+                if unsigned >= MAX_UNSIGNED_NODES {
                     if !state.unsigned_cap_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         warn!(
                             "already {MAX_UNSIGNED_NODES} nodes known only from unsigned gossip; ignoring more (latest: {} from {})",
@@ -1112,6 +1131,7 @@ async fn merge_sync(
                 node.last_seen = Some(now);
                 node.heard_at = Some(now);
                 kn.insert(node.id.clone(), node);
+                unsigned += 1;
                 changed = true;
             }
         }
@@ -1223,18 +1243,24 @@ fn merge_signed(
     // before skipping a record we already hold.
     let mut addr_changed = false;
     if let Some(existing) = kn.get_mut(&node.id).filter(|n| n.signed.is_some()) {
-        let better = if source.cn == Some(node.id.as_str()) && is_wildcard(&node.addr) {
+        let direct = source.cn == Some(node.id.as_str()) && is_wildcard(&node.addr);
+        let better = if direct {
             // From the node itself: where we reached it, or it reached us.
             source.host.and_then(|host| rewrite_wildcard(&node.addr, host))
-        } else if is_wildcard(&existing.addr) {
+        } else if is_wildcard(&existing.addr) || (existing.addr_relayed && !crate::state::node_is_live(existing, now)) {
+            // Nothing better yet, or what a relayer said doesn't work (a
+            // wrong relayer, or the node moved): another relayer's address.
             relayed_address(&node.addr, &existing.addr)
         } else {
             None
         };
-        if let Some(addr) = better.filter(|addr| *addr != existing.addr) {
-            info!("node {} address updated: {} -> {addr}", node.id, existing.addr);
-            existing.addr = addr;
-            addr_changed = true;
+        if let Some(addr) = better {
+            if addr != existing.addr {
+                info!("node {} address updated: {} -> {addr}", node.id, existing.addr);
+                existing.addr = addr;
+                addr_changed = true;
+            }
+            existing.addr_relayed = !direct;
         }
     }
     match crate::signing::claimed_heartbeat(&signed) {
@@ -1264,15 +1290,21 @@ fn merge_signed(
     // tells us best. Relayed, keep an address we already have, or else take
     // the one the relaying node reaches it at (see `relayed_address`).
     let mut addr = record.addr.clone();
+    let mut addr_relayed = false;
     if is_wildcard(&addr) {
         if source.cn == Some(record.id.as_str()) {
             if let Some(rewritten) = source.host.and_then(|host| rewrite_wildcard(&addr, host)) {
                 addr = rewritten;
             }
-        } else if let Some(known) = kn.get(&record.id).filter(|n| !n.addr.is_empty() && !is_wildcard(&n.addr)) {
+        } else if let Some(known) = kn.get(&record.id).filter(|n| {
+            // Keep what we have, unless it's a relayer's and doesn't work.
+            !n.addr.is_empty() && !is_wildcard(&n.addr) && !(n.addr_relayed && !crate::state::node_is_live(n, now))
+        }) {
             addr = known.addr.clone();
+            addr_relayed = known.addr_relayed;
         } else if let Some(relayed) = relayed_address(&node.addr, &record.addr) {
             addr = relayed;
+            addr_relayed = true;
         }
     }
 
@@ -1300,6 +1332,7 @@ fn merge_signed(
                 );
             }
             existing.addr = addr;
+            existing.addr_relayed = addr_relayed;
             // Beats may have raised a signed node's heartbeat past its record
             // version, so keep the higher. But the first signed record
             // replaces what unsigned gossip said: anyone could have claimed
@@ -1345,6 +1378,7 @@ fn merge_signed(
                 NodeInfo {
                     id: record.id,
                     addr,
+                    addr_relayed,
                     heartbeat: record.heartbeat,
                     record_version: record.heartbeat,
                     health: record.health,
@@ -1404,9 +1438,12 @@ fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::con
     let Some(tls) = state.tls.as_deref() else { return checked };
     let known = state.known_nodes.load();
     let mut new_ids = 0;
+    // One check per node per sync, whatever its outcome: a peer repeating
+    // one id thousands of times would otherwise have each copy checked.
+    let mut tried: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for node in nodes {
         let Some(signed) = &node.signed else { continue };
-        if checked.records.contains_key(&node.id) {
+        if !tried.insert(node.id.as_str()) {
             continue;
         }
         let held = known.get(&node.id).filter(|n| n.signed.is_some()).map(|n| n.record_version);
@@ -1550,7 +1587,8 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&
                 (verified.left && verified.id == id).then_some((verified.heartbeat, signed))
             });
             state.update_known_nodes(|kn| {
-                let last = kn.remove(&id).map(|n| n.heartbeat);
+                let removed = kn.remove(&id);
+                let last = removed.as_ref().map(|n| n.heartbeat);
                 if last.is_some() {
                     info!("node left: {id}");
                 }
@@ -1558,6 +1596,9 @@ async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&
                 // restart sends a newer heartbeat and is let back in.
                 let version = left.as_ref().map_or(0, |(v, _)| *v);
                 state.bury_with(&id, heartbeat.max(last.unwrap_or(0)).max(version), left);
+                if removed.is_some_and(|n| n.signed.is_some()) {
+                    state.mark_buried_signed(&id);
+                }
             }).await;
         }
         Message::Sync { config, nodes, beats, config_elided, .. } => {
@@ -1693,11 +1734,17 @@ fn placeholder_config() -> crate::config::DynamicConfig {
 /// What we hold: every signed node record's version (ours and departed
 /// nodes' included) and our config's version and hash.
 fn digest(state: &SharedState, config: &crate::config::DynamicConfig, want_beats: bool) -> messages::SyncDigest {
+    let now = Instant::now();
     let mut records: Vec<(String, u64)> = state
         .known_nodes
         .load()
         .values()
         .filter(|n| n.signed.is_some())
+        // A node reached at an address a relayer gave, which doesn't work:
+        // left out, so peers send its record again with where they reach it
+        // (a record we hold is otherwise never resent, and a NAT'd node
+        // never hears from the node itself).
+        .filter(|n| !(n.addr_relayed && !crate::state::node_is_live(n, now)))
         .map(|n| (n.id.clone(), n.record_version))
         .collect();
     records.extend(state.departed_records().into_iter().map(|(id, v, _)| (id, v)));
@@ -2921,5 +2968,151 @@ mod tests {
         state.delta_peers.lock().unwrap().insert("new:1".into(), (0, config_hash(&DynamicConfig::default())));
         let Message::Sync { config_elided, .. } = sync_msg_for(&state, "new:1", false).await else { unreachable!() };
         assert!(config_elided);
+    }
+    /// A NAT'd observer (which x can never sync with) learns wildcard-bound
+    /// x's address only from relayers. One that turns out not to work (a
+    /// wrong relayer, or x moved) gives way to another relayer's, and while
+    /// it doesn't work the observer's digest leaves x out, so peers resend
+    /// x's record with where they reach it.
+    #[tokio::test]
+    async fn a_relayed_address_that_doesnt_work_gives_way() {
+        let (dir, _sub, x, _m) = signed_nodes_setup();
+        let natd = crate::state::test_support::tls_state_with(
+            &dir,
+            Config { node_id: "natd".into(), outbound_only: true, ..Config::default() },
+            String::new(),
+        );
+        let addr_of = || natd.known_nodes.load()["x"].addr.clone();
+        let in_digest = || digest(&natd, &DynamicConfig::default(), false).records.iter().any(|(id, _)| id == "x");
+        let rec = record("x", "0.0.0.0:8080", 10, &x);
+        let from_m = SyncSource { cn: Some("m"), host: Some("10.0.0.66"), contact_addr: None };
+        let from_b = SyncSource { cn: Some("b"), host: Some("10.0.0.2"), contact_addr: None };
+        let relayed = |addr: &str, rec: &NodeInfo| NodeInfo { addr: addr.into(), ..rec.clone() };
+
+        merge_sync(&natd, None, vec![relayed("10.6.6.6:8080", &rec)], vec![], &from_m).await;
+        assert_eq!(addr_of(), "10.6.6.6:8080");
+        assert!(in_digest(), "x is live (its grace period): its record isn't asked for again");
+        merge_sync(&natd, None, vec![relayed("10.0.0.5:8080", &rec)], vec![], &from_b).await;
+        assert_eq!(addr_of(), "10.6.6.6:8080", "a working address isn't swapped for another relayer's");
+
+        // Nothing answers there.
+        age(&natd, "x", Duration::from_secs(31)).await;
+        assert!(!in_digest(), "x's record is asked for again");
+        merge_sync(&natd, None, vec![relayed("10.0.0.5:8080", &rec)], vec![], &from_b).await;
+        assert_eq!(addr_of(), "10.0.0.5:8080", "another relayer's address replaces it");
+
+        // x restarts elsewhere: a newer record, relayed with its new address,
+        // replaces the old one once that stops working.
+        age(&natd, "x", Duration::from_secs(31)).await;
+        let rec2 = record("x", "0.0.0.0:8080", 20, &x);
+        merge_sync(&natd, None, vec![relayed("10.0.0.9:8080", &rec2)], vec![], &from_b).await;
+        assert_eq!(addr_of(), "10.0.0.9:8080");
+        assert_eq!(natd.known_nodes.load()["x"].record_version, 20);
+
+        // An address from x itself is never replaced by a relayer's.
+        merge_sync(&natd, None, vec![rec2.clone()], vec![], &SyncSource { cn: Some("x"), host: Some("10.0.0.10"), contact_addr: None }).await;
+        assert_eq!(addr_of(), "10.0.0.10:8080");
+        age(&natd, "x", Duration::from_secs(31)).await;
+        assert!(in_digest());
+        merge_sync(&natd, None, vec![relayed("10.6.6.6:8080", &rec2)], vec![], &from_m).await;
+        assert_eq!(addr_of(), "10.0.0.10:8080");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without requireSignedConfig: once a node with signed records has left,
+    /// unsigned gossip about it (which anyone could make up) doesn't bring it
+    /// back; only its own word does.
+    #[tokio::test]
+    async fn unsigned_gossip_doesnt_bring_back_a_departed_signed_node() {
+        let (dir, sub, x, _) = signed_nodes_setup();
+        let fake = |hb: u64| NodeInfo { id: "x".into(), relay: Some("10.6.6.6:8080".into()), heartbeat: hb, ..Default::default() };
+        let from_m = SyncSource { cn: Some("m"), ..Default::default() };
+
+        // It leaves with a signed last record, or (an older build) without.
+        for with_record in [true, false] {
+            merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![], &SyncSource::default()).await;
+            assert!(sub.known_nodes.load()["x"].signed.is_some());
+            let left = crate::config::NodeRecord { id: "x".into(), heartbeat: 11, left: true, ..Default::default() };
+            let last = with_record.then(|| crate::signing::sign_node(&left, &x).unwrap());
+            apply_message(&sub, Message::NodeLeave { id: "x".into(), heartbeat: 11, record: last }, Some("x")).await;
+            assert!(!sub.known_nodes.load().contains_key("x"));
+
+            merge_sync(&sub, None, vec![fake(12)], vec![], &from_m).await;
+            assert!(!sub.known_nodes.load().contains_key("x"), "made-up gossip doesn't revive it");
+            assert!(sub.buried_signed("x"));
+            assert_eq!(sub.has_left("x"), with_record);
+            assert_eq!(sub.departed_records().len(), usize::from(with_record), "its departure is still passed on");
+
+            // Back for real: its own newer record.
+            merge_sync(&sub, None, vec![record("x", "", 20, &x)], vec![], &SyncSource::default()).await;
+            assert!(sub.known_nodes.load()["x"].signed.is_some());
+            assert!(!sub.has_left("x"));
+            sub.update_known_nodes(|kn| {
+                kn.remove("x");
+            })
+            .await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record repeated under one id is checked once per sync, however many
+    /// copies a peer sends (each check is a chain and signature verification).
+    #[tokio::test]
+    async fn copies_of_one_nodes_record_are_checked_once() {
+        let (dir, sub, x, m) = signed_nodes_setup();
+        merge_sync(&sub, None, vec![record("x", "x:1", 10, &x)], vec![], &SyncSource::default()).await;
+        // m's genuine record, claiming a huge heartbeat, relayed as x's.
+        let junk = |id: &str| NodeInfo { id: id.into(), ..record("m", "m:1", u64::MAX, &m) };
+        let copies: Vec<NodeInfo> = (0..3000).map(|_| junk("x")).collect();
+        let distinct: Vec<NodeInfo> = (0..MAX_NEW_RECORDS_PER_SYNC).map(|i| junk(&format!("u{i}"))).collect();
+        let t = std::time::Instant::now();
+        assert!(check_signatures(&sub, &copies, &[]).records.is_empty());
+        let copies_took = t.elapsed();
+        let t = std::time::Instant::now();
+        assert!(check_signatures(&sub, &distinct, &[]).records.is_empty());
+        let distinct_took = t.elapsed();
+        // One check against MAX_NEW_RECORDS_PER_SYNC of them.
+        assert!(copies_took < distinct_took, "{copies_took:?} for 3000 copies, {distinct_took:?} for {MAX_NEW_RECORDS_PER_SYNC} ids");
+
+        // The record x signed still gets through, wherever it is in the list.
+        let newer = record("x", "x:2", 20, &x);
+        merge_sync(&sub, None, vec![newer, junk("x")], vec![], &SyncSource::default()).await;
+        assert_eq!(sub.known_nodes.load()["x"].addr, "x:2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node told to sync with its own address (a shared knownNodes list
+    /// naming its real IP while it binds 0.0.0.0) notices its own
+    /// certificate answering, and stops dialling that address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_doesnt_sync_with_itself() {
+        use crate::state::test_support::tls_state;
+        let dir = std::env::temp_dir().join(format!("stouter_self_{}_{}", std::process::id(), rand::random::<u64>()));
+        let a = tls_state(&dir, "a");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let synced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (a, synced) = (a.clone(), synced.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let (a, synced) = (a.clone(), synced.clone());
+                    tokio::spawn(async move {
+                        if let Ok(mut mesh) = a.tls_accept(tcp).await {
+                            if recv_message(&mut mesh).await.is_ok() {
+                                synced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        assert!(dialable(&a, &addr));
+        sync_with_peer(&a, &addr, false).await.unwrap();
+        assert!(!dialable(&a, &addr), "its own address isn't dialled again");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(synced.load(std::sync::atomic::Ordering::SeqCst), 0, "no sync sent to itself");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

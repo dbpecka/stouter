@@ -100,7 +100,9 @@ if [[ "$RESTART_ONLY" == false ]]; then
   debug "Cleaning remote build directory"
   remote_sudo "rm -rf $RD/build/*"
   debug "Running scp (excluding target/, .git/, .idea/, *.json)"
-  mapfile -t SOURCES < <(find . -maxdepth 1 \
+  # A loop rather than `mapfile`, which macOS's bash (3.2) doesn't have.
+  SOURCES=()
+  while IFS= read -r source; do SOURCES+=("$source"); done < <(find . -maxdepth 1 \
     ! -name '.' \
     ! -name 'target' \
     ! -name '.git' \
@@ -118,7 +120,8 @@ if [[ -n "$CONFIG_FILE" ]]; then
   else
     echo "==> Uploading config: $CONFIG_FILE"
     debug "Creating remote config directory $REMOTE_DIR/config"
-    remote_sudo "mkdir -p $RD/config"
+    # The build directory too: with -r (no build) it may not exist yet.
+    remote_sudo "mkdir -p $RD/config $RD/build && chown \"\$SUDO_UID:\$SUDO_GID\" $RD/build"
     debug "SCP $CONFIG_FILE -> $REMOTE_HOST:$REMOTE_DIR/build/stouter.json"
     scp "$CONFIG_FILE" "$REMOTE_HOST:$REMOTE_DIR/build/stouter.json"
     echo "==> Deploying stouter.json"

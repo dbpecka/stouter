@@ -61,7 +61,7 @@ Create a `stouter.json` file:
 | `knownNodes` | Bootstrap peer addresses for initial gossip |
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
 | `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default) disables admin RPC |
-| `apiPort` | Subscribe-mode REST API port on `127.0.0.1` (default 5381). Set per-cluster when running multiple instances on one host. |
+| `apiPort` | Port on `127.0.0.1` (default 5381) for the subscribe-mode REST API, or in `node` mode for `/metrics` alone. Set per-cluster when running multiple instances on one host. |
 | `requireSignedConfig` | Accept a config change only if a certificate in `adminCns` signed it (see [Signed config changes](#signed-config-changes)). Default `false`. |
 
 The daemon won't start if one of its own settings is wrong (an invalid
@@ -385,11 +385,21 @@ Limits, so one peer can't exhaust a node:
   (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, and 1024
   idle reverse connections, and 2 sync connections kept open between rounds.
   Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
-  so one whose peer vanished is closed within about a minute.
-- At most 512 TLS handshakes may be in progress at once, 128 from one IP
-  address; further connections are closed at once. Until it completes its
-  handshake a connection could be anyone's, so this keeps a host with no
-  certificate from tying up every file descriptor.
+  so an idle one whose peer vanished is closed within about a minute. On
+  Linux, so is one with data waiting to be acknowledged (`TCP_USER_TIMEOUT`,
+  60s), where TCP would otherwise retransmit for about 15 minutes; elsewhere
+  keepalive covers only idle connections.
+- At most 512 TLS handshakes may be in progress at once, 128 from one IPv4
+  address or IPv6 /64. Until it completes its handshake a connection could
+  be anyone's, so this keeps a host with no certificate from tying up every
+  file descriptor. A further connection from an address at its 128 is closed
+  at once; one past the 512 is let in, and the oldest handshake of the
+  address with the most in progress is dropped for it. Hosts that open
+  connections and send nothing then only displace one another, while a
+  peer's handshake (milliseconds, from an address with few in progress)
+  still gets through.
+- A relay keeps nothing for a node id a tunnel request names once the
+  request is done, so requests for made-up nodes leave nothing behind.
 - A failed `accept` (such as no file descriptors left) is retried after a
   short, growing wait and logged, on the mesh listener, local proxies and
   `httpListen` alike: it never stops the daemon or a proxy.
@@ -416,10 +426,14 @@ When a subscribe proxy needs to reach service `api` on node `host2`:
 2. Select a node by smooth weighted round-robin, skipping drained (weight `0`)
    and ejected nodes, and nodes at their `maxConnections` limit.
 3. Acquire a connection (in priority order):
-   - **Mux session** — open a new yamux stream on an existing multiplexed connection (fastest)
-   - **Reverse pool** — take an idle reverse connection (for NAT'd target nodes)
+   - **Reverse pool** — an idle reverse connection the target node holds to
+     this daemon (when this daemon is one of a NAT'd node's relays)
+   - **Mux session** — open a new yamux stream on an existing multiplexed connection
    - **Tunnel pool** — use a pre-warmed TCP connection
    - **Cold connect** — open a fresh mTLS TCP connection
+
+   For a NAT'd target, the last three go to one of its relays, and failing
+   that (or with no answer within 5 seconds) to its next one.
 4. Send a `TunnelRequest{node_id, service_name, timestamp_ms}`.
 5. Read a status byte: `0x00` = success.
 6. Proxy bytes bidirectionally between the local client and the remote service.
@@ -547,7 +561,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay ranking highest for it (rendezvous hashing again, on the subscriber's and relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, instead of all going through one. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel, all within 12 seconds, so the subscriber (which waits 15) hears why. An `outboundOnly` subscriber in `subscribe` mode hosts nothing, so it keeps no reverse connections. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay of X's ranking highest for the pair (rendezvous hashing again, on the subscriber's, X's and the relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, and a subscriber's tunnels to many NAT'd nodes sharing relays spread over them too, instead of all going through one. If a tunnel through that relay fails (or gets no answer within 5 seconds, when its host stopped answering), the subscriber tries X's next relay in the same setup, so a relay going down doesn't fail X's tunnels for the half minute until gossip marks it stale. If a reverse connection turns out to be dead, the relay tries another (up to 3) before failing the tunnel, all within 12 seconds, so the subscriber (which waits 15) hears why. An `outboundOnly` subscriber in `subscribe` mode hosts nothing, so it keeps no reverse connections. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
 
 ### Multiplexing (Yamux)
 
@@ -630,6 +644,13 @@ GET /services/{name}   → one service
 Each entry has `name`, `port`, `address`, `domains` and `meta`.
 
 This lets local processes discover which `127.0.0.1` port to connect to for each service name without static configuration.
+
+The API also serves `GET /metrics` (Prometheus) and `GET /__health`. A
+`node`-mode daemon has no REST API, but serves `GET /metrics` on the same
+port (`127.0.0.1:5381`, or `apiPort`), so what nodes record (tunnels they
+relay and serve, gossip) can be scraped too. If that port is taken, for
+example by a subscriber on the same host, the node logs a warning and runs
+without it: give one of them another `apiPort`.
 
 ### Calling Services from Another Node
 

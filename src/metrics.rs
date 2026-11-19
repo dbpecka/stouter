@@ -22,6 +22,33 @@ pub fn install() -> PrometheusHandle {
         .expect("failed to install Prometheus recorder")
 }
 
+/// Serve `GET /metrics` on `127.0.0.1:port` until shutdown: for `node`-mode
+/// daemons, which run no REST API (subscribers serve `/metrics` there), so
+/// what they record (tunnels relayed and served, gossip) can be scraped.
+/// A port already in use (say by a subscriber on the same host, on the
+/// default port) is a warning, not a reason to stop the node.
+pub async fn serve_metrics(port: u16, handle: PrometheusHandle, state: Arc<SharedState>) {
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let handle = handle.clone();
+            async move { handle.render() }
+        }),
+    );
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::warn!("not serving /metrics: can't bind 127.0.0.1:{port} ({e}); set apiPort to a free port");
+            return;
+        }
+    };
+    tracing::info!("metrics on http://127.0.0.1:{port}/metrics");
+    let shutdown = state.shutdown.clone();
+    if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(async move { shutdown.cancelled().await }).await {
+        tracing::warn!("metrics endpoint stopped: {e}");
+    }
+}
+
 /// Background task that periodically publishes gauge values from shared state.
 ///
 /// Gauges like pool sizes and node counts can't be emitted at callsites
@@ -74,5 +101,47 @@ pub async fn run_gauge_loop(state: Arc<SharedState>) {
         // Mux sessions
         let mux_count = state.mux_pool.session_count();
         metrics::gauge!("stouter_mux_sessions").set(mux_count as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn get(port: u16, path: &str) -> String {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_node_serves_its_metrics_and_a_taken_port_doesnt_stop_it() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("stouter_connections_total", "type" => "tunnel").increment(3);
+        });
+        let state = SharedState::new(crate::config::Config::default(), String::new(), tokio_util::sync::CancellationToken::new(), None);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let server = tokio::spawn(serve_metrics(port, handle.clone(), state.clone()));
+        let mut body = String::new();
+        for _ in 0..50 {
+            if let Ok(s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                drop(s);
+                body = get(port, "/metrics").await;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert!(body.contains("stouter_connections_total{type=\"tunnel\"} 3"), "{body}");
+
+        // The port is taken now: a second server warns and returns.
+        tokio::time::timeout(std::time::Duration::from_secs(2), serve_metrics(port, handle, state.clone())).await.expect("returns");
+        state.shutdown.cancel();
+        server.await.unwrap();
     }
 }

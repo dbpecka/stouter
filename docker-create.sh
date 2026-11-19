@@ -9,9 +9,11 @@
 set -euo pipefail
 
 CONFIG_DIR="${1:-/srv/stouter/config}"
-CONFIG_DIR="${CONFIG_DIR%/}"
+[[ -f "$CONFIG_DIR/stouter.json" ]] || { echo "error: no config at $CONFIG_DIR/stouter.json" >&2; exit 1; }
+# Absolute: Docker mounts only absolute paths, and the container sees the
+# config at the same path.
+CONFIG_DIR=$(cd "$CONFIG_DIR" && pwd)
 CONFIG="$CONFIG_DIR/stouter.json"
-[[ -f "$CONFIG" ]] || { echo "error: no config at $CONFIG" >&2; exit 1; }
 
 mounts=(-v "$CONFIG_DIR:$CONFIG_DIR")
 tls_dir=$(sed -n 's/.*"tlsDir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1)

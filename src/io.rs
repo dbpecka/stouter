@@ -60,10 +60,19 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const KEEPALIVE_RETRIES: u32 = 3;
 
+/// On Linux, how long sent data may go unacknowledged before the connection
+/// is dropped (`TCP_USER_TIMEOUT`). Keepalive probes only a quiet
+/// connection: one with data in flight to a vanished peer is retransmitted
+/// to for about 15 minutes (`tcp_retries2`), and a request sent on it hangs
+/// that long. Also caps the keepalive check at the same minute.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const USER_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Configure a TCP stream for long-lived tunnel use: enable `TCP_NODELAY`
 /// and `SO_KEEPALIVE` (probes after 30s idle, every 10s, 3 tries) so
 /// intermediary NATs/firewalls don't silently drop idle connections, and a
-/// peer that vanished is noticed within about a minute.
+/// peer that vanished is noticed within about a minute; on Linux, also while
+/// data is waiting for it (see [`USER_TIMEOUT`]).
 pub fn configure_stream(stream: &TcpStream) {
     stream.set_nodelay(true).ok();
     let sock = socket2::SockRef::from(stream);
@@ -73,6 +82,8 @@ pub fn configure_stream(stream: &TcpStream) {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
     let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
     let _ = sock.set_tcp_keepalive(&keepalive);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = sock.set_tcp_user_timeout(Some(USER_TIMEOUT));
 }
 
 /// Bidirectional proxy with 64 KiB buffers and a 5-minute idle timeout.
@@ -183,6 +194,7 @@ mod tests {
         assert_eq!(sock.keepalive_time().unwrap(), KEEPALIVE_TIME);
         assert_eq!(sock.keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
         assert_eq!(sock.keepalive_retries().unwrap(), KEEPALIVE_RETRIES);
+        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(USER_TIMEOUT), "and with data waiting");
     }
     use tokio::io::{duplex, DuplexStream};
     use tokio::time::Instant;

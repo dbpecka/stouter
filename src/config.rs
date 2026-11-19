@@ -472,9 +472,13 @@ impl DynamicConfig {
         // the node list), or it would never reach the rest of the cluster.
         let size = rmp_serde::to_vec_named(self).map_or(usize::MAX, |bytes| bytes.len());
         if size > MAX_CONFIG_BYTES {
+            // No byte count: changes are refused only for problems they add
+            // (see `new_problem`), and with the size in it every change to a
+            // config already over the limit would read as a new problem,
+            // even one that shrinks it.
             report(format!(
-                "the config is too large to gossip: {size} bytes encoded, limit {MAX_CONFIG_BYTES} \
-                 (a signed config counts its signed copy too)"
+                "the config is too large to gossip: over the {MAX_CONFIG_BYTES}-byte limit encoded (a signed config \
+                 counts its signed copy too)"
             ));
         }
         problems
@@ -684,6 +688,11 @@ pub struct NodeInfo {
     /// through.
     #[serde(skip)]
     pub relays: Vec<String>,
+    /// Local-only: `addr` is where a relaying node reaches it (its record
+    /// says only a wildcard), not what it told us itself. Such an address
+    /// gives way to another relayer's while it doesn't work.
+    #[serde(skip)]
+    pub addr_relayed: bool,
     /// Local-only: what its signed record says of it (`NodeRecord::subscriber`).
     #[serde(skip)]
     pub subscriber: bool,
@@ -2162,6 +2171,11 @@ mod tests {
         huge.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_CONFIG_BYTES));
         let problem = new_problem(&dc, &huge).expect("refused");
         assert!(problem.contains("too large to gossip"), "{problem}");
+        // A config already over the limit (an older node brought it in) can
+        // still be changed, so it can be brought back under it.
+        let mut smaller = huge.clone();
+        smaller.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_CONFIG_BYTES - 10));
+        assert_eq!(new_problem(&huge, &smaller), None);
 
         let cfg = Config { reverse_pool_size: Some(5000), ..named() };
         assert!(cfg.validate().unwrap_err().to_string().contains("reversePoolSize"));

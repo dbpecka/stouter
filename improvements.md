@@ -84,8 +84,6 @@ service mesh. Grouped by area, not prioritized.
   setup on hosting nodes.
 - Per-route metrics once route rules exist (per-service request metrics exist
   for `http` services).
-- A metrics endpoint for pure `node`-mode daemons (only subscribers serve
-  `/metrics` today, so tunnel metrics recorded on nodes can't be scraped).
 - Service-topology endpoint / UI showing live nodes, services, and request flow.
 - `stouter tap` — live request sampler for debugging.
 
@@ -104,5 +102,3 @@ service mesh. Grouped by area, not prioritized.
 ## Next up
 1. **M5 — Workload identity + L7 authorization** — per-service identities in
    certs, enforced on hosting nodes.
-2. **A `/metrics` endpoint for `node`-mode daemons** — small, but tunnel
-   metrics recorded on nodes can't be scraped today.

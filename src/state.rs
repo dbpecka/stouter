@@ -104,6 +104,9 @@ struct Tombstone {
     /// A node forgotten for silence, as it was then: one with no address is
     /// let back in by a newer beat it signed (see `revive_with_beat`).
     forgotten: Option<NodeInfo>,
+    /// It signed its records: only a newer signed record of its own (or
+    /// direct contact) brings it back, never unsigned gossip about it.
+    signed: bool,
 }
 
 /// Whether an idle connection has been closed by its peer or is otherwise
@@ -155,6 +158,39 @@ impl Backoff {
     }
 }
 
+/// A [`StreamPool::take`] waiting on its key's notifier. The notifier is
+/// dropped from the pool with the last waiter on it (whether it got a
+/// connection, timed out or was cancelled): a peer asking a relay for made-up
+/// node ids would otherwise leave an entry for each, forever.
+struct Waiter<'a> {
+    notifiers: &'a Mutex<HashMap<String, Arc<Notify>>>,
+    key: &'a str,
+    notify: Option<Arc<Notify>>,
+}
+
+impl<'a> Waiter<'a> {
+    fn new(notifiers: &'a Mutex<HashMap<String, Arc<Notify>>>, key: &'a str) -> Self {
+        let notify = notifiers.lock().unwrap().entry(key.to_string()).or_insert_with(|| Arc::new(Notify::new())).clone();
+        Self { notifiers, key, notify: Some(notify) }
+    }
+
+    fn notify(&self) -> &Notify {
+        self.notify.as_deref().expect("held until dropped")
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut notifiers = self.notifiers.lock().unwrap();
+        // Let go of ours under the lock, so of waiters finishing together
+        // the last one sees it is the last.
+        drop(self.notify.take());
+        if notifiers.get(self.key).is_some_and(|n| Arc::strong_count(n) == 1) {
+            notifiers.remove(self.key);
+        }
+    }
+}
+
 /// Pool of idle connections keyed by a string identifier.
 ///
 /// Generic over the stream type so it can hold either plain `TcpStream`s or
@@ -193,16 +229,10 @@ impl<T: Send + tokio::io::AsyncRead + Unpin> StreamPool<T> {
     /// Take a connection, waiting up to `timeout` for one to become available.
     pub async fn take(&self, key: &str, timeout: Duration) -> Option<T> {
         let deadline = Instant::now() + timeout;
+        let waiter = Waiter::new(&self.notifiers, key);
 
         loop {
-            let notify = {
-                let mut notifiers = self.notifiers.lock().unwrap();
-                notifiers
-                    .entry(key.to_string())
-                    .or_insert_with(|| Arc::new(Notify::new()))
-                    .clone()
-            };
-            let notified = notify.notified();
+            let notified = waiter.notify().notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
@@ -415,6 +445,10 @@ pub struct SharedState {
     /// Sync connections peers kept open after the last round, by address
     /// (see `gossip::sync_with_peer`).
     pub(crate) gossip_conns: Mutex<HashMap<String, MeshStream>>,
+    /// Addresses a sync found ourselves at (our certificate answered): with
+    /// a wildcard bind, a shared `knownNodes` list can name our own address
+    /// in a form we can't otherwise tell is ours.
+    pub(crate) own_addrs: Mutex<std::collections::HashSet<String>>,
     /// Whether the cap on unsigned-only nodes was reported (once).
     pub(crate) unsigned_cap_warned: std::sync::atomic::AtomicBool,
     /// The record this node last gossiped about itself, reused while fresh.
@@ -496,6 +530,7 @@ impl SharedState {
             forgotten: Mutex::new(HashMap::new()),
             sync_backoff: Mutex::new(Backoff::new(SYNC_BACKOFF_BASE, SYNC_BACKOFF_MAX)),
             gossip_conns: Mutex::new(HashMap::new()),
+            own_addrs: Mutex::new(std::collections::HashSet::new()),
             unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
@@ -617,11 +652,27 @@ impl SharedState {
     /// may not change for a long time, so only a newer beat can show it.
     pub fn bury_forgotten(&self, node: &NodeInfo) {
         self.bury(&node.id, node.heartbeat);
-        if node.signed.is_some() && node.addr.is_empty() {
+        if node.signed.is_some() {
             if let Some(tomb) = self.departed.lock().unwrap().get_mut(&node.id) {
-                tomb.forgotten = Some(node.clone());
+                tomb.signed = true;
+                if node.addr.is_empty() {
+                    tomb.forgotten = Some(node.clone());
+                }
             }
         }
+    }
+
+    /// Note that `id`, just buried, signed its records (see
+    /// [`Tombstone::signed`]).
+    pub fn mark_buried_signed(&self, id: &str) {
+        if let Some(tomb) = self.departed.lock().unwrap().get_mut(id) {
+            tomb.signed = true;
+        }
+    }
+
+    /// Whether `id` is buried, and signed its records when it was here.
+    pub fn buried_signed(&self, id: &str) -> bool {
+        self.departed.lock().unwrap().get(id).is_some_and(|t| t.signed && t.at.elapsed() < TOMBSTONE_TTL)
     }
 
     /// For a node buried by [`Self::bury_forgotten`]: its last heartbeat
@@ -652,9 +703,10 @@ impl SharedState {
         departed.retain(|_, t| t.at.elapsed() < TOMBSTONE_TTL);
         let tomb = departed
             .entry(id.to_string())
-            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now(), record: None, forgotten: None });
+            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now(), record: None, forgotten: None, signed: false });
         tomb.heartbeat = tomb.heartbeat.max(heartbeat);
         tomb.at = std::time::Instant::now();
+        tomb.signed |= record.is_some();
         if let Some(record) = record {
             if tomb.record.as_ref().is_none_or(|(held, _)| record.0 > *held) {
                 tomb.record = Some(record);
@@ -888,6 +940,36 @@ mod tests {
         drop(dead_peer);
         assert_eq!(pool.prune(), 1);
         assert_eq!(pool.count("n"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_made_up_keys_leaves_nothing_behind() {
+        let pool: Arc<StreamPool<tokio::io::DuplexStream>> = Arc::new(StreamPool::new());
+        for i in 0..200 {
+            assert!(pool.take(&format!("made-up-{i}"), Duration::from_millis(1)).await.is_none());
+        }
+        // Cancelled waits too.
+        let _ = tokio::time::timeout(Duration::from_millis(5), pool.take("cancelled", Duration::from_secs(60))).await;
+        assert!(pool.notifiers.lock().unwrap().is_empty());
+
+        // Waiters still get what is pushed, and the last one out clears up.
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.take("n", Duration::from_secs(5)).await.is_some() })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut peers = Vec::new();
+        for _ in 0..3 {
+            let (conn, peer) = tokio::io::duplex(64);
+            peers.push(peer);
+            pool.push("n".into(), conn);
+        }
+        for waiter in waiters {
+            assert!(waiter.await.unwrap());
+        }
+        assert!(pool.notifiers.lock().unwrap().is_empty());
     }
 
     use super::test_support::tls_state;
