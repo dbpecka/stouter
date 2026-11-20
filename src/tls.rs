@@ -238,7 +238,9 @@ impl Revocations {
     /// Whether certificate `cert` (hex DER, as signed records carry it) is
     /// revoked. One that isn't hex couldn't have verified: not revoked.
     pub fn cert_hex_revoked(&self, cert: &str) -> bool {
-        if !cert.len().is_multiple_of(2) {
+        // Checked for every beat in every sync: nothing to decode for while
+        // nothing is revoked.
+        if self.is_empty() || !cert.len().is_multiple_of(2) {
             return false;
         }
         let der: Option<Vec<u8>> = (0..cert.len()).step_by(2).map(|i| u8::from_str_radix(cert.get(i..i + 2)?, 16).ok()).collect();
@@ -247,12 +249,16 @@ impl Revocations {
 
     /// Whether certificate `cert` (DER) is revoked.
     pub fn cert_revoked(&self, cert: &[u8]) -> bool {
-        let list = self.list.load();
-        if list.nodes.is_empty() && list.certs.is_empty() {
+        if self.is_empty() {
             return false;
         }
         let cn = cert_cn(&CertificateDer::from(cert));
         self.is_revoked(cn.as_deref(), &fingerprint(cert))
+    }
+
+    fn is_empty(&self) -> bool {
+        let list = self.list.load();
+        list.nodes.is_empty() && list.certs.is_empty()
     }
 
     fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
