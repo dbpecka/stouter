@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::{info, warn};
+use tracing::info;
 
 /// The fixed DNS SAN stamped into every node cert so WebPki hostname
 /// verification can be used without per-node cert customisation.
@@ -179,7 +179,7 @@ fn warn_if_readable_by_others(path: &Path) {
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
-                warn!(
+                tracing::warn!(
                     "{} is readable by other users (mode {mode:03o}); restrict it with `chmod 600 {}`",
                     path.display(),
                     path.display()

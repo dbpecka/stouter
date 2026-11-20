@@ -326,7 +326,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn span(parent: Option<&str>) -> SpanRecord {
-        let start = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789);
+        // A whole number of 100ns: Windows keeps time no finer.
+        let start = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_700);
         SpanRecord {
             trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
             span_id: "00f067aa0ba902b7".into(),
@@ -361,12 +362,12 @@ mod tests {
         assert_eq!(s["spanId"], "00f067aa0ba902b7");
         assert_eq!(s["parentSpanId"], "aaaaaaaaaaaaaaaa");
         assert_eq!(s["kind"], 3);
-        assert_eq!(s["startTimeUnixNano"], "1700000000123456789");
-        assert_eq!(s["endTimeUnixNano"], "1700000000128456789");
+        assert_eq!(s["startTimeUnixNano"], "1700000000123456700");
+        assert_eq!(s["endTimeUnixNano"], "1700000000128456700");
         assert_eq!(s["attributes"][1], json!({"key": "http.response.status_code", "value": {"intValue": "200"}}));
         assert_eq!(s["status"], json!({}));
         assert_eq!(s["events"][0]["name"], "retry");
-        assert_eq!(s["events"][0]["timeUnixNano"], "1700000000124456789");
+        assert_eq!(s["events"][0]["timeUnixNano"], "1700000000124456700");
     }
 
     #[test]
