@@ -502,6 +502,15 @@ impl SharedState {
         let bootstrap_peers = config.known_nodes.clone();
         let service_index = build_service_index(&dynamic_config);
         let routes = build_route_index(&dynamic_config);
+        if let Some(tls) = &tls {
+            tls.revocations().set(&dynamic_config.revoked);
+            if tls.own_cert_revoked() {
+                tracing::error!(
+                    "this node's own certificate is revoked (the config's revoked list): peers will refuse it. \
+                     Issue it a new certificate (`stouter cert issue`), or unrevoke it"
+                );
+            }
+        }
 
         Arc::new(Self {
             config: Arc::new(config),
@@ -603,8 +612,64 @@ impl SharedState {
     }
 
     pub async fn rebuild_service_index(&self) {
-        let dc = self.dynamic_config.read().await;
-        self.index_config(&dc);
+        {
+            let dc = self.dynamic_config.read().await;
+            self.index_config(&dc);
+        }
+        self.forget_revoked_nodes().await;
+    }
+
+    /// Take `dc`'s revocation list (see [`crate::tls::Revocations`]). If it
+    /// changed, close the idle connections it now refuses; busy ones fail
+    /// at their next read or write, and new ones fail their handshake.
+    fn apply_revocations(&self, dc: &DynamicConfig) {
+        let Some(tls) = &self.tls else { return };
+        if !tls.revocations().set(&dc.revoked) {
+            return;
+        }
+        tracing::info!(
+            "revoked certificates: {} node name(s) {:?}, {} single certificate(s)",
+            dc.revoked.nodes.len(),
+            dc.revoked.nodes,
+            dc.revoked.certs.len()
+        );
+        if tls.own_cert_revoked() {
+            tracing::error!(
+                "this node's own certificate is revoked: peers refuse its connections and what it signs. Issue it \
+                 a new certificate (`stouter cert issue`), or unrevoke it"
+            );
+        }
+        self.tunnel_pool.prune();
+        self.reverse_pool.prune();
+        self.gossip_conns.lock().unwrap().retain(|_, stream| !stream.peer_revoked());
+        self.mux_pool.drop_revoked(tls.revocations());
+    }
+
+    /// Forget known nodes whose certificate (or name) is revoked, burying
+    /// them so gossip doesn't bring them back. A node revoked by
+    /// certificate alone comes back with a newer record on a new one.
+    pub async fn forget_revoked_nodes(&self) {
+        let Some(tls) = &self.tls else { return };
+        let revocations = tls.revocations();
+        let revoked = |n: &NodeInfo| {
+            revocations.name_revoked(&n.id) || n.signed.as_ref().is_some_and(|s| revocations.cert_hex_revoked(&s.cert))
+        };
+        if !self.known_nodes.load().values().any(revoked) {
+            return;
+        }
+        let gone: Vec<NodeInfo> = self
+            .update_known_nodes(|kn| {
+                let ids: Vec<String> = kn.values().filter(|n| revoked(n)).map(|n| n.id.clone()).collect();
+                ids.iter().filter_map(|id| kn.remove(id)).collect()
+            })
+            .await;
+        for node in gone {
+            tracing::warn!("node {}: its certificate is revoked; forgetting it", node.id);
+            self.bury_with(&node.id, node.heartbeat.max(node.record_version), None);
+            if node.signed.is_some() {
+                self.mark_buried_signed(&node.id);
+            }
+        }
     }
 
     /// Rebuild the service and route indexes from `dc`, now: called with
@@ -614,6 +679,7 @@ impl SharedState {
     pub fn index_config(&self, dc: &DynamicConfig) {
         self.service_index.store(Arc::new(build_service_index(dc)));
         self.routes.store(Arc::new(build_route_index(dc)));
+        self.apply_revocations(dc);
     }
 
     /// Whether `node_id` reports `service_name` as failing its health check.
@@ -972,7 +1038,84 @@ mod tests {
         assert!(pool.notifiers.lock().unwrap().is_empty());
     }
 
-    use super::test_support::tls_state;
+    /// `state` takes a config revoking `nodes` and `certs`, as when one arrives.
+    async fn revoke(state: &SharedState, nodes: &[&str], certs: &[String]) {
+        let mut dc = state.dynamic_config.read().await.clone();
+        dc.revoked = crate::config::Revoked { nodes: nodes.iter().map(|n| n.to_string()).collect(), certs: certs.to_vec() };
+        state.index_config(&dc);
+        *state.dynamic_config.write().await = dc;
+    }
+
+    /// Whether `client` can open an mTLS connection to `server`, as both see it.
+    async fn connects(client: &SharedState, server: &SharedState) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (c, s) = tokio::join!(
+            async {
+                let mut stream = client.tls_connect(TcpStream::connect(addr).await.unwrap()).await?;
+                // TLS 1.3: the server checks the client's certificate after
+                // the client is done; a refusal shows on the next read.
+                stream.write_all(b"?").await?;
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                anyhow::Ok(())
+            },
+            async {
+                let mut stream = server.tls_accept(listener.accept().await.unwrap().0).await?;
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                stream.write_all(b"!").await?;
+                anyhow::Ok(())
+            },
+        );
+        c.is_ok() && s.is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_revoked_certificate_is_refused_both_ways_and_cut_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("stouter_revoke_{}_{}", std::process::id(), rand::random::<u64>()));
+        let (a, b, c) = (tls_state(&dir, "a"), tls_state(&dir, "b"), tls_state(&dir, "c"));
+        assert!(connects(&b, &a).await && connects(&a, &b).await);
+
+        // Connections b has open with a: in use, idle in a's pool, kept for gossip.
+        let (_b_end, mut in_use) = mesh_pair(&b, &a).await;
+        let (_b_idle, idle) = mesh_pair(&b, &a).await;
+        a.tunnel_pool.push("b:1".into(), idle);
+        let (kept, _b_kept) = mesh_pair(&a, &b).await;
+        a.gossip_conns.lock().unwrap().insert("b:1".into(), kept);
+
+        revoke(&a, &["b"], &[]).await;
+        assert!(!connects(&b, &a).await, "b's certificate is refused as a client");
+        assert!(!connects(&a, &b).await, "and as a server");
+        assert!(connects(&c, &a).await, "others aren't affected");
+        let mut byte = [0u8; 1];
+        assert!(in_use.write_all(b"x").await.is_err(), "an open connection carries nothing more");
+        assert!(in_use.read(&mut byte).await.is_err());
+        assert_eq!(a.tunnel_pool.count("b:1"), 0, "idle ones are dropped");
+        assert!(a.gossip_conns.lock().unwrap().is_empty());
+
+        // By certificate: that one only; the node can be issued a new one.
+        revoke(&a, &[], &[]).await;
+        assert!(connects(&b, &a).await, "unrevoked");
+        let (c_end, _) = mesh_pair(&c, &a).await;
+        let c_cert = crate::tls::fingerprint(c.tls.as_ref().unwrap().own_cert_der());
+        let hex: String = c_cert.iter().map(|b| format!("{b:02x}")).collect();
+        drop(c_end);
+        revoke(&a, &[], &[hex]).await;
+        assert!(!connects(&c, &a).await);
+        let reissued = tls_state(&dir, "c");
+        assert!(connects(&reissued, &a).await, "a new certificate for c is accepted");
+
+        // Revoking a node's own certificate doesn't stop it, but it is told.
+        assert!(!a.tls.as_ref().unwrap().own_cert_revoked());
+        revoke(&a, &["a"], &[]).await;
+        assert!(a.tls.as_ref().unwrap().own_cert_revoked());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use super::test_support::{mesh_pair, tls_state};
 
     #[tokio::test]
     async fn connect_mesh_requires_the_expected_node() {

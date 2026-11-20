@@ -1469,6 +1469,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "aws-lc-rs",
  "axum",
  "bytes",
  "clap",

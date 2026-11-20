@@ -69,7 +69,7 @@ jobs:
       - run: cargo build --locked --all-targets
 
   e2e:
-    name: End-to-end (caps, multi-host)
+    name: End-to-end (caps, multi-host, revocation)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -83,6 +83,8 @@ jobs:
         run: tests/e2e/caps.sh target/debug/stouter
       - name: Wildcard-bound nodes on separate hosts (network namespaces)
         run: sudo tests/e2e/multihost.sh target/debug/stouter
+      - name: Revoking a node's certificate reaches the cluster
+        run: tests/e2e/revoke.sh target/debug/stouter
 
   docker:
     name: End-to-end (deploy.sh, docker stop)

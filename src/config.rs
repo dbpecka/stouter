@@ -276,11 +276,47 @@ pub struct DynamicConfig {
     /// every node (see [`DynamicConfig::supersedes`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub changed_by: String,
+    /// Certificates no node accepts any more, for anything: connections,
+    /// node records and beats, config signatures (see
+    /// `crate::tls::Revocations`).
+    #[serde(default, skip_serializing_if = "Revoked::is_empty")]
+    pub revoked: Revoked,
     /// An admin's signature over this config, when it has one. Nodes with
     /// `requireSignedConfig` accept a change only if it is signed (see
     /// `crate::signing`); everyone else keeps and relays it as is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<ConfigSignature>,
+}
+
+/// Revoked certificates (see [`DynamicConfig::revoked`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Revoked {
+    /// Names (certificate CNs) no certificate is accepted for, whoever
+    /// issued it when: for a node removed for good.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// SHA-256 fingerprints (lowercase hex) of single certificates: for a
+    /// key that leaked. The node can be issued a new certificate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certs: Vec<String>,
+}
+
+impl Revoked {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.certs.is_empty()
+    }
+}
+
+/// `text` as a certificate fingerprint: 64 hex digits, any case, with or
+/// without `:` between bytes (as `openssl x509 -fingerprint -sha256`
+/// prints them). Returns it in lowercase without separators.
+pub fn normalize_fingerprint(text: &str) -> std::result::Result<String, String> {
+    let hex: String = text.chars().filter(|c| *c != ':').collect::<String>().to_ascii_lowercase();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("'{text}' is not a SHA-256 certificate fingerprint (64 hex digits)"));
+    }
+    Ok(hex)
 }
 
 /// An admin's signature over a [`DynamicConfig`].
@@ -468,6 +504,19 @@ impl DynamicConfig {
             }
         }
 
+        for node in &self.revoked.nodes {
+            if node.is_empty() || node.contains(':') {
+                report(format!("revoked node name '{node}' is not a node name"));
+            }
+        }
+        for cert in &self.revoked.certs {
+            match normalize_fingerprint(cert) {
+                Ok(normal) if normal == *cert => {}
+                Ok(normal) => report(format!("revoked certificate '{cert}' must be written as {normal}")),
+                Err(e) => report(format!("revoked certificate: {e}")),
+            }
+        }
+
         // It must fit in the gossip messages that carry it (with room for
         // the node list), or it would never reach the rest of the cluster.
         let size = rmp_serde::to_vec_named(self).map_or(usize::MAX, |bytes| bytes.len());
@@ -551,6 +600,48 @@ impl DynamicConfig {
             return Err(format!("routes for '{service}' require every instance to have protocol: http"));
         }
         Ok(())
+    }
+
+    /// Revoke `nodes` (every certificate for those names) and `certs`
+    /// (fingerprints, see [`normalize_fingerprint`]). Bumps `version` and
+    /// returns the new version; refused if all were revoked already.
+    pub fn revoke(&mut self, nodes: &[String], certs: &[String]) -> Result<u64, MutateErr> {
+        let certs = certs.iter().map(|c| normalize_fingerprint(c)).collect::<std::result::Result<Vec<_>, _>>().map_err(MutateErr::Invalid)?;
+        let mut added = false;
+        for node in nodes {
+            if node.is_empty() || node.contains(':') {
+                return Err(MutateErr::Invalid(format!("'{node}' is not a node name")));
+            }
+            if !self.revoked.nodes.contains(node) {
+                self.revoked.nodes.push(node.clone());
+                added = true;
+            }
+        }
+        for cert in certs {
+            if !self.revoked.certs.contains(&cert) {
+                self.revoked.certs.push(cert);
+                added = true;
+            }
+        }
+        if !added {
+            return Err(MutateErr::Invalid("already revoked".into()));
+        }
+        self.version += 1;
+        Ok(self.version)
+    }
+
+    /// Undo [`Self::revoke`] for `nodes` and `certs`. Bumps `version` and
+    /// returns the new version; refused if none of them was revoked.
+    pub fn unrevoke(&mut self, nodes: &[String], certs: &[String]) -> Result<u64, MutateErr> {
+        let certs = certs.iter().map(|c| normalize_fingerprint(c)).collect::<std::result::Result<Vec<_>, _>>().map_err(MutateErr::Invalid)?;
+        let before = self.revoked.clone();
+        self.revoked.nodes.retain(|n| !nodes.contains(n));
+        self.revoked.certs.retain(|c| !certs.contains(c));
+        if self.revoked == before {
+            return Err(MutateErr::Invalid("not revoked".into()));
+        }
+        self.version += 1;
+        Ok(self.version)
     }
 
     /// Replace all routes for `service` with `routes` (empty clears them).
@@ -1775,6 +1866,37 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("serviceGroups"));
         assert!(!json.contains("services"));
+    }
+
+    #[test]
+    fn revocations_are_config_edits_that_older_nodes_hash_alike() {
+        let fp = "ab".repeat(32);
+        let mut dc = DynamicConfig { version: 3, ..Default::default() };
+        // Nothing revoked: encoded exactly as before the field existed, so
+        // the config hashes the same on nodes that don't know it.
+        assert!(!serde_json::to_string(&dc).unwrap().contains("revoked"));
+
+        assert_eq!(dc.revoke(&["n1".into()], &[fp.to_uppercase()]).unwrap(), 4);
+        assert_eq!(dc.revoked, Revoked { nodes: vec!["n1".into()], certs: vec![fp.clone()] }, "fingerprints normalized");
+        assert!(dc.revoke(&["n1".into()], std::slice::from_ref(&fp)).is_err(), "already revoked");
+        assert!(dc.revoke(&["bad:name".into()], &[]).is_err());
+        assert!(dc.revoke(&[], &["not-hex".into()]).is_err());
+        assert_eq!(dc.version, 4, "refused edits change nothing");
+        let json = serde_json::to_value(&dc).unwrap();
+        assert_eq!(json["revoked"], serde_json::json!({"nodes": ["n1"], "certs": [fp]}));
+
+        assert_eq!(dc.unrevoke(&["n1".into()], &[]).unwrap(), 5);
+        assert!(dc.unrevoke(&["n1".into()], &[]).is_err(), "not revoked");
+        assert_eq!(dc.unrevoke(&[], std::slice::from_ref(&fp)).unwrap(), 6);
+        assert!(dc.revoked.is_empty());
+
+        // Hand-written entries are checked.
+        let hand: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [], "revoked": {"nodes": ["a:b"], "certs": [fp.to_uppercase(), "xyz"]},
+        }))
+        .unwrap();
+        let problems = hand.problems();
+        assert_eq!(problems.len(), 3, "{problems:?}");
     }
 
     #[test]

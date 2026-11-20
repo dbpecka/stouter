@@ -1055,6 +1055,11 @@ async fn merge_sync(
                 debug!("ignoring unsigned gossip about node {}", node.id);
                 continue;
             }
+            // Revoked by name: nothing about it is believed.
+            if state.tls.as_ref().is_some_and(|tls| tls.revocations().name_revoked(&node.id)) {
+                debug!("ignoring gossip about revoked node {}", node.id);
+                continue;
+            }
             // Only the node itself knows where it was reached from.
             if source.cn == Some(node.id.as_str()) {
                 if let Some(addr) = source.host.and_then(|host| rewrite_wildcard(&node.addr, host)) {
@@ -1482,7 +1487,8 @@ fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::con
                 .next()
         });
         let mut last_err = None;
-        for cert in held.iter().chain(received.iter()) {
+        // A record held from before its certificate was revoked vouches for nothing.
+        for cert in held.iter().chain(received.iter()).filter(|cert| !tls.revocations().cert_hex_revoked(cert)) {
             match crate::signing::verify_beat(beat, cert) {
                 Ok(()) => {
                     checked.beats.insert((beat.id.clone(), beat.beat, beat.signature.clone()));
@@ -3113,6 +3119,52 @@ mod tests {
         assert!(!dialable(&a, &addr), "its own address isn't dialled again");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(synced.load(std::sync::atomic::Ordering::SeqCst), 0, "no sync sent to itself");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn a_revoked_node_is_forgotten_and_gossip_cant_bring_it_back() {
+        let (dir, sub, x, _m) = signed_nodes_setup();
+        let revoke = |nodes: &[&str], certs: &[String]| {
+            let sub = sub.clone();
+            let revoked = crate::config::Revoked { nodes: nodes.iter().map(|n| n.to_string()).collect(), certs: certs.to_vec() };
+            async move {
+                let mut dc = sub.dynamic_config.read().await.clone();
+                dc.revoked = revoked;
+                sub.index_config(&dc);
+                *sub.dynamic_config.write().await = dc;
+                sub.rebuild_service_index().await;
+            }
+        };
+        let known = || sub.known_nodes.load().contains_key("x");
+        let from_m = SyncSource { cn: Some("m"), ..Default::default() };
+        merge_sync(&sub, None, vec![record("x", "x:1", 10, &x)], vec![], &SyncSource::default()).await;
+        assert!(known());
+
+        // Revoked by name: forgotten, and nothing about it is believed.
+        revoke(&["x"], &[]).await;
+        assert!(!known(), "forgotten");
+        merge_sync(&sub, None, vec![record("x", "x:1", 20, &x)], vec![], &from_m).await;
+        assert!(!known(), "not even a newer record it signed");
+        let unsigned = NodeInfo { id: "x".into(), addr: "x:1".into(), heartbeat: 30, ..Default::default() };
+        merge_sync(&sub, None, vec![unsigned], vec![], &from_m).await;
+        assert!(!known(), "nor unsigned gossip");
+
+        // Unrevoked: back with its next record.
+        revoke(&[], &[]).await;
+        merge_sync(&sub, None, vec![record("x", "x:1", 40, &x)], vec![], &from_m).await;
+        assert!(known());
+
+        // Revoked by certificate: forgotten, and its beats count for nothing...
+        let cert = sub.known_nodes.load()["x"].signed.as_ref().unwrap().cert.clone();
+        let der: Vec<u8> = (0..cert.len()).step_by(2).map(|i| u8::from_str_radix(&cert[i..i + 2], 16).unwrap()).collect();
+        revoke(&[], &[crate::tls::fingerprint_hex(&der)]).await;
+        assert!(!known());
+        merge_sync(&sub, None, vec![record("x", "x:1", 50, &x)], vec![], &from_m).await;
+        assert!(!known(), "a record on the revoked certificate isn't believed");
+        // ...but a newer record on a new certificate for x is.
+        let reissued = crate::signing::Signer::from_material(&crate::pki::load_or_create(dir.to_str().unwrap(), "x").unwrap()).unwrap();
+        merge_sync(&sub, None, vec![record("x", "x:1", 60, &reissued)], vec![], &from_m).await;
+        assert!(known(), "back on a new certificate");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

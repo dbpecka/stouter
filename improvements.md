@@ -53,8 +53,8 @@ service mesh. Grouped by area, not prioritized.
   with `stouter route set|clear|list`.
 
 ## Security (identity & policy)
-- Certificate rotation without a restart, and revocation (a CRL or short-lived
-  certs) for removed nodes.
+- Certificate rotation without a restart, and short-lived certificates
+  (revocation exists: `stouter cert revoke`).
 - SPIFFE-style workload identity so services — not just nodes — are principals.
 - Authorization policies: "service A may call service B on path /x" (L7 RBAC).
 - Finer-grained admin RBAC (per-group or per-operation rather than one allowlist).

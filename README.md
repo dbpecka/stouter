@@ -116,6 +116,12 @@ stouter service list
 # Issue a signed node certificate (run on the CA node)
 stouter cert issue --node host2 --out /path/to/certs
 
+# Revoke a node's certificates: every one for a node removed for good, or
+# one certificate whose key leaked (see Revoking certificates)
+stouter cert revoke --node host2
+stouter cert revoke --cert /path/to/leaked/node.crt
+stouter cert revoked
+
 # Copy the cluster's dynamic config into the local file (to edit it by hand)
 stouter config pull --remote host1:8080
 
@@ -238,6 +244,44 @@ Private keys (`ca.key`, and the `node.key` written by `cert issue`) are created
 readable by their owner only (`0600`); stouter warns at startup if an existing
 key is readable by other users.
 
+#### Revoking certificates
+
+A certificate from the cluster CA is otherwise trusted until it expires (10
+years for a node's). Revoke one when a node is removed for good or a key
+leaks:
+
+```sh
+# Every certificate for a node name, issued before or after: a node removed for good
+stouter cert revoke --node host2
+# One certificate, by its file or fingerprint: a key that leaked. The node
+# can be issued a new certificate (`cert issue`) and carry on.
+stouter cert revoke --cert /path/to/node.crt
+stouter cert revoke --fingerprint 3f:9a:...   # as `cert fingerprint` or `openssl x509 -fingerprint -sha256` prints it
+stouter cert revoked                          # list them
+stouter cert unrevoke --node host2            # undo
+```
+
+Revocations are part of the dynamic config (`revoked`: `nodes`, and `certs`
+as SHA-256 fingerprints), so they reach every node by gossip like any
+other change, and go through the daemon (`--remote`) or the local file like
+`service` commands. Every node then refuses a revoked certificate wherever it
+appears: in a TLS handshake (as client or server), in a node record or beat,
+and on a config signature. It closes idle connections with it, connections
+in use carry no more data, and it forgets a node whose certificate is
+revoked, so gossip can't bring it back. `cert issue` warns when the name is
+revoked, as the certificate would be refused everywhere.
+
+- With `requireSignedConfig`, a revocation is an admin-signed change like any
+  other, and a revoked admin's signature counts for nothing from then on. A
+  config that revokes the certificate that signed it is refused (another
+  admin must revoke it), and the CLI won't revoke the certificate it uses.
+  Without `requireSignedConfig`, any member can change the config, so any
+  member can revoke (or unrevoke) any other.
+- A node keeps running with its own certificate revoked, and logs an error:
+  its peers refuse it until it has a new certificate or is unrevoked.
+- Every node must run a version that knows revocations: an older one ignores
+  the list, and one relaying an unsigned config drops it.
+
 ### Docker
 
 ```sh
@@ -271,13 +315,14 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 | Script | Checks | Needs |
 |--------|--------|-------|
 | `caps.sh BINARY` | Per-peer connection caps under load, and that stalled handshakes from several addresses can't lock peers out | python3 |
+| `revoke.sh BINARY` | `cert revoke --node` through one daemon reaches the others: every node forgets the node and refuses it; `cert unrevoke` lets it back | |
 | `multihost.sh BINARY` | Nodes on separate hosts (network namespaces), all bound to `0.0.0.0`, find each other's real addresses and tunnel | root, iproute2, python3, curl |
 | `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
 | `deploy-host.sh [user@host]` | `deploy.sh` against a real host: the container runs and answers, a redeploy keeps the CA | ssh with keys, sudo and Docker on the host |
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, checks
 the build with Rust 1.88 (the Docker image's) and on macOS and Windows, and
-runs all four scripts, `deploy-host.sh` over ssh from the runner to itself.
+runs all five scripts, `deploy-host.sh` over ssh from the runner to itself.
 
 ---
 
@@ -590,7 +635,7 @@ To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessi
 - All node certs share the fixed SAN `stouter-node`, which allows standard WebPki hostname verification without per-node DNS configuration.
 - Servers require client certificates; clients verify server certificates. Both sides authenticate against the cluster CA.
 - A node's identity is its certificate's CN, which must match its `nodeId`. A tunnel to X, whether on a mux session, a pooled connection or a new one, must reach a server whose certificate names X (or, for a NAT'd X, a relay X signed for); a relay accepts reverse registrations for X only from X; only X may announce X joining or leaving; and only X's signature makes gossip about X believed (see [Gossip Protocol](#gossip-protocol)).
-- Certificates are valid from the day they are issued (backdated a day for clock skew): 20 years for a new CA, 10 years for a node certificate, never past the CA's own expiry.
+- Certificates are valid from the day they are issued (backdated a day for clock skew): 20 years for a new CA, 10 years for a node certificate, never past the CA's own expiry, unless revoked (see [Revoking certificates](#revoking-certificates)).
 - Tunnel requests include a millisecond timestamp. The receiving node rejects requests with clock skew greater than ±30 seconds, providing basic replay protection.
 
 ### Signed config changes

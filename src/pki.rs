@@ -296,6 +296,12 @@ fn load_issued(
 // PEM decode helpers
 // ---------------------------------------------------------------------------
 
+/// The (first) certificate in PEM file `path`.
+pub fn read_cert(path: &str) -> Result<CertificateDer<'static>> {
+    let pem = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    pem_to_der(&pem).with_context(|| path.to_string())
+}
+
 fn pem_to_der(pem: &str) -> Result<CertificateDer<'static>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
     let cert = rustls_pemfile::certs(&mut reader)

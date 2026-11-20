@@ -115,6 +115,71 @@ enum CertAction {
         #[arg(long, default_value = ".")]
         out: String,
     },
+    /// Revoke certificates: no node accepts them any more, for connections
+    /// or signatures, and connections already open with them fail
+    Revoke {
+        #[command(flatten)]
+        which: RevokeTargets,
+        /// Address `host:port` of the daemon to make the change through
+        /// (defaults to this host's daemon, else the config file).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Undo `cert revoke`
+    Unrevoke {
+        #[command(flatten)]
+        which: RevokeTargets,
+        /// Address `host:port` of the daemon to make the change through
+        /// (defaults to this host's daemon, else the config file).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// List revoked certificates
+    Revoked {
+        /// Address `host:port` of a daemon to ask (defaults to the config file).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Print a certificate file's SHA-256 fingerprint, as `cert revoke` takes it
+    Fingerprint {
+        /// Certificate file (PEM), such as a node's node.crt
+        path: String,
+    },
+}
+
+/// What `cert revoke` and `cert unrevoke` are about.
+#[derive(clap::Args)]
+struct RevokeTargets {
+    /// Every certificate for this node name, issued before or after: for a
+    /// node removed for good. Repeatable.
+    #[arg(long = "node")]
+    nodes: Vec<String>,
+    /// This certificate file (PEM) only: for a key that leaked, where the
+    /// node can be issued a new certificate. Repeatable.
+    #[arg(long = "cert")]
+    cert_files: Vec<String>,
+    /// A certificate by its SHA-256 fingerprint (see `cert fingerprint`),
+    /// instead of its file. Repeatable.
+    #[arg(long = "fingerprint")]
+    fingerprints: Vec<String>,
+}
+
+impl RevokeTargets {
+    /// The node names, and the fingerprints of the certificates (from files
+    /// or given), normalized.
+    fn resolve(&self) -> Result<(Vec<String>, Vec<String>)> {
+        if self.nodes.is_empty() && self.cert_files.is_empty() && self.fingerprints.is_empty() {
+            anyhow::bail!("name what to revoke: --node NAME, --cert FILE or --fingerprint HEX");
+        }
+        let mut certs = Vec::new();
+        for path in &self.cert_files {
+            certs.push(tls::fingerprint_hex(pki::read_cert(path)?.as_ref()));
+        }
+        for fp in &self.fingerprints {
+            certs.push(config::normalize_fingerprint(fp).map_err(anyhow::Error::msg)?);
+        }
+        Ok((self.nodes.clone(), certs))
+    }
 }
 
 #[derive(Subcommand)]
@@ -1055,8 +1120,80 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("tlsDir is not set in {}", cli.config)
             })?;
             pki::issue_cert_to_dir(tls_dir, &node, &out)?;
+            let cert = pki::read_cert(&format!("{out}/node.crt"))?;
             println!("Certificate for '{}' written to {}/", node, out);
+            println!("SHA-256 fingerprint: {}", tls::fingerprint_hex(cert.as_ref()));
             println!("Copy ca.crt, node.crt, and node.key to the node's tlsDir.");
+            if cfg.dynamic_config.revoked.nodes.contains(&node) {
+                eprintln!(
+                    "warning: node name '{node}' is revoked, so no node accepts this certificate: \
+                     `stouter cert unrevoke --node {node}` first"
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // cert revoke / unrevoke
+        // -----------------------------------------------------------------
+        Some(Commands::Cert { action: action @ (CertAction::Revoke { .. } | CertAction::Unrevoke { .. }) }) => {
+            let (revoking, which, remote) = match action {
+                CertAction::Revoke { which, remote } => (true, which, remote),
+                CertAction::Unrevoke { which, remote } => (false, which, remote),
+                _ => unreachable!("matched above"),
+            };
+            let (nodes, certs) = which.resolve()?;
+            let local = Config::load_or_default(&cli.config)?;
+            if revoking {
+                refuse_revoking_own_cert(&local, cli.cert_dir.as_deref(), &nodes, &certs)?;
+            }
+            let op = if revoking {
+                AdminOp::Revoke { nodes: nodes.clone(), certs: certs.clone() }
+            } else {
+                AdminOp::Unrevoke { nodes: nodes.clone(), certs: certs.clone() }
+            };
+            let remote = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
+            let version = if let Some(target) = &remote {
+                run_admin_rpc(target, op, &local, cli.cert_dir.as_deref()).await?
+            } else {
+                let mut cfg = Config::load(&cli.config)?;
+                let before = cfg.dynamic_config.clone();
+                let version = op.apply(&mut cfg.dynamic_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
+                broadcast_config(&cfg, &cli.config).await?;
+                version
+            };
+            let what: Vec<String> =
+                nodes.iter().map(|n| format!("node '{n}'")).chain(certs.iter().map(|c| format!("certificate {c}"))).collect();
+            let verb = if revoking { "Revoked" } else { "Unrevoked" };
+            println!("{verb} {} (version {version})", what.join(", "));
+        }
+
+        // -----------------------------------------------------------------
+        // cert revoked
+        // -----------------------------------------------------------------
+        Some(Commands::Cert { action: CertAction::Revoked { remote } }) => {
+            let dc = if let Some(target) = remote {
+                let cfg = Config::load_or_default(&cli.config)?;
+                fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?
+            } else {
+                Config::load(&cli.config)?.dynamic_config
+            };
+            if dc.revoked.is_empty() {
+                println!("No revoked certificates (version {})", dc.version);
+            }
+            for node in &dc.revoked.nodes {
+                println!("node {node} (every certificate)");
+            }
+            for cert in &dc.revoked.certs {
+                println!("certificate {cert}");
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // cert fingerprint
+        // -----------------------------------------------------------------
+        Some(Commands::Cert { action: CertAction::Fingerprint { path } }) => {
+            println!("{}", tls::fingerprint_hex(pki::read_cert(&path)?.as_ref()));
         }
     }
 
@@ -1352,6 +1489,21 @@ fn trusted_config(
             if cfg.admin_cns.is_empty() { "none listed".to_string() } else { cfg.admin_cns.join(", ") }
         ))
     })
+}
+
+/// Refuse revoking the certificate this CLI uses: it would lock the CLI out,
+/// and in a signed cluster no node would take a config revoking its own
+/// signer (another admin must revoke it).
+fn refuse_revoking_own_cert(cfg: &Config, cert_dir: Option<&str>, nodes: &[String], certs: &[String]) -> Result<()> {
+    let Ok(material) = load_cli_material(cfg, cert_dir) else { return Ok(()) };
+    let cn = tls::cert_cn(&material.node_cert_der).unwrap_or_default();
+    let fp = tls::fingerprint_hex(material.node_cert_der.as_ref());
+    if nodes.contains(&cn) || certs.contains(&fp) {
+        anyhow::bail!(
+            "that revokes the certificate this CLI uses ('{cn}'): revoke it with another admin's certificate (--cert-dir)"
+        );
+    }
+    Ok(())
 }
 
 /// Whether the CLI treats the cluster as requiring admin-signed configs: if
@@ -1757,6 +1909,65 @@ mod tests {
         let tls_ctx = tls::TlsContext::new(&certs["admin"]).unwrap();
         let verified = trusted_config(&saved, &base, &certs["admin"], &tls_ctx).unwrap();
         assert_eq!((port_of(&verified), verified.version), (4000, 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_revoked_admin_signs_nothing_and_no_config_revokes_its_own_signer() {
+        let (dir, certs) = cluster_certs(&["admin", "other-admin"]);
+        let sign = |dc: &config::DynamicConfig, who: &str| {
+            signing::sign(dc, &signing::Signer::from_material(&certs[who]).unwrap()).unwrap()
+        };
+        let me = &certs["admin"];
+        let tls_ctx = tls::TlsContext::new(me).unwrap();
+        let admins = Config { admin_cns: vec!["admin".into(), "other-admin".into()], ..Config::default() };
+
+        // A config revoking the admin who signed it: refused.
+        let mut revoking_self = api_on_port(3000);
+        revoking_self.revoked.nodes.push("admin".into());
+        let err = trusted_config(&sign(&revoking_self, "admin"), &admins, me, &tls_ctx).expect_err("refused");
+        assert!(format!("{err:#}").contains("revokes the certificate that signed it"), "{err:#}");
+        // Another admin can revoke it.
+        assert!(trusted_config(&sign(&revoking_self, "other-admin"), &admins, me, &tls_ctx).is_ok());
+        // By certificate too.
+        let mut by_cert = api_on_port(3000);
+        by_cert.revoked.certs.push(tls::fingerprint_hex(certs["other-admin"].node_cert_der.as_ref()));
+        assert!(trusted_config(&sign(&by_cert, "other-admin"), &admins, me, &tls_ctx).is_err());
+
+        // Once revoked here, an admin's signature counts for nothing.
+        let theirs = sign(&api_on_port(4000), "other-admin");
+        assert!(trusted_config(&theirs, &admins, me, &tls_ctx).is_ok());
+        tls_ctx.revocations().set(&config::Revoked { nodes: vec!["other-admin".into()], certs: vec![] });
+        let err = trusted_config(&theirs, &admins, me, &tls_ctx).expect_err("revoked");
+        assert!(format!("{err:#}").contains("revoked") || format!("{err:#}").contains("Revoked"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cli_wont_revoke_its_own_certificate() {
+        let (dir, certs) = cluster_certs(&["admin"]);
+        let cert_dir = dir.join("admin");
+        let cert_dir = cert_dir.to_str();
+        let cfg = Config::default();
+        let mine = tls::fingerprint_hex(certs["admin"].node_cert_der.as_ref());
+        assert!(refuse_revoking_own_cert(&cfg, cert_dir, &["admin".into()], &[]).is_err());
+        assert!(refuse_revoking_own_cert(&cfg, cert_dir, &[], std::slice::from_ref(&mine)).is_err());
+        assert!(refuse_revoking_own_cert(&cfg, cert_dir, &["n1".into()], &[]).is_ok());
+
+        // What to revoke: names as given, certificates by fingerprint,
+        // from a file or written any common way.
+        let file = dir.join("admin/node.crt");
+        let colons: String = mine.as_bytes().chunks(2).map(|b| std::str::from_utf8(b).unwrap().to_uppercase()).collect::<Vec<_>>().join(":");
+        let targets = RevokeTargets {
+            nodes: vec!["n1".into()],
+            cert_files: vec![file.to_str().unwrap().into()],
+            fingerprints: vec![colons],
+        };
+        assert_eq!(targets.resolve().unwrap(), (vec!["n1".to_string()], vec![mine.clone(), mine]));
+        let nothing = RevokeTargets { nodes: vec![], cert_files: vec![], fingerprints: vec![] };
+        assert!(nothing.resolve().is_err());
+        let bad = RevokeTargets { nodes: vec![], cert_files: vec![], fingerprints: vec!["abc".into()] };
+        assert!(bad.resolve().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

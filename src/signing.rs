@@ -114,6 +114,12 @@ pub fn verify(dc: &DynamicConfig, tls: &TlsContext, admin_cns: &[String]) -> Res
         bail!("config version {} is signed by '{signer}', which is not in adminCns", dc.version);
     }
     let mut config: DynamicConfig = serde_json::from_str(&sig.config_json).context("decode signed config")?;
+    // A config revoking the certificate that signed it would leave nothing
+    // vouching for it: refused, rather than adopted as signed by no one.
+    let signer_fp = crate::tls::fingerprint_hex(&unhex(&sig.signer_cert).context("signer certificate")?);
+    if config.revoked.nodes.contains(&signer) || config.revoked.certs.contains(&signer_fp) {
+        bail!("config version {} revokes the certificate that signed it ('{signer}'): another admin must sign it", dc.version);
+    }
     config.signature = Some(sig.clone());
     Ok((config, signer))
 }

@@ -157,6 +157,21 @@ pub enum AdminOp {
         owner_node_id: String,
         name: String,
     },
+    /// Revoke certificates: every one for each of `nodes` (names), and each
+    /// of `certs` (SHA-256 fingerprints).
+    Revoke {
+        #[serde(default)]
+        nodes: Vec<String>,
+        #[serde(default)]
+        certs: Vec<String>,
+    },
+    /// Undo a `Revoke` of these.
+    Unrevoke {
+        #[serde(default)]
+        nodes: Vec<String>,
+        #[serde(default)]
+        certs: Vec<String>,
+    },
     /// Replace the whole config with `config`, which an admin computed and
     /// signed (required by daemons with `requireSignedConfig`). Refused with
     /// `Conflict` unless the daemon is still at `base_version`, the version
@@ -210,6 +225,8 @@ impl AdminOp {
                 dc.rename_service(&group, &owner_node_id, &from, &to)
             }
             AdminOp::ServiceRemove { group, owner_node_id, name } => dc.remove_service(&group, &owner_node_id, &name),
+            AdminOp::Revoke { nodes, certs } => dc.revoke(&nodes, &certs),
+            AdminOp::Unrevoke { nodes, certs } => dc.unrevoke(&nodes, &certs),
             AdminOp::ConfigPush { .. } => Err(MutateErr::Invalid("a pushed config is not an edit".into())),
         }
     }

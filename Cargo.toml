@@ -34,6 +34,8 @@ rustls-pemfile = "2"
 # Verifying config signatures (already rustls's own certificate verifier).
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 x509-parser = "0.16"
+# Certificate fingerprints (already rustls's crypto backend, same features).
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http = "1"

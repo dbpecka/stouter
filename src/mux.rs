@@ -45,6 +45,8 @@ pub struct MuxHandle {
     tx: mpsc::Sender<oneshot::Sender<StreamResult>>,
     /// The CN of the server's certificate: the node at the other end.
     peer: Option<String>,
+    /// That certificate's SHA-256 fingerprint.
+    peer_fingerprint: Option<[u8; 32]>,
     /// Until when new tunnels skip this session (see [`SATURATED_FOR`]).
     saturated_until: Arc<Mutex<Option<Instant>>>,
 }
@@ -151,6 +153,19 @@ impl MuxPool {
     /// Number of active sessions in the pool.
     pub fn session_count(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+
+    /// Drop the sessions with peers whose certificate is revoked. (Their
+    /// connections fail at the next read or write in any case.)
+    pub fn drop_revoked(&self, revocations: &crate::tls::Revocations) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, handle| match (&handle.peer_fingerprint, &handle.peer) {
+            (Some(fp), cn) => !revocations.is_revoked(cn.as_deref(), fp),
+            (None, Some(cn)) => !revocations.name_revoked(cn),
+            (None, None) => true,
+        });
+        before - sessions.len()
     }
 
     /// Drop the sessions for addresses `keep` rejects. A session still
@@ -304,6 +319,7 @@ pub async fn establish_mux_session(
         .context("send MuxTunnel")?;
 
     let peer = stream.peer_cn().map(str::to_string);
+    let peer_fingerprint = stream.peer_fingerprint();
 
     // Upgrade to yamux client mode.
     let compat = stream.compat();
@@ -318,7 +334,7 @@ pub async fn establish_mux_session(
         drive_client_connection(connection, rx, &addr_owned).await;
     });
 
-    Ok(MuxHandle { tx, peer, saturated_until: Arc::default() })
+    Ok(MuxHandle { tx, peer, peer_fingerprint, saturated_until: Arc::default() })
 }
 
 /// Background task that drives a yamux client connection.
@@ -430,10 +446,28 @@ mod tests {
     async fn a_session_serves_only_the_node_it_is_with() {
         let pool = MuxPool::new();
         let (tx, _rx) = mpsc::channel(1);
-        pool.insert("10.0.0.1:7000".into(), MuxHandle { tx, peer: Some("m".into()), saturated_until: Arc::default() });
+        pool.insert("10.0.0.1:7000".into(), MuxHandle { tx, peer: Some("m".into()), peer_fingerprint: None, saturated_until: Arc::default() });
         // Gossip may claim x is at m's address: x's tunnels still don't
         // ride m's session.
         assert!(pool.open_stream("10.0.0.1:7000", Some("x")).await.is_none());
         assert!(pool.contains("10.0.0.1:7000"), "the session itself is fine");
+    }
+    #[test]
+    fn sessions_with_revoked_peers_are_dropped() {
+        let pool = MuxPool::new();
+        // Each session's driver, here only the receiving end held open.
+        let mut drivers = Vec::new();
+        let mut handle = |peer: &str, fp: Option<[u8; 32]>| {
+            let (tx, rx) = mpsc::channel(1);
+            drivers.push(rx);
+            MuxHandle { tx, peer: Some(peer.into()), peer_fingerprint: fp, saturated_until: Arc::default() }
+        };
+        pool.insert("m:1".into(), handle("m", Some([1; 32])));
+        pool.insert("n:1".into(), handle("n", Some([2; 32])));
+        pool.insert("o:1".into(), handle("o", None));
+        let revocations = crate::tls::Revocations::default();
+        revocations.set(&crate::config::Revoked { nodes: vec!["o".into()], certs: vec!["02".repeat(32)] });
+        assert_eq!(pool.drop_revoked(&revocations), 2);
+        assert!(pool.contains("m:1") && !pool.contains("n:1") && !pool.contains("o:1"));
     }
 }
