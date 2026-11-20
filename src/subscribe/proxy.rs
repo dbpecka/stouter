@@ -25,11 +25,6 @@ const REVERSE_POOL_TIMEOUT: Duration = Duration::from_secs(5);
 /// before giving up. Bounds retry amplification during a hosting outage.
 pub(super) const MAX_TUNNEL_ATTEMPTS: usize = 3;
 
-/// A node not confirmed reachable within this window is treated as unhealthy
-/// and excluded from load balancing. The gossip sync loop probes every peer
-/// every 10s, so this tolerates roughly three missed cycles before ejection.
-const NODE_STALE_AFTER: Duration = Duration::from_secs(30);
-
 /// Run a local TCP proxy for a service, routing across all available nodes.
 ///
 /// Binds on `127.0.0.1:{port}` (a random port when `None`), sends the bound
@@ -65,11 +60,25 @@ pub async fn run_proxy(
     let http = proxies.get(&service_name);
     let balancer = http.balancer();
 
+    let what = format!("proxy for {service_name}");
+    let mut backoff = crate::io::AcceptBackoff::default();
     loop {
         // Stop accepting at shutdown; connections already accepted are
-        // tracked as in-flight and drained.
+        // tracked as in-flight and drained. A failed accept (such as no file
+        // descriptors left) is waited out, so the proxy keeps its port.
         let (client, _) = tokio::select! {
-            accepted = listener.accept() => accepted.context("proxy accept")?,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => {
+                    backoff.succeeded(&what);
+                    accepted
+                }
+                Err(e) => {
+                    if backoff.failed(&what, &e, &state.shutdown).await {
+                        continue;
+                    }
+                    return Ok(());
+                }
+            },
             _ = state.shutdown.cancelled() => return Ok(()),
         };
         client.set_nodelay(true).ok();
@@ -211,8 +220,11 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
         .iter()
         .filter(|((_, svc), _)| svc == service_name)
         .filter_map(|((node_id, _), svc)| {
-            kn.get(node_id).map(|node| Backend {
-                node: node.clone(),
+            // A node never lists itself among its peers, but an instance on
+            // this node (`nodeSubscribe`) is a backend too, reached directly.
+            let node = kn.get(node_id).cloned().or_else(|| own_node(state).filter(|own| own.id == *node_id))?;
+            Some(Backend {
+                node,
                 weight: svc.weight,
                 max_connections: svc.max_connections,
                 request_timeout: svc.request_timeout_ms.map(Duration::from_millis),
@@ -225,6 +237,18 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
     backends
 }
 
+/// This node, as a backend for services it hosts itself: only a
+/// `nodeSubscribe` node both hosts services and proxies them. It is live
+/// (it's us); its services' health comes from its own checker.
+pub(super) fn own_node(state: &SharedState) -> Option<NodeInfo> {
+    matches!(state.config.mode, crate::config::Mode::NodeSubscribe).then(|| NodeInfo {
+        id: state.config.node_id.clone(),
+        last_seen: Some(Instant::now()),
+        heard_at: Some(Instant::now()),
+        ..Default::default()
+    })
+}
+
 /// Drop nodes whose gossip liveness marker is stale, then nodes whose health
 /// check reports the service down.
 ///
@@ -233,11 +257,7 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
 /// so per-connection retry can still find a working backend.
 pub(super) fn prefer_healthy(backends: Vec<Backend>, service_name: &str, state: &SharedState) -> Vec<Backend> {
     let now = Instant::now();
-    let live = prefer(backends, |b| {
-        b.node
-            .last_seen
-            .is_some_and(|seen| now.duration_since(seen) <= NODE_STALE_AFTER)
-    });
+    let live = prefer(backends, |b| crate::state::node_is_live(&b.node, now));
     prefer(live, |b| !state.service_unhealthy(&b.node.id, service_name))
 }
 
@@ -266,18 +286,7 @@ async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
         .context("read tunnel status byte")?;
 
     if status[0] != 0x00 {
-        let mut len_buf = [0u8; 4];
-        stream
-            .read_exact(&mut len_buf)
-            .await
-            .context("read tunnel error length")?;
-        let err_len = u32::from_be_bytes(len_buf) as usize;
-        let mut err_bytes = vec![0u8; err_len];
-        stream
-            .read_exact(&mut err_bytes)
-            .await
-            .context("read tunnel error message")?;
-        let msg = String::from_utf8_lossy(&err_bytes);
+        let msg = crate::node::tunnel::read_tunnel_error(stream).await?;
         bail!("node rejected tunnel: {msg}");
     }
 
@@ -286,19 +295,15 @@ async fn send_and_check_tunnel<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// An established tunnel to a remote node, ready for proxying.
 pub(super) enum Tunnel {
-    /// A stream on a pooled yamux session.
-    Mux(Compat<yamux::Stream>),
+    /// A stream on a pooled yamux session, and a handle keeping that
+    /// session running while the stream is in use.
+    Mux(Compat<yamux::Stream>, #[allow(dead_code)] crate::mux::MuxHandle),
     /// A dedicated mTLS connection (boxed: a TLS stream is large).
     Mesh(Box<MeshStream>),
+    /// A service on this node itself (`nodeSubscribe`), reached directly.
+    Local(TcpStream),
 }
 
-/// Establish an authenticated tunnel to `service_name` on `node`.
-///
-/// Connection acquisition priority:
-/// 1. Mux pool (open stream on existing yamux session)
-/// 2. Reverse pool (instant check — free path to NAT'd nodes)
-/// 3. Reverse pool with wait (for NAT-only nodes with no address)
-/// 4. Cold TCP connect as last resort
 impl AsyncRead for Tunnel {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -306,8 +311,9 @@ impl AsyncRead for Tunnel {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_read(cx, buf),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -319,8 +325,9 @@ impl AsyncWrite for Tunnel {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_write(cx, buf),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -329,8 +336,9 @@ impl AsyncWrite for Tunnel {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_flush(cx),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -339,17 +347,95 @@ impl AsyncWrite for Tunnel {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Tunnel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Tunnel::Mux(s, _) => std::pin::Pin::new(s).poll_shutdown(cx),
             Tunnel::Mesh(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            Tunnel::Local(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
+
+/// Time allowed to set up a tunnel, from picking a connection to the node's
+/// answer. A node that stopped responding otherwise hangs the client for as
+/// long as TCP takes to give up (many minutes), and is never ejected. Above
+/// the relay's own wait for a reverse connection, so a relayed setup can
+/// report why it failed.
+const TUNNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) async fn establish_tunnel(
     node: &NodeInfo,
     service_name: String,
     state: &Arc<SharedState>,
 ) -> Result<Tunnel> {
+    tokio::time::timeout(TUNNEL_SETUP_TIMEOUT, establish_tunnel_untimed(node, service_name, state))
+        .await
+        .map_err(|_| anyhow::anyhow!("tunnel setup to node {} timed out", node.id))?
+}
+
+/// Where to connect for a tunnel to `node`, and the node whose certificate
+/// must answer there: the first of [`tunnel_routes`]. `None`: no address and
+/// no usable relay, so only a reverse connection the node holds to us can
+/// reach it.
+pub(crate) fn tunnel_route(node: &NodeInfo, state: &SharedState) -> Option<(String, Option<String>)> {
+    tunnel_routes(node, state).into_iter().next()
+}
+
+/// Every way to reach `node` for a tunnel, best first: where to connect, and
+/// the node whose certificate must answer there.
+///
+/// A node with an address is reached there, and only that node may answer:
+/// whoever else gossip says is at the address, a tunnel for `node` never
+/// goes to them. A NAT'd node that signs its record is reached only through
+/// the relays it lists there, live ones first, each ranked by rendezvous
+/// hashing on this subscriber, the node and the relay. Each subscriber sticks
+/// to one relay per node, while across subscribers and nodes the tunnels,
+/// and the reverse connections each node keeps at its relays, are used
+/// evenly; the others are tried if it fails. An older NAT'd node, known from
+/// unsigned gossip, through its gossiped relay.
+pub(crate) fn tunnel_routes(node: &NodeInfo, state: &SharedState) -> Vec<(String, Option<String>)> {
+    if !node.addr.is_empty() {
+        return vec![(node.addr.clone(), Some(node.id.clone()))];
+    }
+    if node.signed.is_some() {
+        let known = state.known_nodes.load();
+        let now = Instant::now();
+        let mut relays: Vec<&NodeInfo> = node
+            .relays
+            .iter()
+            .filter_map(|id| known.get(id))
+            .filter(|relay| !relay.addr.is_empty())
+            .collect();
+        let chooser = format!("{}\0{}", state.config.node_id, node.id);
+        relays.sort_by_key(|r| {
+            (
+                std::cmp::Reverse(crate::state::node_is_live(r, now)),
+                std::cmp::Reverse(crate::node::reverse::rendezvous_score(&chooser, &r.id)),
+            )
+        });
+        return relays.iter().map(|r| (r.addr.clone(), Some(r.id.clone()))).collect();
+    }
+    node.relay.iter().map(|relay| (relay.clone(), state.node_at(relay))).collect()
+}
+
+/// For a NAT'd node with several relays: the time to try each but the last
+/// before moving on to the next, within the one tunnel setup. A relay that
+/// went down, or whose host stopped answering, costs this much, not the
+/// client's tunnel (until gossip marks it stale, half a minute later).
+const RELAY_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn establish_tunnel_untimed(
+    node: &NodeInfo,
+    service_name: String,
+    state: &Arc<SharedState>,
+) -> Result<Tunnel> {
+    // Our own instance (a `nodeSubscribe` node): no tunnel needed.
+    if node.id == state.config.node_id {
+        let connect_start = Instant::now();
+        let stream = crate::node::tunnel::connect_local_service(&service_name, state).await.map_err(anyhow::Error::msg)?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "local")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Local(stream));
+    }
+
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time before Unix epoch")?
@@ -360,51 +446,82 @@ pub(super) async fn establish_tunnel(
         service_name,
         timestamp_ms,
     };
-
-    let connect_addr = node.relay.as_deref().unwrap_or(&node.addr);
     let connect_start = Instant::now();
 
-    // --- Try mux pool first (multiplexed yamux stream) ---
-    if !connect_addr.is_empty() {
-        if let Some(yamux_stream) = state.mux_pool.open_stream(connect_addr).await {
-            let mut compat = yamux_stream.compat();
-            send_and_check_tunnel(&mut compat, &msg).await?;
-            metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
-                .record(connect_start.elapsed().as_secs_f64());
-            return Ok(Tunnel::Mux(compat));
-        }
+    // A reverse connection the node holds to us: it registered it with its
+    // own certificate, so it is the right node.
+    if let Some(mut stream) = state.reverse_pool.try_take(&node.id) {
+        send_and_check_tunnel(&mut stream, &msg).await?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Mesh(Box::new(stream)));
     }
 
-    // --- Fallback: legacy single-connection path ---
-    let method;
-    let mut node_stream: MeshStream = if let Some(stream) = state.reverse_pool.try_take(&node.id) {
-        method = "reverse";
-        stream
-    } else if let Some(stream) = state.tunnel_pool.try_take(connect_addr) {
-        method = "pool";
-        stream
-    } else if connect_addr.is_empty() {
-        method = "reverse";
-        state
+    let routes = tunnel_routes(node, state);
+    if routes.is_empty() {
+        // No address and no usable relay: wait for the node to give us a
+        // reverse connection.
+        let mut stream = state
             .reverse_pool
             .take(&node.id, REVERSE_POOL_TIMEOUT)
             .await
-            .with_context(|| {
-                format!("node {} not reachable: no address and no reverse connections", node.id)
-            })?
-    } else {
-        method = "cold";
-        let tcp = TcpStream::connect(connect_addr)
-            .await
-            .with_context(|| format!("connect to {connect_addr}"))?;
-        tcp.set_nodelay(true).ok();
-        state
-            .tls_connect(tcp)
-            .await
-            .with_context(|| format!("TLS connect to {connect_addr}"))?
-    };
+            .with_context(|| format!("node {} not reachable: no address, relay or reverse connection", node.id))?;
+        send_and_check_tunnel(&mut stream, &msg).await?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Mesh(Box::new(stream)));
+    }
+    let mut last_err = None;
+    for (i, (addr, expect)) in routes.iter().enumerate() {
+        let attempt = tunnel_via(addr, expect.as_deref(), &msg, state, connect_start);
+        let result = if i + 1 < routes.len() {
+            tokio::time::timeout(RELAY_ROUTE_TIMEOUT, attempt)
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer through {addr} within {}s", RELAY_ROUTE_TIMEOUT.as_secs())))
+        } else {
+            attempt.await
+        };
+        match result {
+            Ok(tunnel) => return Ok(tunnel),
+            Err(e) => {
+                if i + 1 < routes.len() {
+                    tracing::debug!("tunnel to node {} through {addr} failed, trying its next relay: {e:#}", node.id);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one route"))
+}
 
-    send_and_check_tunnel(&mut node_stream, &msg).await?;
+/// A tunnel through `addr`, where `expect` (if given) must answer: on a mux
+/// session, else a warm pooled connection, else a new one.
+async fn tunnel_via(
+    addr: &str,
+    expect: Option<&str>,
+    msg: &Message,
+    state: &Arc<SharedState>,
+    connect_start: Instant,
+) -> Result<Tunnel> {
+    // A stream on a mux session, if it is with the node we must reach.
+    if let Some((yamux_stream, session)) = state.mux_pool.open_stream(addr, expect).await {
+        let mut compat = yamux_stream.compat();
+        send_and_check_tunnel(&mut compat, msg).await?;
+        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "mux")
+            .record(connect_start.elapsed().as_secs_f64());
+        return Ok(Tunnel::Mux(compat, session));
+    }
+
+    // A warm pooled connection to that node, else a new one.
+    let pooled = state
+        .tunnel_pool
+        .try_take(addr)
+        .filter(|stream| expect.is_none() || stream.peer_cn() == expect);
+    let (method, mut node_stream) = match pooled {
+        Some(stream) => ("pool", stream),
+        None => ("cold", state.connect_mesh(addr, expect).await?),
+    };
+    send_and_check_tunnel(&mut node_stream, msg).await?;
     metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => method)
         .record(connect_start.elapsed().as_secs_f64());
 
@@ -441,6 +558,7 @@ mod tests {
                 version: 1,
                 routes: vec![],
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
+                ..Default::default()
             },
             ..Config::default()
         };
@@ -459,6 +577,7 @@ mod tests {
                                 version: 1,
                                 unhealthy: unhealthy.iter().map(|s| s.to_string()).collect(),
                             },
+                            ..Default::default()
                         },
                     );
                 }
@@ -499,5 +618,180 @@ mod tests {
             unhealthy: vec!["api".into()],
         }));
         assert_eq!(ids(&find_service_nodes("api", &state)), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn tunnels_go_to_the_node_itself_or_a_relay_it_signed() {
+        let state = state_with(&[("r1", true, &[]), ("m", true, &[])]).await;
+        let signed = Some(crate::config::SignedNode {
+            record_json: String::new(),
+            cert: String::new(),
+            signature: String::new(),
+        });
+        // A direct node: its own address, and only it may answer there.
+        let direct = NodeInfo { id: "x".into(), addr: "x:1".into(), ..Default::default() };
+        assert_eq!(tunnel_route(&direct, &state), Some(("x:1".into(), Some("x".into()))));
+
+        // A signing NAT'd node: only through a relay it listed, whatever
+        // relay gossip claims for it.
+        let natd = NodeInfo {
+            id: "n".into(),
+            relays: vec!["r1".into()],
+            relay: Some("m:1".into()),
+            signed: signed.clone(),
+            ..Default::default()
+        };
+        assert_eq!(tunnel_route(&natd, &state), Some(("r1:1".into(), Some("r1".into()))));
+        let unlisted = NodeInfo { relays: vec!["nobody".into()], ..natd };
+        assert_eq!(tunnel_route(&unlisted, &state), None, "no usable relay: reverse connections only");
+
+        // An older, unsigned NAT'd node: its gossiped relay, as before.
+        let old = NodeInfo { id: "o".into(), relay: Some("m:1".into()), ..Default::default() };
+        assert_eq!(tunnel_route(&old, &state), Some(("m:1".into(), Some("m".into()))));
+    }
+
+    #[tokio::test]
+    async fn a_node_subscribe_node_reaches_its_own_instances_directly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut conn, _) = backend.accept().await.unwrap();
+            conn.write_all(b"from me").await.unwrap();
+        });
+        let dc: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "serviceGroups": [{"name": "g", "services": [{"name": "web", "nodeId": "me", "nodePort": port}]}],
+        }))
+        .unwrap();
+        let cfg = Config { node_id: "me".into(), mode: crate::config::Mode::NodeSubscribe, dynamic_config: dc, ..Config::default() };
+        let state = SharedState::new(cfg.clone(), String::new(), CancellationToken::new(), None);
+
+        // Our own instance is a backend (live), though we're not a peer of ours.
+        let backends = service_backends("web", &state);
+        assert_eq!(ids(&prefer_healthy(backends.clone(), "web", &state)), ["me"]);
+        // And reached straight at its port, no tunnel.
+        let mut tunnel = establish_tunnel(&backends[0].node, "web".into(), &state).await.unwrap();
+        assert!(matches!(tunnel, Tunnel::Local(_)));
+        let mut got = String::new();
+        tunnel.read_to_string(&mut got).await.unwrap();
+        assert_eq!(got, "from me");
+
+        // A plain subscriber hosts nothing itself: no such backend.
+        let plain = SharedState::new(Config { mode: crate::config::Mode::Subscribe, ..cfg }, String::new(), CancellationToken::new(), None);
+        assert!(service_backends("web", &plain).is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribers_spread_a_natd_nodes_tunnels_over_its_relays() {
+        let natd = NodeInfo {
+            id: "n".into(),
+            relays: vec!["r1".into(), "r2".into(), "r3".into()],
+            signed: Some(crate::config::SignedNode { record_json: String::new(), cert: String::new(), signature: String::new() }),
+            ..Default::default()
+        };
+        let mut used: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for sub in 0..60 {
+            let cfg = Config { node_id: format!("sub-{sub}"), ..Config::default() };
+            let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+            state
+                .update_known_nodes(|kn| {
+                    for r in &natd.relays {
+                        let relay = NodeInfo { id: r.clone(), addr: format!("{r}:1"), last_seen: Some(Instant::now()), ..Default::default() };
+                        kn.insert(r.clone(), relay);
+                    }
+                })
+                .await;
+            let (addr, expect) = tunnel_route(&natd, &state).unwrap();
+            // The same choice every time, so its warm connections stay put.
+            assert_eq!(tunnel_route(&natd, &state), Some((addr.clone(), expect.clone())));
+            *used.entry(addr.clone()).or_default() += 1;
+
+            // Once that relay stops being live, another is used.
+            let id = expect.unwrap();
+            state.update_known_nodes(|kn| kn.get_mut(&id).unwrap().last_seen = None).await;
+            assert_ne!(tunnel_route(&natd, &state).unwrap().0, addr);
+        }
+        // 60 subscribers over 3 relays: about 20 each, not all on one.
+        assert_eq!(used.len(), 3, "{used:?}");
+        assert!(used.values().all(|&n| (8..=32).contains(&n)), "{used:?}");
+    }
+    fn natd_with_relays(id: &str, relays: &[&str]) -> NodeInfo {
+        NodeInfo {
+            id: id.into(),
+            relays: relays.iter().map(|r| r.to_string()).collect(),
+            signed: Some(crate::config::SignedNode { record_json: String::new(), cert: String::new(), signature: String::new() }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn one_subscriber_spreads_natd_nodes_over_their_shared_relays() {
+        let state = state_with(&[("r1", true, &[]), ("r2", true, &[]), ("r3", true, &[])]).await;
+        let mut used: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for n in 0..30 {
+            let natd = natd_with_relays(&format!("n{n}"), &["r1", "r2", "r3"]);
+            let routes = tunnel_routes(&natd, &state);
+            assert_eq!(routes.len(), 3, "every relay, to fall back on");
+            *used.entry(routes[0].0.clone()).or_default() += 1;
+        }
+        assert_eq!(used.len(), 3, "not all through one relay: {used:?}");
+        assert!(used.values().all(|&n| (4..=18).contains(&n)), "{used:?}");
+
+        // A relay that isn't live goes last.
+        let natd = natd_with_relays("n0", &["r1", "r2", "r3"]);
+        let first = tunnel_routes(&natd, &state)[0].1.clone().unwrap();
+        state.update_known_nodes(|kn| kn.get_mut(&first).unwrap().last_seen = None).await;
+        let routes = tunnel_routes(&natd, &state);
+        assert_eq!(routes.last().unwrap().1.as_deref(), Some(first.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tunnel_falls_over_to_the_next_relay() {
+        use crate::state::test_support::tls_state;
+        let dir = std::env::temp_dir().join(format!("stouter_failover_{}_{}", std::process::id(), rand::random::<u64>()));
+        let sub = tls_state(&dir, "sub");
+        let natd = natd_with_relays("x", &["r1", "r2"]);
+        let relay = |id: &str| NodeInfo { id: id.into(), addr: format!("{id}:1"), last_seen: Some(Instant::now()), ..Default::default() };
+        sub.update_known_nodes(|kn| {
+            kn.insert("r1".into(), relay("r1"));
+            kn.insert("r2".into(), relay("r2"));
+        })
+        .await;
+        let (first, second) = match &tunnel_routes(&natd, &sub)[..] {
+            [a, b] => (a.1.clone().unwrap(), b.1.clone().unwrap()),
+            other => panic!("{other:?}"),
+        };
+
+        // The first relay is down (nothing listens); the second is up, and
+        // answers the tunnel request (as it would once X does).
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap().to_string();
+        let second_state = tls_state(&dir, &second);
+        tokio::spawn(async move {
+            let (tcp, _) = up.accept().await.unwrap();
+            let mut stream = second_state.tls_accept(tcp).await.unwrap();
+            let Ok(Message::TunnelRequest { node_id, .. }) = gossip::recv_message(&mut stream).await else { return };
+            assert_eq!(node_id, "x");
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&[0]).await.unwrap();
+            stream.write_all(b"via the second relay").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        sub.update_known_nodes(|kn| {
+            kn.get_mut(&first).unwrap().addr = dead.clone();
+            kn.get_mut(&second).unwrap().addr = up_addr.clone();
+        })
+        .await;
+
+        let started = Instant::now();
+        let mut tunnel = establish_tunnel(&natd, "api".into(), &sub).await.expect("through the second relay");
+        assert!(started.elapsed() < RELAY_ROUTE_TIMEOUT, "a refused relay costs no wait");
+        let mut got = String::new();
+        use tokio::io::AsyncReadExt;
+        tunnel.read_to_string(&mut got).await.unwrap();
+        assert_eq!(got, "via the second relay");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

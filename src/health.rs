@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -71,16 +71,6 @@ impl HealthTracker {
     }
 }
 
-/// Next report version: wall-clock milliseconds, forced strictly above the
-/// previous version so ordering holds even if the clock steps backwards.
-fn next_version(prev: u64) -> u64 {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    now_ms.max(prev + 1)
-}
-
 /// Background task: probe every service hosted on this node until shutdown.
 pub async fn run_health_checks(state: Arc<SharedState>) {
     let mut tracker = HealthTracker::default();
@@ -128,9 +118,10 @@ pub async fn run_health_checks(state: Arc<SharedState>) {
         }
 
         if changed {
-            let prev = state.local_health.load().version;
+            // Ordered like heartbeats, so a restarted node's reports always
+            // supersede the ones peers held from before, clock or no clock.
             state.local_health.store(Arc::new(ServiceHealth {
-                version: next_version(prev),
+                version: state.next_heartbeat(),
                 unhealthy: tracker.unhealthy(),
             }));
             // Push now rather than waiting for the next sync round.
@@ -215,14 +206,6 @@ mod tests {
         assert!(!t.retain(&["a".into()]));
         assert!(t.retain(&[]));
         assert!(t.unhealthy().is_empty());
-    }
-
-    #[test]
-    fn versions_strictly_increase() {
-        let v1 = next_version(0);
-        assert!(v1 > 0);
-        assert!(next_version(v1) > v1);
-        assert_eq!(next_version(u64::MAX - 1), u64::MAX);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,17 +12,198 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, DynamicConfig, NodeInfo, Route, Service, ServiceHealth};
 use crate::tls::{MeshStream, TlsContext};
 
+/// A node not confirmed reachable within this window is treated as unhealthy
+/// and excluded from load balancing (failing open if every node is). The
+/// gossip sync loop probes every peer every 10s, so this tolerates roughly
+/// three missed rounds.
+pub const NODE_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// Time allowed to open a mesh connection (TCP connect plus TLS handshake),
+/// and for an accepted one to finish its handshake. Without it, a peer that
+/// stopped answering (or a client that never handshakes) holds a task, and
+/// often a whole background loop, indefinitely.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A node with no sign of life (direct contact or a rising heartbeat) for
+/// this long is forgotten, so dead nodes don't linger forever.
+pub const NODE_EXPIRE_AFTER: Duration = Duration::from_secs(300);
+
+/// How long a departed (left or expired) node is remembered, so a stale
+/// copy still circulating in gossip can't bring it back.
+const TOMBSTONE_TTL: Duration = Duration::from_secs(1800);
+
+/// How long a node forgotten for silence keeps being retried at its last
+/// address. It may have been cut off rather than dead; when the network
+/// heals, this is how the two sides find each other again even if neither
+/// lists the other as a bootstrap peer.
+pub const RECONNECT_FOR: Duration = Duration::from_secs(24 * 3600);
+
+/// A relay counts as one this node uses while it holds a reverse
+/// connection there, or registered one this recently (connections are
+/// consumed by tunnels and replaced, so the count dips during bursts).
+const RELAY_GRACE: Duration = Duration::from_secs(30);
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// This process's incarnation: one above the previous process's (kept in
+/// `{config_path}.state`) and no lower than the current Unix time in
+/// seconds, which also puts it above heartbeats from versions that used the
+/// wall clock directly, or from before the state file existed. Saved back
+/// for the next start. If it can't be saved (a read-only directory), the
+/// clock alone orders restarts, as before.
+pub fn incarnation_for(config_path: &str) -> u64 {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct NodeStateFile {
+        incarnation: u64,
+    }
+    let path = format!("{config_path}.state");
+    let stored = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<NodeStateFile>(&text).ok())
+        .map_or(0, |state| state.incarnation);
+    let incarnation = stored.saturating_add(1).max(unix_seconds());
+    let saved = serde_json::to_vec(&NodeStateFile { incarnation })
+        .map_err(std::io::Error::other)
+        .and_then(|json| crate::config::write_atomic(std::path::Path::new(&path), &json));
+    if let Err(e) = saved {
+        tracing::info!(
+            "cannot save {path} ({e}): if this node restarts with its clock set back, peers may ignore it until the clock catches up"
+        );
+    }
+    incarnation
+}
+
+/// Whether `node` was confirmed reachable recently enough to route to.
+pub fn node_is_live(node: &NodeInfo, now: std::time::Instant) -> bool {
+    node.last_seen.is_some_and(|seen| now.saturating_duration_since(seen) <= NODE_STALE_AFTER)
+}
+
+/// Most forgotten nodes whose addresses are retried (see `forgotten_addrs`);
+/// past this the longest-forgotten is dropped.
+const MAX_FORGOTTEN: usize = 512;
+
+/// Backoff for a peer address that didn't answer a sync: from one sync
+/// round, doubling to a few minutes, so a dead peer (or a made-up one) costs
+/// a dial every few minutes rather than every round. A peer that syncs with
+/// us is tried again at once (see `gossip::handle_gossip_message`).
+pub const SYNC_BACKOFF_BASE: Duration = Duration::from_secs(10);
+pub const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(160);
+
+/// A node that left or was forgotten, and its last heartbeat then.
+struct Tombstone {
+    heartbeat: u64,
+    at: std::time::Instant,
+    /// The node's signed "left" record, when it said so itself: relayed
+    /// (see `departed_records`) so the departure reaches every node.
+    record: Option<(u64, crate::config::SignedNode)>,
+    /// A node forgotten for silence, as it was then: one with no address is
+    /// let back in by a newer beat it signed (see `revive_with_beat`).
+    forgotten: Option<NodeInfo>,
+    /// It signed its records: only a newer signed record of its own (or
+    /// direct contact) brings it back, never unsigned gossip about it.
+    signed: bool,
+}
+
+/// Whether an idle connection has been closed by its peer or is otherwise
+/// unusable: reading it without waiting gives EOF, an error, or data nobody
+/// asked for (an idle pooled connection carries none). Never blocks.
+pub fn idle_stream_closed<T: tokio::io::AsyncRead + Unpin>(stream: &mut T) -> bool {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut byte = [0u8; 1];
+    let mut buf = tokio::io::ReadBuf::new(&mut byte);
+    !std::pin::Pin::new(stream).poll_read(&mut cx, &mut buf).is_pending()
+}
+
+/// Per-key exponential backoff for reconnect loops: after each consecutive
+/// failure the next attempt for that key waits twice as long, from `base`
+/// up to `max`, with jitter so many callers don't retry in lockstep.
+pub struct Backoff {
+    base: Duration,
+    max: Duration,
+    keys: HashMap<String, (u32, Instant)>,
+}
+
+impl Backoff {
+    pub fn new(base: Duration, max: Duration) -> Self {
+        Self { base, max, keys: HashMap::new() }
+    }
+
+    /// Whether `key` may be tried at `now`.
+    pub fn ready(&self, key: &str, now: Instant) -> bool {
+        self.keys.get(key).is_none_or(|(_, next)| now >= *next)
+    }
+
+    /// Record a failure; returns how long until the next attempt.
+    pub fn failed(&mut self, key: &str, now: Instant) -> Duration {
+        let (failures, next) = self.keys.entry(key.to_string()).or_insert((0, now));
+        *failures += 1;
+        let wait = self.base.saturating_mul(1 << (*failures - 1).min(16)).min(self.max);
+        let wait = wait.mul_f64(rand::random_range(0.75..=1.0));
+        *next = now + wait;
+        wait
+    }
+
+    pub fn succeeded(&mut self, key: &str) {
+        self.keys.remove(key);
+    }
+
+    /// Drop state for keys `keep` rejects (e.g. peers no longer known).
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.keys.retain(|k, _| keep(k));
+    }
+}
+
+/// A [`StreamPool::take`] waiting on its key's notifier. The notifier is
+/// dropped from the pool with the last waiter on it (whether it got a
+/// connection, timed out or was cancelled): a peer asking a relay for made-up
+/// node ids would otherwise leave an entry for each, forever.
+struct Waiter<'a> {
+    notifiers: &'a Mutex<HashMap<String, Arc<Notify>>>,
+    key: &'a str,
+    notify: Option<Arc<Notify>>,
+}
+
+impl<'a> Waiter<'a> {
+    fn new(notifiers: &'a Mutex<HashMap<String, Arc<Notify>>>, key: &'a str) -> Self {
+        let notify = notifiers.lock().unwrap().entry(key.to_string()).or_insert_with(|| Arc::new(Notify::new())).clone();
+        Self { notifiers, key, notify: Some(notify) }
+    }
+
+    fn notify(&self) -> &Notify {
+        self.notify.as_deref().expect("held until dropped")
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut notifiers = self.notifiers.lock().unwrap();
+        // Let go of ours under the lock, so of waiters finishing together
+        // the last one sees it is the last.
+        drop(self.notify.take());
+        if notifiers.get(self.key).is_some_and(|n| Arc::strong_count(n) == 1) {
+            notifiers.remove(self.key);
+        }
+    }
+}
+
 /// Pool of idle connections keyed by a string identifier.
 ///
 /// Generic over the stream type so it can hold either plain `TcpStream`s or
 /// `MeshStream`s (TLS-wrapped or not). Supports both immediate (`try_take`)
-/// and blocking (`take`) retrieval.
+/// and blocking (`take`) retrieval. Connections the peer has closed are
+/// never handed out, and [`StreamPool::prune`] drops them so they don't
+/// pile up holding file descriptors.
 pub struct StreamPool<T> {
     connections: Mutex<HashMap<String, Vec<T>>>,
     notifiers: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
-impl<T: Send> StreamPool<T> {
+impl<T: Send + tokio::io::AsyncRead + Unpin> StreamPool<T> {
     pub fn new() -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
@@ -48,26 +229,15 @@ impl<T: Send> StreamPool<T> {
     /// Take a connection, waiting up to `timeout` for one to become available.
     pub async fn take(&self, key: &str, timeout: Duration) -> Option<T> {
         let deadline = Instant::now() + timeout;
+        let waiter = Waiter::new(&self.notifiers, key);
 
         loop {
-            let notify = {
-                let mut notifiers = self.notifiers.lock().unwrap();
-                notifiers
-                    .entry(key.to_string())
-                    .or_insert_with(|| Arc::new(Notify::new()))
-                    .clone()
-            };
-            let notified = notify.notified();
+            let notified = waiter.notify().notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            {
-                let mut conns = self.connections.lock().unwrap();
-                if let Some(vec) = conns.get_mut(key) {
-                    if let Some(stream) = vec.pop() {
-                        return Some(stream);
-                    }
-                }
+            if let Some(stream) = self.try_take(key) {
+                return Some(stream);
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -82,17 +252,81 @@ impl<T: Send> StreamPool<T> {
         }
     }
 
-    /// Take a connection without waiting.
+    /// Take a live connection without waiting, dropping closed ones on the way.
     pub fn try_take(&self, key: &str) -> Option<T> {
         let mut conns = self.connections.lock().unwrap();
         let vec = conns.get_mut(key)?;
-        vec.pop()
+        while let Some(mut stream) = vec.pop() {
+            if !idle_stream_closed(&mut stream) {
+                return Some(stream);
+            }
+        }
+        None
+    }
+
+    /// Drop every connection the peer has closed. Returns how many.
+    pub fn prune(&self) -> usize {
+        let mut dropped = 0;
+        let mut conns = self.connections.lock().unwrap();
+        conns.retain(|_, streams| {
+            let before = streams.len();
+            streams.retain_mut(|s| !idle_stream_closed(s));
+            dropped += before - streams.len();
+            !streams.is_empty()
+        });
+        dropped
+    }
+
+    /// Drop every idle connection for keys `keep` rejects. Returns how many.
+    pub fn retain_keys(&self, keep: impl Fn(&str) -> bool) -> usize {
+        let mut dropped = 0;
+        self.connections.lock().unwrap().retain(|key, streams| {
+            let kept = keep(key);
+            if !kept {
+                dropped += streams.len();
+            }
+            kept
+        });
+        dropped
     }
 
     /// Number of idle connections for `key`.
     pub fn count(&self, key: &str) -> usize {
         let conns = self.connections.lock().unwrap();
         conns.get(key).map_or(0, |v| v.len())
+    }
+}
+
+/// Background task: every few seconds, drop idle pooled connections their
+/// peers have closed (a restarted NAT'd node leaves its old reverse
+/// connections behind on every relay) and mux sessions that have ended.
+pub async fn run_pool_sweeper(state: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.shutdown.cancelled() => break,
+        }
+        let dropped = state.reverse_pool.prune() + state.tunnel_pool.prune();
+        if dropped > 0 {
+            tracing::debug!("dropped {dropped} closed idle connection(s)");
+        }
+        state.mux_pool.prune();
+    }
+}
+
+/// A reverse connection registered with a relay, from
+/// [`SharedState::relay_registered`]; gone when dropped.
+pub struct RelayRegistration {
+    state: Arc<SharedState>,
+    relay: String,
+}
+
+impl Drop for RelayRegistration {
+    fn drop(&mut self) {
+        if let Some((live, _)) = self.state.relays.lock().unwrap().get_mut(&self.relay) {
+            *live = live.saturating_sub(1);
+        }
     }
 }
 
@@ -160,6 +394,11 @@ impl InFlightTracker {
 pub struct SharedState {
     pub config: Arc<Config>,
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
+    /// The dynamic config (as JSON) that the config file holds as far as
+    /// this daemon knows: what it last wrote there or took from there. The
+    /// file saying something else means an edit nobody applied, which a
+    /// write must not silently overwrite (see `gossip::persist_state_with`).
+    pub(crate) file_config: Mutex<Option<String>>,
     pub known_nodes: ArcSwap<HashMap<String, NodeInfo>>,
     known_nodes_write: tokio::sync::Mutex<()>,
     pub service_index: ArcSwap<HashMap<(String, String), Service>>,
@@ -182,6 +421,74 @@ pub struct SharedState {
     pub in_flight: Arc<InFlightTracker>,
     /// Span exporter, set at daemon start when `tracing` is configured.
     pub tracer: std::sync::OnceLock<Arc<crate::telemetry::Tracer>>,
+    /// Heartbeats issued by this process (the low half of each).
+    heartbeat: AtomicU64,
+    /// This process's incarnation, the high half of each heartbeat. Set at
+    /// daemon start from [`incarnation_for`]; the clock if never set.
+    pub incarnation: std::sync::OnceLock<u64>,
+    /// Nodes that left or were forgotten, by id.
+    departed: Mutex<HashMap<String, Tombstone>>,
+    /// Version of the last config refused for lacking a valid signature, so
+    /// each is reported once rather than on every sync.
+    pub(crate) rejected_config_version: AtomicU64,
+    /// This node's key and certificate, to sign its own node record. Set at
+    /// daemon start.
+    pub signer: std::sync::OnceLock<crate::signing::Signer>,
+    /// Relays (by node id) this node registered reverse connections with:
+    /// how many it holds there now, and when it last registered one.
+    relays: Mutex<HashMap<String, (usize, std::time::Instant)>>,
+    /// Nodes forgotten for silence: last address, and when.
+    forgotten: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Backoff for peer addresses that didn't answer a sync (see
+    /// `gossip::run_sync_loop`).
+    pub(crate) sync_backoff: Mutex<Backoff>,
+    /// Sync connections peers kept open after the last round, by address
+    /// (see `gossip::sync_with_peer`).
+    pub(crate) gossip_conns: Mutex<HashMap<String, MeshStream>>,
+    /// Addresses a sync found ourselves at (our certificate answered): with
+    /// a wildcard bind, a shared `knownNodes` list can name our own address
+    /// in a form we can't otherwise tell is ours.
+    pub(crate) own_addrs: Mutex<std::collections::HashSet<String>>,
+    /// Whether the cap on unsigned-only nodes was reported (once).
+    pub(crate) unsigned_cap_warned: std::sync::atomic::AtomicBool,
+    /// The record this node last gossiped about itself, reused while fresh.
+    pub(crate) own_record: Mutex<Option<OwnRecord>>,
+    /// Open connections per (kind, peer CN), for the per-peer limits.
+    peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
+    /// Peer addresses known to speak delta sync (their replies say so), so
+    /// syncs to them can be compact, with the (version, hash) of the config
+    /// each had as of its last reply: one that's behind gets ours.
+    pub(crate) delta_peers: Mutex<HashMap<String, (u64, u64)>>,
+    /// This node's last beat and when it was made (NAT'd nodes only).
+    pub(crate) own_beat: Mutex<Option<(crate::config::SignedBeat, std::time::Instant)>>,
+    /// Set at shutdown: this node's record now says it left.
+    pub leaving: std::sync::atomic::AtomicBool,
+}
+
+/// One of a peer's limited connections (see [`SharedState::try_peer_slot`]);
+/// frees its place when dropped.
+pub struct PeerSlot {
+    state: Arc<SharedState>,
+    key: (&'static str, String),
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut slots = self.state.peer_slots.lock().unwrap();
+        if let Some(count) = slots.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                slots.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// This node's last record (see `gossip::own_record`): its content, and
+/// the version and signature it went out with.
+pub(crate) struct OwnRecord {
+    pub record: crate::config::NodeRecord,
+    pub signed: Option<crate::config::SignedNode>,
 }
 
 impl SharedState {
@@ -195,9 +502,19 @@ impl SharedState {
         let bootstrap_peers = config.known_nodes.clone();
         let service_index = build_service_index(&dynamic_config);
         let routes = build_route_index(&dynamic_config);
+        if let Some(tls) = &tls {
+            tls.revocations().set(&dynamic_config.revoked);
+            if tls.own_cert_revoked() {
+                tracing::error!(
+                    "this node's own certificate is revoked (the config's revoked list): peers will refuse it. \
+                     Issue it a new certificate (`stouter cert issue`), or unrevoke it"
+                );
+            }
+        }
 
         Arc::new(Self {
             config: Arc::new(config),
+            file_config: Mutex::new(serde_json::to_string(&dynamic_config).ok()),
             dynamic_config: Arc::new(RwLock::new(dynamic_config)),
             known_nodes: ArcSwap::from_pointee(HashMap::new()),
             known_nodes_write: tokio::sync::Mutex::new(()),
@@ -213,30 +530,156 @@ impl SharedState {
             shutdown,
             in_flight: InFlightTracker::new(),
             tracer: std::sync::OnceLock::new(),
+            heartbeat: AtomicU64::new(0),
+            incarnation: std::sync::OnceLock::new(),
+            departed: Mutex::new(HashMap::new()),
+            rejected_config_version: AtomicU64::new(0),
+            signer: std::sync::OnceLock::new(),
+            relays: Mutex::new(HashMap::new()),
+            forgotten: Mutex::new(HashMap::new()),
+            sync_backoff: Mutex::new(Backoff::new(SYNC_BACKOFF_BASE, SYNC_BACKOFF_MAX)),
+            gossip_conns: Mutex::new(HashMap::new()),
+            own_addrs: Mutex::new(std::collections::HashSet::new()),
+            unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
+            own_record: Mutex::new(None),
+            peer_slots: Mutex::new(HashMap::new()),
+            delta_peers: Mutex::new(HashMap::new()),
+            own_beat: Mutex::new(None),
+            leaving: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Wrap a newly accepted `TcpStream` with mTLS.
+    /// Wrap a newly accepted `TcpStream` with mTLS, within [`CONNECT_TIMEOUT`].
     pub async fn tls_accept(&self, stream: TcpStream) -> anyhow::Result<MeshStream> {
         match &self.tls {
-            Some(ctx) => ctx.accept(stream).await,
+            Some(ctx) => tokio::time::timeout(CONNECT_TIMEOUT, ctx.accept(stream))
+                .await
+                .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?,
             None => anyhow::bail!("mTLS is required but tlsDir is not configured"),
         }
     }
 
-    /// Wrap an outbound `TcpStream` with mTLS.
+    /// Wrap an outbound `TcpStream` with mTLS, within [`CONNECT_TIMEOUT`].
     pub async fn tls_connect(&self, stream: TcpStream) -> anyhow::Result<MeshStream> {
         match &self.tls {
-            Some(ctx) => ctx.connect(stream).await,
+            Some(ctx) => tokio::time::timeout(CONNECT_TIMEOUT, ctx.connect(stream))
+                .await
+                .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?,
             None => anyhow::bail!("mTLS is required but tlsDir is not configured"),
         }
+    }
+
+    /// Open an mTLS connection to `addr`, TCP connect and handshake within
+    /// [`CONNECT_TIMEOUT`].
+    ///
+    /// With `expect_node`, the server's certificate must name that node:
+    /// every node's certificate is signed by the same CA, so without this
+    /// check any node at the address (one that took it over, or that gossip
+    /// pointed us to) could receive another node's tunnels.
+    pub async fn connect_mesh(&self, addr: &str, expect_node: Option<&str>) -> anyhow::Result<MeshStream> {
+        use anyhow::Context as _;
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect to {addr} timed out"))?
+            .with_context(|| format!("connect to {addr}"))?;
+        crate::io::configure_stream(&tcp);
+        let stream = self.tls_connect(tcp).await.with_context(|| format!("TLS connect to {addr}"))?;
+        if let Some(expected) = expect_node {
+            if stream.peer_cn() != Some(expected) {
+                anyhow::bail!(
+                    "{addr} is not node {expected}: its certificate names {}",
+                    stream.peer_cn().unwrap_or("no one")
+                );
+            }
+        }
+        Ok(stream)
+    }
+
+    /// The id of the known node advertising `addr`: whose certificate a
+    /// connection to `addr` should present. `None` if no node, or more than
+    /// one, claims it (then only per-tunnel checks decide who it may serve).
+    pub fn node_at(&self, addr: &str) -> Option<String> {
+        if addr.is_empty() {
+            return None;
+        }
+        let known = self.known_nodes.load();
+        let mut claimants = known.values().filter(|n| n.addr == addr);
+        let only = claimants.next()?;
+        if claimants.next().is_some() {
+            return None;
+        }
+        Some(only.id.clone())
     }
 
     pub async fn rebuild_service_index(&self) {
-        let dc = self.dynamic_config.read().await;
-        let idx = build_service_index(&dc);
-        self.service_index.store(Arc::new(idx));
-        self.routes.store(Arc::new(build_route_index(&dc)));
+        {
+            let dc = self.dynamic_config.read().await;
+            self.index_config(&dc);
+        }
+        self.forget_revoked_nodes().await;
+    }
+
+    /// Take `dc`'s revocation list (see [`crate::tls::Revocations`]). If it
+    /// changed, close the idle connections it now refuses; busy ones fail
+    /// at their next read or write, and new ones fail their handshake.
+    fn apply_revocations(&self, dc: &DynamicConfig) {
+        let Some(tls) = &self.tls else { return };
+        if !tls.revocations().set(&dc.revoked) {
+            return;
+        }
+        tracing::info!(
+            "revoked certificates: {} node name(s) {:?}, {} single certificate(s)",
+            dc.revoked.nodes.len(),
+            dc.revoked.nodes,
+            dc.revoked.certs.len()
+        );
+        if tls.own_cert_revoked() {
+            tracing::error!(
+                "this node's own certificate is revoked: peers refuse its connections and what it signs. Issue it \
+                 a new certificate (`stouter cert issue`), or unrevoke it"
+            );
+        }
+        self.tunnel_pool.prune();
+        self.reverse_pool.prune();
+        self.gossip_conns.lock().unwrap().retain(|_, stream| !stream.peer_revoked());
+        self.mux_pool.drop_revoked(tls.revocations());
+    }
+
+    /// Forget known nodes whose certificate (or name) is revoked, burying
+    /// them so gossip doesn't bring them back. A node revoked by
+    /// certificate alone comes back with a newer record on a new one.
+    pub async fn forget_revoked_nodes(&self) {
+        let Some(tls) = &self.tls else { return };
+        let revocations = tls.revocations();
+        let revoked = |n: &NodeInfo| {
+            revocations.name_revoked(&n.id) || n.signed.as_ref().is_some_and(|s| revocations.cert_hex_revoked(&s.cert))
+        };
+        if !self.known_nodes.load().values().any(revoked) {
+            return;
+        }
+        let gone: Vec<NodeInfo> = self
+            .update_known_nodes(|kn| {
+                let ids: Vec<String> = kn.values().filter(|n| revoked(n)).map(|n| n.id.clone()).collect();
+                ids.iter().filter_map(|id| kn.remove(id)).collect()
+            })
+            .await;
+        for node in gone {
+            tracing::warn!("node {}: its certificate is revoked; forgetting it", node.id);
+            self.bury_with(&node.id, node.heartbeat.max(node.record_version), None);
+            if node.signed.is_some() {
+                self.mark_buried_signed(&node.id);
+            }
+        }
+    }
+
+    /// Rebuild the service and route indexes from `dc`, now: called with
+    /// the config's lock still held right after it changes, so nothing can
+    /// interrupt a change between taking a config and indexing it (a sync
+    /// cut off by its timeout used to leave the index on the old config).
+    pub fn index_config(&self, dc: &DynamicConfig) {
+        self.service_index.store(Arc::new(build_service_index(dc)));
+        self.routes.store(Arc::new(build_route_index(dc)));
+        self.apply_revocations(dc);
     }
 
     /// Whether `node_id` reports `service_name` as failing its health check.
@@ -251,6 +694,188 @@ impl SharedState {
             .load()
             .get(node_id)
             .is_some_and(|n| n.health.is_unhealthy(service_name))
+    }
+
+    /// Advance and return this node's own heartbeat: this process's
+    /// incarnation in the high 32 bits, a counter in the low 32. Every
+    /// process's incarnation is above the previous one's (it is persisted;
+    /// see [`incarnation_for`]), so a restarted node's heartbeats outrank
+    /// the ones it gossiped before whatever the clock did meanwhile. Also
+    /// orders health reports.
+    pub fn next_heartbeat(&self) -> u64 {
+        let incarnation = *self.incarnation.get_or_init(unix_seconds);
+        let counter = self.heartbeat.fetch_add(1, Ordering::SeqCst) + 1;
+        (incarnation << 32) | (counter & 0xFFFF_FFFF)
+    }
+
+    /// Remember that `id` departed with heartbeat `heartbeat`.
+    pub fn bury(&self, id: &str, heartbeat: u64) {
+        self.bury_with(id, heartbeat, None);
+    }
+
+    /// Bury `node`, forgotten for silence, keeping it as it was: a node
+    /// with no address can't be contacted to see it's back, and its record
+    /// may not change for a long time, so only a newer beat can show it.
+    pub fn bury_forgotten(&self, node: &NodeInfo) {
+        self.bury(&node.id, node.heartbeat);
+        if node.signed.is_some() {
+            if let Some(tomb) = self.departed.lock().unwrap().get_mut(&node.id) {
+                tomb.signed = true;
+                if node.addr.is_empty() {
+                    tomb.forgotten = Some(node.clone());
+                }
+            }
+        }
+    }
+
+    /// Note that `id`, just buried, signed its records (see
+    /// [`Tombstone::signed`]).
+    pub fn mark_buried_signed(&self, id: &str) {
+        if let Some(tomb) = self.departed.lock().unwrap().get_mut(id) {
+            tomb.signed = true;
+        }
+    }
+
+    /// Whether `id` is buried, and signed its records when it was here.
+    pub fn buried_signed(&self, id: &str) -> bool {
+        self.departed.lock().unwrap().get(id).is_some_and(|t| t.signed && t.at.elapsed() < TOMBSTONE_TTL)
+    }
+
+    /// For a node buried by [`Self::bury_forgotten`]: its last heartbeat
+    /// and the certificate (hex DER) of its record, to check a beat against.
+    pub fn forgotten_cert(&self, id: &str) -> Option<(u64, String)> {
+        let departed = self.departed.lock().unwrap();
+        let tomb = departed.get(id).filter(|t| t.at.elapsed() < TOMBSTONE_TTL)?;
+        let cert = tomb.forgotten.as_ref()?.signed.as_ref()?.cert.clone();
+        Some((tomb.heartbeat, cert))
+    }
+
+    /// For a beat about a node buried by [`Self::bury_forgotten`], already
+    /// checked against its record's key (see [`Self::forgotten_cert`]): the
+    /// node, let back in, if the beat is newer than its last. It is alive
+    /// after all, just out of touch for a while (it can't be reached, and
+    /// we heard nothing of it).
+    pub fn revive(&self, beat: &crate::config::SignedBeat) -> Option<NodeInfo> {
+        let mut departed = self.departed.lock().unwrap();
+        let tomb = departed.get(&beat.id).filter(|t| t.at.elapsed() < TOMBSTONE_TTL)?;
+        tomb.forgotten.as_ref().filter(|_| beat.beat > tomb.heartbeat)?;
+        departed.remove(&beat.id).and_then(|t| t.forgotten)
+    }
+
+    /// [`Self::bury`], keeping the node's signed "left" record (at version
+    /// `record.0`) to relay.
+    pub fn bury_with(&self, id: &str, heartbeat: u64, record: Option<(u64, crate::config::SignedNode)>) {
+        let mut departed = self.departed.lock().unwrap();
+        departed.retain(|_, t| t.at.elapsed() < TOMBSTONE_TTL);
+        let tomb = departed
+            .entry(id.to_string())
+            .or_insert(Tombstone { heartbeat, at: std::time::Instant::now(), record: None, forgotten: None, signed: false });
+        tomb.heartbeat = tomb.heartbeat.max(heartbeat);
+        tomb.at = std::time::Instant::now();
+        tomb.signed |= record.is_some();
+        if let Some(record) = record {
+            if tomb.record.as_ref().is_none_or(|(held, _)| record.0 > *held) {
+                tomb.record = Some(record);
+            }
+        }
+    }
+
+    /// Signed "left" records of departed nodes: (id, version, record).
+    pub fn departed_records(&self) -> Vec<(String, u64, crate::config::SignedNode)> {
+        let departed = self.departed.lock().unwrap();
+        departed
+            .iter()
+            .filter(|(_, t)| t.at.elapsed() < TOMBSTONE_TTL)
+            .filter_map(|(id, t)| t.record.as_ref().map(|(v, r)| (id.clone(), *v, r.clone())))
+            .collect()
+    }
+
+    /// Whether gossip about `id` carrying `heartbeat` is just a stale copy
+    /// of a node that has since departed. A heartbeat newer than the one it
+    /// departed with means it really came back.
+    pub fn is_buried(&self, id: &str, heartbeat: u64) -> bool {
+        let mut departed = self.departed.lock().unwrap();
+        match departed.get(id) {
+            Some(t) if t.at.elapsed() >= TOMBSTONE_TTL => {
+                departed.remove(id);
+                false
+            }
+            Some(t) => heartbeat <= t.heartbeat,
+            None => false,
+        }
+    }
+
+    /// Forget that `id` departed (it rejoined).
+    /// Whether `id` left (we hold its signed "left" record), recently
+    /// enough that it's still buried.
+    pub fn has_left(&self, id: &str) -> bool {
+        self.departed
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|t| t.record.is_some() && t.at.elapsed() < TOMBSTONE_TTL)
+    }
+
+    pub fn unbury(&self, id: &str) {
+        self.departed.lock().unwrap().remove(id);
+        self.forgotten.lock().unwrap().remove(id);
+    }
+
+    /// Remember the last address of `id`, forgotten for silence, so it is
+    /// retried for [`RECONNECT_FOR`]. (Not for a node that left: it said so.)
+    pub fn remember_forgotten(&self, id: &str, addr: &str) {
+        if !addr.is_empty() {
+            let mut forgotten = self.forgotten.lock().unwrap();
+            // Bounded: in a cluster without signed records, anyone could
+            // make up nodes for us to forget (and retry for a day).
+            if forgotten.len() >= MAX_FORGOTTEN && !forgotten.contains_key(id) {
+                let oldest = forgotten.iter().min_by_key(|(_, (_, at))| *at).map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    forgotten.remove(&oldest);
+                }
+            }
+            forgotten.insert(id.to_string(), (addr.to_string(), std::time::Instant::now()));
+        }
+    }
+
+    /// Last addresses of nodes forgotten within [`RECONNECT_FOR`].
+    pub fn forgotten_addrs(&self) -> Vec<String> {
+        let mut forgotten = self.forgotten.lock().unwrap();
+        forgotten.retain(|_, (_, at)| at.elapsed() < RECONNECT_FOR);
+        forgotten.values().map(|(addr, _)| addr.clone()).collect()
+    }
+
+    /// Take one of `peer`'s at most `limit` connections of `kind`, or `None`
+    /// if it already holds them all.
+    pub fn try_peer_slot(self: &Arc<Self>, kind: &'static str, peer: &str, limit: usize) -> Option<PeerSlot> {
+        let key = (kind, peer.to_string());
+        let mut slots = self.peer_slots.lock().unwrap();
+        let count = slots.entry(key.clone()).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot { state: Arc::clone(self), key })
+    }
+
+    /// Note a reverse connection registered with `relay` (a node id); the
+    /// returned guard marks it gone when dropped.
+    pub fn relay_registered(self: &Arc<Self>, relay: &str) -> RelayRegistration {
+        let mut relays = self.relays.lock().unwrap();
+        let entry = relays.entry(relay.to_string()).or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
+        entry.1 = std::time::Instant::now();
+        RelayRegistration { state: Arc::clone(self), relay: relay.to_string() }
+    }
+
+    /// The relays this node uses (sorted ids): ones it holds a reverse
+    /// connection to, or registered one with in the last [`RELAY_GRACE`].
+    pub fn current_relays(&self) -> Vec<String> {
+        let mut relays = self.relays.lock().unwrap();
+        relays.retain(|_, (live, at)| *live > 0 || at.elapsed() < RELAY_GRACE);
+        let mut ids: Vec<String> = relays.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 
     pub async fn update_known_nodes<F, R>(&self, f: F) -> R
@@ -283,6 +908,38 @@ fn build_route_index(dc: &DynamicConfig) -> HashMap<String, Vec<Route>> {
     idx
 }
 
+/// Helpers for tests that need real mTLS between nodes.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A state with a real TLS identity `id`, its CA kept in `dir` (states
+    /// made with the same `dir` trust each other).
+    pub fn tls_state(dir: &std::path::Path, id: &str) -> Arc<SharedState> {
+        tls_state_with(dir, Config { node_id: id.into(), ..Config::default() }, String::new())
+    }
+
+    /// Like [`tls_state`], for a full config (persisted to `config_path`).
+    pub fn tls_state_with(dir: &std::path::Path, cfg: Config, config_path: String) -> Arc<SharedState> {
+        let material = crate::pki::load_or_create(dir.to_str().unwrap(), &cfg.node_id).unwrap();
+        let tls = TlsContext::new(&material).unwrap();
+        let state = SharedState::new(cfg, config_path, CancellationToken::new(), Some(tls));
+        let _ = state.signer.set(crate::signing::Signer::from_material(&material).unwrap());
+        state
+    }
+
+    /// An mTLS connection from `client` to `server`: (client end, server end).
+    pub async fn mesh_pair(client: &SharedState, server: &SharedState) -> (MeshStream, MeshStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (a, b) = tokio::join!(
+            async { client.tls_connect(TcpStream::connect(addr).await.unwrap()).await.unwrap() },
+            async { server.tls_accept(listener.accept().await.unwrap().0).await.unwrap() },
+        );
+        (a, b)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +967,226 @@ mod tests {
         let _guard = tracker.track();
         assert!(!tracker.wait_zero(Duration::from_secs(30)).await);
         assert_eq!(tracker.current(), 1);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_cap_and_resets_on_success() {
+        let mut b = Backoff::new(Duration::from_secs(1), Duration::from_secs(8));
+        let now = Instant::now();
+        assert!(b.ready("a", now));
+        let waits: Vec<u64> = (0..6).map(|_| b.failed("a", now).as_millis() as u64).collect();
+        let full = [1000, 2000, 4000, 8000, 8000, 8000];
+        for (wait, full) in waits.iter().zip(full) {
+            assert!((full * 3 / 4..=full).contains(wait), "{waits:?}");
+        }
+        assert!(!b.ready("a", now));
+        assert!(b.ready("a", now + Duration::from_secs(8)));
+        assert!(b.ready("b", now), "keys back off independently");
+        b.succeeded("a");
+        assert!(b.ready("a", now));
+    }
+
+    #[tokio::test]
+    async fn pools_skip_and_prune_connections_their_peer_closed() {
+        let pool: StreamPool<tokio::io::DuplexStream> = StreamPool::new();
+        let (live, _live_peer) = tokio::io::duplex(64);
+        let (dead, dead_peer) = tokio::io::duplex(64);
+        pool.push("n".into(), live);
+        pool.push("n".into(), dead);
+        drop(dead_peer);
+
+        // The dead one was pushed last (LIFO) but is skipped.
+        let mut taken = pool.try_take("n").expect("the live one");
+        assert!(!idle_stream_closed(&mut taken));
+        assert!(pool.try_take("n").is_none(), "the dead one was dropped, not returned");
+
+        let (dead, dead_peer) = tokio::io::duplex(64);
+        pool.push("n".into(), dead);
+        pool.push("n".into(), taken);
+        drop(dead_peer);
+        assert_eq!(pool.prune(), 1);
+        assert_eq!(pool.count("n"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_for_made_up_keys_leaves_nothing_behind() {
+        let pool: Arc<StreamPool<tokio::io::DuplexStream>> = Arc::new(StreamPool::new());
+        for i in 0..200 {
+            assert!(pool.take(&format!("made-up-{i}"), Duration::from_millis(1)).await.is_none());
+        }
+        // Cancelled waits too.
+        let _ = tokio::time::timeout(Duration::from_millis(5), pool.take("cancelled", Duration::from_secs(60))).await;
+        assert!(pool.notifiers.lock().unwrap().is_empty());
+
+        // Waiters still get what is pushed, and the last one out clears up.
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.take("n", Duration::from_secs(5)).await.is_some() })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut peers = Vec::new();
+        for _ in 0..3 {
+            let (conn, peer) = tokio::io::duplex(64);
+            peers.push(peer);
+            pool.push("n".into(), conn);
+        }
+        for waiter in waiters {
+            assert!(waiter.await.unwrap());
+        }
+        assert!(pool.notifiers.lock().unwrap().is_empty());
+    }
+
+    /// `state` takes a config revoking `nodes` and `certs`, as when one arrives.
+    async fn revoke(state: &SharedState, nodes: &[&str], certs: &[String]) {
+        let mut dc = state.dynamic_config.read().await.clone();
+        dc.revoked = crate::config::Revoked { nodes: nodes.iter().map(|n| n.to_string()).collect(), certs: certs.to_vec() };
+        state.index_config(&dc);
+        *state.dynamic_config.write().await = dc;
+    }
+
+    /// Whether `client` can open an mTLS connection to `server`, as both see it.
+    async fn connects(client: &SharedState, server: &SharedState) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (c, s) = tokio::join!(
+            async {
+                let mut stream = client.tls_connect(TcpStream::connect(addr).await.unwrap()).await?;
+                // TLS 1.3: the server checks the client's certificate after
+                // the client is done; a refusal shows on the next read.
+                stream.write_all(b"?").await?;
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                anyhow::Ok(())
+            },
+            async {
+                let mut stream = server.tls_accept(listener.accept().await.unwrap().0).await?;
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                stream.write_all(b"!").await?;
+                anyhow::Ok(())
+            },
+        );
+        c.is_ok() && s.is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_revoked_certificate_is_refused_both_ways_and_cut_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("stouter_revoke_{}_{}", std::process::id(), rand::random::<u64>()));
+        let (a, b, c) = (tls_state(&dir, "a"), tls_state(&dir, "b"), tls_state(&dir, "c"));
+        assert!(connects(&b, &a).await && connects(&a, &b).await);
+
+        // Connections b has open with a: in use, idle in a's pool, kept for gossip.
+        let (_b_end, mut in_use) = mesh_pair(&b, &a).await;
+        let (_b_idle, idle) = mesh_pair(&b, &a).await;
+        a.tunnel_pool.push("b:1".into(), idle);
+        let (kept, _b_kept) = mesh_pair(&a, &b).await;
+        a.gossip_conns.lock().unwrap().insert("b:1".into(), kept);
+
+        revoke(&a, &["b"], &[]).await;
+        assert!(!connects(&b, &a).await, "b's certificate is refused as a client");
+        assert!(!connects(&a, &b).await, "and as a server");
+        assert!(connects(&c, &a).await, "others aren't affected");
+        let mut byte = [0u8; 1];
+        assert!(in_use.write_all(b"x").await.is_err(), "an open connection carries nothing more");
+        assert!(in_use.read(&mut byte).await.is_err());
+        assert_eq!(a.tunnel_pool.count("b:1"), 0, "idle ones are dropped");
+        assert!(a.gossip_conns.lock().unwrap().is_empty());
+
+        // By certificate: that one only; the node can be issued a new one.
+        revoke(&a, &[], &[]).await;
+        assert!(connects(&b, &a).await, "unrevoked");
+        let (c_end, _) = mesh_pair(&c, &a).await;
+        let c_cert = crate::tls::fingerprint(c.tls.as_ref().unwrap().own_cert_der());
+        let hex: String = c_cert.iter().map(|b| format!("{b:02x}")).collect();
+        drop(c_end);
+        revoke(&a, &[], &[hex]).await;
+        assert!(!connects(&c, &a).await);
+        let reissued = tls_state(&dir, "c");
+        assert!(connects(&reissued, &a).await, "a new certificate for c is accepted");
+
+        // Revoking a node's own certificate doesn't stop it, but it is told.
+        assert!(!a.tls.as_ref().unwrap().own_cert_revoked());
+        revoke(&a, &["a"], &[]).await;
+        assert!(a.tls.as_ref().unwrap().own_cert_revoked());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use super::test_support::{mesh_pair, tls_state};
+
+    #[tokio::test]
+    async fn connect_mesh_requires_the_expected_node() {
+        let dir = std::env::temp_dir().join(format!("stouter_ident_{}_{}", std::process::id(), rand::random::<u64>()));
+        let server = tls_state(&dir, "a");
+        let client = tls_state(&dir, "b");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let server = server.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut s) = server.tls_accept(tcp).await {
+                        let mut buf = [0u8; 1];
+                        let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+                    }
+                });
+            }
+        });
+
+        let ok = client.connect_mesh(&addr, Some("a")).await.unwrap();
+        assert_eq!(ok.peer_cn(), Some("a"));
+        let err = client.connect_mesh(&addr, Some("c")).await.err().expect("wrong node refused").to_string();
+        assert!(err.contains("certificate names a"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_mesh_gives_up_on_a_silent_peer() {
+        let dir = std::env::temp_dir().join(format!("stouter_silent_{}_{}", std::process::id(), rand::random::<u64>()));
+        let client = tls_state(&dir, "b");
+        // Accepts TCP but never answers the TLS handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let _hold = tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let start = Instant::now();
+        let err = client.connect_mesh(&addr, None).await.err().expect("silent peer refused");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        // Connect and handshake each get CONNECT_TIMEOUT. (Paused time also
+        // advances while real socket I/O is in flight, so no exact value.)
+        assert!(start.elapsed() <= 2 * CONNECT_TIMEOUT, "{:?}", start.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_outranks_earlier_heartbeats_even_with_the_clock_set_back() {
+        let dir = std::env::temp_dir().join(format!("stouter_incarnation_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("stouter.json").to_str().unwrap().to_string();
+        // The previous process ran with the clock a long way ahead; now it's
+        // been set back.
+        let ahead = unix_seconds() + 1_000_000;
+        std::fs::write(format!("{config}.state"), format!(r#"{{"incarnation":{ahead}}}"#)).unwrap();
+        let last_before_restart = (ahead << 32) | 0xFFFF_FFFF;
+
+        let state = SharedState::new(Config::default(), config.clone(), CancellationToken::new(), None);
+        state.incarnation.set(incarnation_for(&config)).unwrap();
+        let first = state.next_heartbeat();
+        assert!(first > last_before_restart);
+        assert!(state.next_heartbeat() > first);
+        // Saved for the next start.
+        assert_eq!(incarnation_for(&config), ahead + 2);
+
+        // Also above the wall-clock-millisecond heartbeats of older versions.
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let fresh = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
+        assert!(fresh.next_heartbeat() > now_ms);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

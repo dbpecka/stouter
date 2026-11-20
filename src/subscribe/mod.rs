@@ -4,6 +4,8 @@ mod http;
 mod listener;
 mod proxy;
 
+pub(crate) use proxy::tunnel_route;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +17,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::gossip;
-use crate::state::SharedState;
+use crate::state::{Backoff, SharedState};
 
 /// Port and metadata for a locally proxied service.
 pub(crate) struct ServiceInfo {
@@ -84,34 +86,22 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
             "Subscribe daemon running in outbound-only mode (NAT'd), node_id={}",
             state.config.node_id
         );
-        crate::node::reverse::run_reverse_pool_loop(state).await;
+        // Reverse connections are how tunnels reach a NAT'd node's services.
+        // A plain subscriber hosts none, so it holds none: it would
+        // otherwise keep `reversePoolSize` idle connections at each relay
+        // for nothing.
+        if matches!(state.config.mode, crate::config::Mode::NodeSubscribe) {
+            crate::node::reverse::run_reverse_pool_loop(state).await;
+        } else {
+            state.shutdown.cancelled().await;
+        }
     } else {
         let listener = TcpListener::bind(&state.config.bind)
             .await
             .with_context(|| format!("bind gossip listener to {}", state.config.bind))?;
 
         info!("Subscribe daemon listening on {}", state.config.bind);
-
-        loop {
-            let (stream, peer_addr) = tokio::select! {
-                result = listener.accept() => result.context("accept connection")?,
-                _ = state.shutdown.cancelled() => {
-                    info!("subscribe listener shutting down");
-                    break;
-                }
-            };
-            stream.set_nodelay(true).ok();
-            let state = state.clone();
-            let peer = peer_addr.to_string();
-            // In-flight tracking happens in `dispatch_connection`, once the
-            // connection carries work; idle pooled connections don't count.
-            tokio::spawn(async move {
-                match state.tls_accept(stream).await {
-                    Ok(mesh) => gossip::dispatch_connection(mesh, peer, state).await,
-                    Err(e) => tracing::debug!("TLS accept from {peer}: {e}"),
-                }
-            });
-        }
+        crate::node::serve_mesh(listener, state, "subscribe listener").await;
     }
 
     Ok(())
@@ -136,6 +126,14 @@ async fn manage_proxies(
     // Last localPort conflict per service key, likewise reported once.
     let mut port_conflicts: HashMap<String, String> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(2));
+    // Known node ids as of the previous pass, to notice nodes leaving.
+    let mut prev_nodes: HashSet<String> = HashSet::new();
+    // The relay each NAT'd node's tunnels went through as of the previous
+    // pass (NAT'd node id -> relay id), to notice relays leaving.
+    let mut prev_relays: HashMap<String, String> = HashMap::new();
+    // Service keys skipped because their name is taken by another group,
+    // so each conflict is reported once.
+    let mut name_conflicts: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -147,10 +145,34 @@ async fn manage_proxies(
         let dc = state.dynamic_config.read().await.clone();
         let nodes = state.known_nodes.load_full();
 
+        // A node that left may still be draining, and our idle HTTP
+        // keep-alive connections to it look like open tunnels to it: close
+        // them, so its drain doesn't wait out the pool's idle timeout. The
+        // same for NAT'd nodes whose tunnels now go another way (see
+        // [`nodes_to_unpool`]); the pools are keyed by service, so they
+        // would never be closed otherwise.
+        let relays_now: HashMap<String, String> = nodes
+            .values()
+            .filter(|node| node.addr.is_empty())
+            .filter_map(|node| Some((node.id.clone(), proxy::tunnel_route(node, &state)?.1?)))
+            .collect();
+        let unpool = nodes_to_unpool(&prev_nodes, &prev_relays, &nodes, &relays_now);
+        if !unpool.is_empty() {
+            let index = state.service_index.load();
+            let hosted: HashSet<&str> =
+                index.keys().filter(|(node, _)| unpool.contains(node.as_str())).map(|(_, svc)| svc.as_str()).collect();
+            http_proxies.reset_pools(|name| hosted.contains(name));
+        }
+        prev_nodes = nodes.keys().cloned().collect();
+        prev_relays = relays_now;
+
         // Build the desired set: "group/service" keys where at least one
         // node is reachable, with what proxy setup and the REST API need.
         let mut desired: HashMap<String, DesiredService> = HashMap::new();
         let mut seen_svc_keys: HashSet<String> = HashSet::new();
+        // Service name -> the first group (in config order) proxying it. A
+        // proxy, the REST API and httpListen know a service by name only.
+        let mut name_owner: HashMap<String, String> = HashMap::new();
         for group in &dc.service_groups {
             for svc in &group.services {
                 // In nodeSubscribe mode, services this node owns are already running
@@ -166,6 +188,21 @@ async fn manage_proxies(
                     }
                 }
                 let key = format!("{}/{}", group.name, svc.name);
+                match name_owner.get(&svc.name) {
+                    Some(owner) if *owner != group.name => {
+                        if name_conflicts.insert(key.clone()) {
+                            tracing::warn!(
+                                "service name '{}' is in groups '{owner}' and '{}'; proxying the one in '{owner}' (first in the config)",
+                                svc.name, group.name
+                            );
+                        }
+                        continue;
+                    }
+                    Some(_) => {}
+                    None => {
+                        name_owner.insert(svc.name.clone(), group.name.clone());
+                    }
+                }
                 if nodes.contains_key(&svc.node_id) && seen_svc_keys.insert(key.clone()) {
                     let local_port = match dc.local_port_for(&svc.name) {
                         Ok(port) => {
@@ -189,6 +226,18 @@ async fn manage_proxies(
                         },
                     );
                 }
+            }
+        }
+
+        // A proxy whose task ended on its own (it shouldn't: it waits out
+        // accept errors) is forgotten here, so it is started again below
+        // rather than left advertised on a port nothing listens on.
+        let ended: Vec<String> =
+            proxies.iter().filter(|(_, handle)| handle.abort.is_finished()).map(|(key, _)| key.clone()).collect();
+        for key in ended {
+            if let Some(handle) = proxies.remove(&key) {
+                service_ports.write().await.remove(&handle.service_name);
+                tracing::warn!("proxy for {key} stopped; starting it again");
             }
         }
 
@@ -273,86 +322,289 @@ async fn manage_proxies(
     }
 }
 
-/// Background task that maintains warm TCP connections to known nodes.
+/// Ids of the nodes hosting a service this daemon proxies (by name, as a
+/// proxy routes: see `proxy::service_backends`), other than itself.
+fn proxied_nodes(dc: &crate::config::DynamicConfig, config: &crate::config::Config) -> HashSet<String> {
+    let filter = config.subscribe_filter.as_ref().filter(|f| !f.is_empty());
+    let services = || dc.service_groups.iter().flat_map(|g| g.services.iter().map(move |s| (g, s)));
+    let names: HashSet<&str> = services()
+        .filter(|(g, s)| filter.is_none_or(|f| f.allows(&g.name, &s.name)))
+        .map(|(_, s)| s.name.as_str())
+        .collect();
+    services()
+        .filter(|(_, s)| names.contains(s.name.as_str()) && s.node_id != config.node_id)
+        .map(|(_, s)| s.node_id.clone())
+        .collect()
+}
+
+/// The nodes whose services' idle HTTP keep-alive connections should be
+/// closed, given the known nodes and the relay each NAT'd node's tunnels go
+/// through (NAT'd node id -> relay id), as of the previous pass and now:
+/// nodes that left, NAT'd nodes behind a relay that left, and NAT'd nodes
+/// whose tunnels now go through another relay (the one before stopped
+/// answering, say). A pooled connection through a relay that vanished
+/// would hold each request sent on it until TCP gave up.
+fn nodes_to_unpool(
+    prev_nodes: &HashSet<String>,
+    prev_relays: &HashMap<String, String>,
+    nodes: &HashMap<String, crate::config::NodeInfo>,
+    relays_now: &HashMap<String, String>,
+) -> HashSet<String> {
+    let gone: HashSet<&str> = prev_nodes.iter().map(String::as_str).filter(|id| !nodes.contains_key(*id)).collect();
+    let rerouted = prev_relays
+        .iter()
+        .filter(|(natd, relay)| gone.contains(relay.as_str()) || relays_now.get(*natd).is_some_and(|now| now != *relay))
+        .map(|(natd, _)| natd.as_str());
+    gone.iter().copied().chain(rerouted).map(str::to_string).collect()
+}
+
+/// Where this daemon's tunnels go: the connect address (see
+/// `proxy::tunnel_route`) of each node hosting a service it proxies,
+/// without duplicates, as several NAT'd nodes can share a relay. Only these
+/// get warm connections and mux sessions, so a subscriber's idle
+/// connections grow with what it proxies, not with the cluster.
+async fn tunnel_addrs(state: &SharedState) -> HashSet<String> {
+    let wanted = proxied_nodes(&*state.dynamic_config.read().await, &state.config);
+    let known = state.known_nodes.load();
+    wanted
+        .iter()
+        .filter_map(|id| known.get(id))
+        .filter_map(|node| proxy::tunnel_route(node, state))
+        .map(|(addr, _)| addr)
+        .collect()
+}
+
+/// Background task that maintains warm TCP connections to the nodes this
+/// daemon's tunnels go to (see [`tunnel_addrs`]).
 ///
 /// These pre-established connections eliminate TCP handshake latency on
-/// the proxy hot path.
+/// the proxy hot path. Each address is refilled on its own, one connection
+/// at a time: a slow address (one that times out) doesn't hold up the
+/// others. One that can't be reached is retried with exponential backoff,
+/// rather than as fast as the loop spins.
 async fn fill_tunnel_pool(state: Arc<SharedState>) {
     /// Target number of warm connections per node address.
     const POOL_TARGET: usize = 8;
+    let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    let mut connecting: HashSet<String> = HashSet::new();
 
-    while !state.shutdown.is_cancelled() {
-        let addrs: Vec<String> = {
-            let nodes = state.known_nodes.load();
-            nodes
-                .values()
-                .filter_map(|node| {
-                    let addr = node.relay.as_deref().unwrap_or(&node.addr);
-                    if addr.is_empty() || state.tunnel_pool.count(addr) >= POOL_TARGET {
-                        None
-                    } else {
-                        Some(addr.to_string())
-                    }
-                })
-                .collect()
-        };
-
-        if addrs.is_empty() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
+    loop {
+        let known = tunnel_addrs(&state).await;
+        backoff.retain(|addr| known.contains(addr));
+        // Tunnels no longer go there (the service moved, the node left, or
+        // its relay changed): close what is warm for them.
+        let dropped = state.tunnel_pool.retain_keys(|addr| known.contains(addr));
+        if dropped > 0 {
+            tracing::debug!("closed {dropped} warm connection(s) no tunnel needs");
         }
-
-        for addr in &addrs {
-            match tokio::net::TcpStream::connect(addr.as_str()).await {
-                Ok(tcp) => {
-                    crate::io::configure_stream(&tcp);
-                    match state.tls_connect(tcp).await {
-                        Ok(stream) => state.tunnel_pool.push(addr.clone(), stream),
-                        Err(e) => tracing::debug!("TLS connect to {addr} failed: {e}"),
-                    }
-                }
-                Err(_) => continue,
+        let now = tokio::time::Instant::now();
+        for addr in known {
+            if !connecting.contains(&addr) && state.tunnel_pool.count(&addr) < POOL_TARGET && backoff.ready(&addr, now) {
+                connecting.insert(addr.clone());
+                let state = state.clone();
+                attempts.push(async move {
+                    let result = state.connect_mesh(&addr, state.node_at(&addr).as_deref()).await;
+                    (addr, result)
+                });
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The next attempt to finish (then refill that address again at
+        // once), or a second's wait to look again.
+        tokio::select! {
+            Some((addr, result)) = futures::StreamExt::next(&mut attempts), if !attempts.is_empty() => {
+                connecting.remove(&addr);
+                match result {
+                    Ok(stream) => {
+                        backoff.succeeded(&addr);
+                        state.tunnel_pool.push(addr, stream);
+                    }
+                    Err(e) => {
+                        let wait = backoff.failed(&addr, tokio::time::Instant::now());
+                        tracing::debug!("warm connection to {addr} failed, retrying in {}s: {e:#}", wait.as_secs());
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = state.shutdown.cancelled() => break,
+        }
+    }
+}
+/// Background task that maintains yamux multiplexed sessions to the nodes
+/// this daemon's tunnels go to (see [`tunnel_addrs`]).
+///
+/// Looks every 5 seconds (and whenever a session attempt finishes) for nodes
+/// without a live mux session and starts establishing one, each on its own
+/// so a slow address doesn't hold up the others, with backoff for ones that
+/// keep failing. Ended sessions are dropped by `MuxPool::contains` and the
+/// pool sweeper, so they are replaced within a round.
+async fn maintain_mux_sessions(state: Arc<SharedState>) {
+    let mut backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    let mut connecting: HashSet<String> = HashSet::new();
+    loop {
+        let known = tunnel_addrs(&state).await;
+        backoff.retain(|addr| known.contains(addr));
+        let dropped = state.mux_pool.retain(|addr| known.contains(addr));
+        if dropped > 0 {
+            info!("closing {dropped} mux session(s) no tunnel needs");
+        }
+        let now = tokio::time::Instant::now();
+        for addr in known {
+            if !connecting.contains(&addr) && !state.mux_pool.contains(&addr) && backoff.ready(&addr, now) {
+                connecting.insert(addr.clone());
+                let state = state.clone();
+                attempts.push(async move {
+                    let result = crate::mux::establish_mux_session(&addr, &state).await;
+                    (addr, result)
+                });
+            }
+        }
+
+        tokio::select! {
+            Some((addr, result)) = futures::StreamExt::next(&mut attempts), if !attempts.is_empty() => {
+                connecting.remove(&addr);
+                match result {
+                    Ok(handle) => {
+                        info!("mux session established to {addr}");
+                        backoff.succeeded(&addr);
+                        state.mux_pool.insert(addr, handle);
+                    }
+                    Err(e) => {
+                        let wait = backoff.failed(&addr, tokio::time::Instant::now());
+                        tracing::debug!("failed to establish mux to {addr}, retrying in {}s: {e:#}", wait.as_secs());
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = state.shutdown.cancelled() => break,
+        }
     }
 }
 
-/// Background task that maintains yamux multiplexed sessions to known nodes.
-///
-/// Checks every 5 seconds for nodes without an active mux session and
-/// establishes one. Dead sessions are lazily removed by the MuxPool when
-/// `open_stream()` fails.
-async fn maintain_mux_sessions(state: Arc<SharedState>) {
-    while !state.shutdown.is_cancelled() {
-        let addrs: Vec<String> = {
-            let nodes = state.known_nodes.load();
-            nodes
-                .values()
-                .filter_map(|node| {
-                    let addr = node.relay.as_deref().unwrap_or(&node.addr);
-                    if addr.is_empty() || state.mux_pool.contains(addr) {
-                        None
-                    } else {
-                        Some(addr.to_string())
-                    }
-                })
-                .collect()
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, DynamicConfig, SubscribeFilter};
 
-        for addr in &addrs {
-            match crate::mux::establish_mux_session(addr, &state).await {
-                Ok(handle) => {
-                    info!("mux session established to {addr}");
-                    state.mux_pool.insert(addr.clone(), handle);
-                }
-                Err(e) => {
-                    tracing::debug!("failed to establish mux to {addr}: {e}");
+    fn dc() -> DynamicConfig {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "serviceGroups": [
+                {"name": "web", "services": [
+                    {"name": "api", "nodeId": "a", "nodePort": 1},
+                    {"name": "api", "nodeId": "b", "nodePort": 1},
+                    {"name": "ui", "nodeId": "c", "nodePort": 1},
+                ]},
+                {"name": "batch", "services": [
+                    {"name": "jobs", "nodeId": "d", "nodePort": 1},
+                    {"name": "api", "nodeId": "e", "nodePort": 1},
+                    {"name": "own", "nodeId": "me", "nodePort": 1},
+                ]},
+            ],
+        }))
+        .unwrap()
+    }
+
+    fn sorted(ids: HashSet<String>) -> Vec<String> {
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_address_doesnt_hold_up_warm_connections_to_others() {
+        use crate::state::test_support::{tls_state, tls_state_with};
+        let dir = std::env::temp_dir().join(format!("stouter_fill_{}_{}", std::process::id(), rand::random::<u64>()));
+        // "good" answers handshakes; "slow" takes connections and says nothing.
+        let good = tls_state(&dir, "good");
+        let good_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (tcp, _) = good_listener.accept().await.unwrap();
+                if let Ok(mesh) = good.tls_accept(tcp).await {
+                    held.push(mesh);
                 }
             }
-        }
+        });
+        let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(slow_listener.accept().await.unwrap().0);
+            }
+        });
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let cfg = Config {
+            node_id: "sub".into(),
+            mode: crate::config::Mode::Subscribe,
+            dynamic_config: serde_json::from_value(serde_json::json!({"version": 1, "serviceGroups": [{"name": "g", "services": [
+                {"name": "a", "nodeId": "good", "nodePort": 1},
+                {"name": "b", "nodeId": "slow", "nodePort": 1},
+            ]}]}))
+            .unwrap(),
+            ..Config::default()
+        };
+        let sub = tls_state_with(&dir, cfg, String::new());
+        sub.update_known_nodes(|kn| {
+            for (id, addr) in [("good", &good_addr), ("slow", &slow_addr)] {
+                kn.insert(id.into(), crate::config::NodeInfo { id: id.into(), addr: addr.clone(), ..Default::default() });
+            }
+        })
+        .await;
+        tokio::spawn(fill_tunnel_pool(sub.clone()));
+        // Well inside the 10s a handshake to "slow" waits before giving up.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(sub.tunnel_pool.count(&good_addr), 8);
+        assert_eq!(sub.tunnel_pool.count(&slow_addr), 0);
+        sub.shutdown.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_connections_go_only_to_nodes_hosting_proxied_services() {
+        let all = Config { node_id: "me".into(), ..Config::default() };
+        // No filter: every service's nodes, but never ourselves.
+        assert_eq!(sorted(proxied_nodes(&dc(), &all)), ["a", "b", "c", "d", "e"]);
+
+        // A filter limits them to what it lets through; a proxy routes by
+        // service name, so that's "api" in any group (e is in "batch").
+        let filtered = Config {
+            subscribe_filter: Some(SubscribeFilter { services: vec!["api".into()], ..Default::default() }),
+            ..all.clone()
+        };
+        assert_eq!(sorted(proxied_nodes(&dc(), &filtered)), ["a", "b", "e"]);
+
+        let by_group = Config {
+            subscribe_filter: Some(SubscribeFilter { service_groups: vec!["batch".into()], ..Default::default() }),
+            ..all
+        };
+        assert_eq!(sorted(proxied_nodes(&dc(), &by_group)), ["a", "b", "d", "e"]);
+    }
+    #[test]
+    fn keep_alives_are_closed_to_nodes_that_left_or_now_go_another_way() {
+        let ids = |list: &[&str]| -> HashSet<String> { list.iter().map(|s| s.to_string()).collect() };
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        let known = |list: &[&str]| -> HashMap<String, crate::config::NodeInfo> {
+            list.iter().map(|id| (id.to_string(), crate::config::NodeInfo { id: id.to_string(), ..Default::default() })).collect()
+        };
+        let before = ids(&["a", "r1", "r2", "x", "y"]);
+        let relays_before = map(&[("x", "r1"), ("y", "r2")]);
+
+        // Nothing changed.
+        let none = nodes_to_unpool(&before, &relays_before, &known(&["a", "r1", "r2", "x", "y"]), &relays_before);
+        assert!(none.is_empty());
+        // a left; so did r2, which y went through (y now has no route).
+        let left = nodes_to_unpool(&before, &relays_before, &known(&["r1", "x", "y"]), &map(&[("x", "r1")]));
+        assert_eq!(left, ids(&["a", "r2", "y"]));
+        // r1 stopped answering (still known, not live): x's tunnels moved to r2.
+        let moved = nodes_to_unpool(&before, &relays_before, &known(&["a", "r1", "r2", "x", "y"]), &map(&[("x", "r2"), ("y", "r2")]));
+        assert_eq!(moved, ids(&["x"]));
     }
 }

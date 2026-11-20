@@ -5,6 +5,44 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Pacing for an accept loop after `accept` fails. Such failures mostly pass
+/// on their own (out of file descriptors until connections close, a
+/// connection reset before it was taken), so the loop waits a little,
+/// longer each time, and carries on. Ending it instead would take the
+/// listener, or the whole daemon, down over a moment's shortage, which
+/// anyone able to open connections could cause on purpose.
+#[derive(Default)]
+pub struct AcceptBackoff {
+    failures: u32,
+}
+
+impl AcceptBackoff {
+    /// After a failed accept: log it (at warn the first time and as the
+    /// streak doubles), then wait 10ms, doubling to about a second. Returns
+    /// false if `stop` was cancelled meanwhile.
+    pub async fn failed(&mut self, what: &str, err: &io::Error, stop: &tokio_util::sync::CancellationToken) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures.is_power_of_two() {
+            tracing::warn!("{what}: accept failed ({err}), {} in a row; retrying", self.failures);
+        } else {
+            tracing::debug!("{what}: accept failed ({err}); retrying");
+        }
+        let wait = Duration::from_millis(5 << self.failures.min(8));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => true,
+            _ = stop.cancelled() => false,
+        }
+    }
+
+    /// After a successful accept.
+    pub fn succeeded(&mut self, what: &str) {
+        if self.failures > 0 {
+            tracing::info!("{what}: accepting again after {} failed accepts", self.failures);
+            self.failures = 0;
+        }
+    }
+}
+
 /// Buffer size for bidirectional proxy (64 KiB).
 const BUF_SIZE: usize = 65536;
 
@@ -14,14 +52,83 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// TCP keepalive idle time for long-lived connections.
 const KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 
+/// Between keepalive probes once a connection has gone quiet, and how many
+/// unanswered ones mean the peer is gone: a vanished peer is noticed about a
+/// minute after it went quiet (with the system defaults, 75s × 9, it took
+/// over 12 minutes, holding its connections and in-flight work that long).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd", windows))]
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// How long sent data may go unacknowledged before the connection is
+/// dropped. Keepalive probes only a quiet connection: one with data in
+/// flight to a vanished peer is retransmitted to for many minutes (about 15
+/// on Linux), and a request sent on it hangs that long. See
+/// [`set_retransmit_timeout`].
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
+const USER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `TCP_RXT_CONNDROPTIME` from Darwin's `netinet/tcp.h` (not in `libc`):
+/// seconds of retransmitting after which the connection is dropped.
+#[cfg(target_os = "macos")]
+const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+
+/// Drop the connection once sent data has gone unacknowledged for
+/// [`USER_TIMEOUT`]: `TCP_USER_TIMEOUT` on Linux (which also caps the
+/// keepalive check), `TCP_RXT_CONNDROPTIME` on macOS, `TCP_MAXRT` on
+/// Windows. Elsewhere, the system's own retransmission limit applies.
+fn set_retransmit_timeout(stream: &TcpStream) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = socket2::SockRef::from(stream).set_tcp_user_timeout(Some(USER_TIMEOUT));
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let secs = USER_TIMEOUT.as_secs() as libc::c_int;
+        // SAFETY: a valid socket descriptor, and a pointer to a c_int of
+        // the length given, which setsockopt only reads.
+        unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                TCP_RXT_CONNDROPTIME,
+                (&secs as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{setsockopt, IPPROTO_TCP, TCP_KEEPCNT, TCP_MAXRT};
+        let socket = stream.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+        // Windows sends 10 keepalive probes unless told otherwise (Windows
+        // 10 1703 on); socket2 can't set the count there.
+        for (option, value) in [(TCP_MAXRT, USER_TIMEOUT.as_secs() as u32), (TCP_KEEPCNT, KEEPALIVE_RETRIES)] {
+            // SAFETY: a valid socket, and a pointer to a DWORD of the
+            // length given, which setsockopt only reads.
+            unsafe {
+                setsockopt(socket, IPPROTO_TCP, option, (&value as *const u32).cast(), std::mem::size_of::<u32>() as i32);
+            }
+        }
+    }
+}
+
 /// Configure a TCP stream for long-lived tunnel use: enable `TCP_NODELAY`
-/// and `SO_KEEPALIVE` (30 s idle time) so intermediary NATs/firewalls don't
-/// silently drop idle connections.
+/// and `SO_KEEPALIVE` (probes after 30s idle, every 10s, 3 tries) so
+/// intermediary NATs/firewalls don't silently drop idle connections, and a
+/// peer that vanished is noticed within about a minute; on Linux, macOS and
+/// Windows, also while data is waiting for it (see
+/// [`set_retransmit_timeout`]).
 pub fn configure_stream(stream: &TcpStream) {
     stream.set_nodelay(true).ok();
     let sock = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE_TIME);
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd", windows))]
+    let keepalive = keepalive.with_interval(KEEPALIVE_INTERVAL);
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
     let _ = sock.set_tcp_keepalive(&keepalive);
+    set_retransmit_timeout(stream);
 }
 
 /// Bidirectional proxy with 64 KiB buffers and a 5-minute idle timeout.
@@ -120,6 +227,59 @@ impl Activity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_vanished_peer_is_noticed_within_about_a_minute() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        configure_stream(&stream);
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.keepalive_time().unwrap(), KEEPALIVE_TIME);
+        assert_eq!(sock.keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(sock.keepalive_retries().unwrap(), KEEPALIVE_RETRIES);
+        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(USER_TIMEOUT), "and with data waiting");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unacknowledged_data_is_given_up_on_within_about_a_minute() {
+        use std::os::fd::AsRawFd;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        configure_stream(&stream);
+        let mut secs: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: a valid socket, and a c_int buffer of the length given.
+        let rc = unsafe {
+            libc::getsockopt(stream.as_raw_fd(), libc::IPPROTO_TCP, TCP_RXT_CONNDROPTIME, (&mut secs as *mut libc::c_int).cast(), &mut len)
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(secs as u64, USER_TIMEOUT.as_secs());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unacknowledged_data_is_given_up_on_within_about_a_minute() {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{getsockopt, IPPROTO_TCP, SOCKET, TCP_KEEPCNT, TCP_MAXRT};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        configure_stream(&stream);
+        let read = |option: i32| -> u32 {
+            let mut value: u32 = 0;
+            let mut len = std::mem::size_of::<u32>() as i32;
+            // SAFETY: a valid socket, and a DWORD buffer of the length given.
+            let rc = unsafe {
+                getsockopt(stream.as_raw_socket() as SOCKET, IPPROTO_TCP, option, (&mut value as *mut u32).cast(), &mut len)
+            };
+            assert_eq!(rc, 0, "getsockopt({option})");
+            value
+        };
+        assert_eq!(u64::from(read(TCP_MAXRT)), USER_TIMEOUT.as_secs());
+        assert_eq!(read(TCP_KEEPCNT), KEEPALIVE_RETRIES);
+    }
     use tokio::io::{duplex, DuplexStream};
     use tokio::time::Instant;
 

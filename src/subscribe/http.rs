@@ -29,7 +29,7 @@ use tracing::{debug, info};
 
 use super::balancer::{Balancer, Pick};
 use super::proxy::{
-    establish_tunnel, note_tunnel_failure, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
+    establish_tunnel, note_tunnel_failure, own_node, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
 };
 use crate::config::{labels_match, Route};
 use crate::telemetry::{Attributes, SpanEvent, SpanKind, SpanRecord};
@@ -48,7 +48,9 @@ pub(super) struct HttpProxy {
     service_name: String,
     state: Arc<SharedState>,
     balancer: Arc<Balancer>,
-    client: Client<TunnelConnector, ProxyBody>,
+    /// Swapped for a fresh one (with an empty connection pool) when a node
+    /// hosting the service leaves; see [`HttpProxy::reset_pool`].
+    client: arc_swap::ArcSwap<Client<TunnelConnector, ProxyBody>>,
     retry_budget: RetryBudget,
 }
 
@@ -79,6 +81,16 @@ impl HttpProxies {
     pub fn retain(&self, keep: impl Fn(&str) -> bool) {
         self.map.lock().unwrap().retain(|name, _| keep(name));
     }
+
+    /// Close idle upstream connections of the services `affected` picks
+    /// (see [`HttpProxy::reset_pool`]).
+    pub fn reset_pools(&self, affected: impl Fn(&str) -> bool) {
+        for (name, proxy) in self.map.lock().unwrap().iter() {
+            if affected(name) {
+                proxy.reset_pool();
+            }
+        }
+    }
 }
 
 impl HttpProxy {
@@ -88,17 +100,21 @@ impl HttpProxy {
     }
 
     pub fn new(service_name: String, state: Arc<SharedState>, balancer: Arc<Balancer>) -> Arc<Self> {
-        let connector = TunnelConnector {
-            service_name: service_name.clone(),
-            state: state.clone(),
-        };
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            // The URI authority is a synthetic per-node pool key; the
-            // client's own Host header is forwarded instead.
-            .set_host(false)
-            .build(connector);
+        let client = arc_swap::ArcSwap::from_pointee(build_client(&service_name, &state));
         Arc::new(Self { service_name, state, balancer, client, retry_budget: RetryBudget::new() })
+    }
+
+    /// Close the idle keep-alive connections this proxy holds to its
+    /// service's nodes, by switching to a fresh client with an empty pool.
+    /// Requests in progress finish on their connections, which then close
+    /// rather than return to the old pool.
+    ///
+    /// Used when a node leaves: to that node a pooled keep-alive connection
+    /// is an open tunnel like any other, so it would hold up the node's
+    /// drain until the pool's idle timeout. (The other nodes' connections
+    /// are just reopened on the next request.)
+    pub fn reset_pool(&self) {
+        self.client.store(Arc::new(build_client(&self.service_name, &self.state)));
     }
 
     /// Serve HTTP/1.1 on one accepted client connection. The connection
@@ -139,11 +155,7 @@ impl HttpProxy {
 
         let (mut parts, body) = req.into_parts();
         strip_hop_by_hop(&mut parts.headers, upgrade);
-        if !parts.headers.contains_key(header::HOST) {
-            if let Ok(host) = HeaderValue::from_str(&self.service_name) {
-                parts.headers.insert(header::HOST, host);
-            }
-        }
+        set_upstream_host(&parts.uri, &mut parts.headers, &self.service_name);
         parts.headers.insert(
             HeaderName::from_static("traceparent"),
             HeaderValue::from_str(&upstream_trace.to_header()).expect("traceparent is ASCII"),
@@ -350,7 +362,7 @@ impl HttpProxy {
             *upstream.version_mut() = Version::HTTP_11;
             *upstream.headers_mut() = parts.headers.clone();
 
-            let sent = self.client.request(upstream);
+            let sent = self.client.load().request(upstream);
             let result = match backend.request_timeout {
                 Some(limit) => match tokio::time::timeout(limit, sent).await {
                     Ok(r) => r,
@@ -422,6 +434,20 @@ impl HttpProxy {
     }
 }
 
+/// A pooled HTTP/1.1 client whose connections are tunnels to `service_name`.
+fn build_client(service_name: &str, state: &Arc<SharedState>) -> Client<TunnelConnector, ProxyBody> {
+    let connector = TunnelConnector {
+        service_name: service_name.to_string(),
+        state: state.clone(),
+    };
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // The URI authority is a synthetic per-node pool key; the
+        // client's own Host header is forwarded instead.
+        .set_host(false)
+        .build(connector)
+}
+
 /// Serve HTTP/1.1 (with upgrades) on an accepted client connection until it
 /// closes. Once `shutdown` fires, the connection finishes the request it is
 /// on and then closes; an idle keep-alive connection closes at once.
@@ -454,6 +480,29 @@ struct RoutedTo {
     label: String,
     /// Labels an instance must carry to serve the request.
     labels: BTreeMap<String, String>,
+}
+
+/// The `Host` the upstream request carries. A request in absolute form (sent
+/// through `HTTP_PROXY` to `httpListen`) names its target in the URL, and a
+/// proxy forwards that, whatever `Host` the client sent (RFC 9112 §3.2.2);
+/// one with no `Host` at all gets the service's name.
+fn set_upstream_host(uri: &Uri, headers: &mut HeaderMap, service_name: &str) {
+    let target = uri.authority().map(|authority| match authority.port() {
+        // Without any `user@` the URL may carry.
+        Some(port) => format!("{}:{port}", authority.host()),
+        None => authority.host().to_string(),
+    });
+    match target.and_then(|t| HeaderValue::from_str(&t).ok()) {
+        Some(host) => {
+            headers.insert(header::HOST, host);
+        }
+        None if !headers.contains_key(header::HOST) => {
+            if let Ok(host) = HeaderValue::from_str(service_name) {
+                headers.insert(header::HOST, host);
+            }
+        }
+        None => {}
+    }
 }
 
 /// Find the first route matching the request and pick one of its backend
@@ -810,6 +859,7 @@ impl tower_service::Service<Uri> for TunnelConnector {
                 .load()
                 .get(&node_id)
                 .cloned()
+                .or_else(|| own_node(&state).filter(|own| own.id == node_id))
                 .ok_or_else(|| format!("unknown node {node_id}"))?;
             let tunnel = establish_tunnel(&node, service_name, &state).await?;
             Ok(TunnelIo(TokioIo::new(tunnel)))
@@ -860,6 +910,24 @@ mod tests {
             h.append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    #[test]
+    fn the_upstream_host_is_the_requests_target() {
+        let host_for = |uri: &str, client_host: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = client_host {
+                h.insert(header::HOST, HeaderValue::from_str(v).unwrap());
+            }
+            set_upstream_host(&uri.parse().unwrap(), &mut h, "web1");
+            h.get(header::HOST).map(|v| v.to_str().unwrap().to_string())
+        };
+        // Through HTTP_PROXY: the URL's host, whatever Host says.
+        assert_eq!(host_for("http://web1/x", Some("elsewhere")).as_deref(), Some("web1"));
+        assert_eq!(host_for("http://user@web1:8080/x", None).as_deref(), Some("web1:8080"));
+        // At the service's own port: the client's Host, or the service's name.
+        assert_eq!(host_for("/x", Some("api.example.com")).as_deref(), Some("api.example.com"));
+        assert_eq!(host_for("/x", None).as_deref(), Some("web1"));
     }
 
     #[test]
@@ -1048,6 +1116,14 @@ mod tests {
         assert!(!Arc::ptr_eq(&a, &proxies.get("web")));
         proxies.retain(|name| name == "web");
         assert!(!Arc::ptr_eq(&a, &proxies.get("api")), "a dropped service gets a fresh proxy");
+
+        // Resetting a service's pool swaps in a fresh client (empty pool)
+        // for that service only.
+        let (api, web) = (proxies.get("api"), proxies.get("web"));
+        let (api_client, web_client) = (api.client.load_full(), web.client.load_full());
+        proxies.reset_pools(|name| name == "api");
+        assert!(!Arc::ptr_eq(&api_client, &api.client.load_full()));
+        assert!(Arc::ptr_eq(&web_client, &web.client.load_full()));
     }
 
     #[test]

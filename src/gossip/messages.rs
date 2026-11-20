@@ -10,17 +10,43 @@ use crate::config::{DynamicConfig, NodeInfo};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Message {
-    /// Full state synchronisation: send our current config and known peer list.
+    /// State synchronisation: our config and known nodes.
+    ///
+    /// Between nodes that both send `have` (this version on), a sync is a
+    /// delta: the initiator sends its own record, its digest and beats; the
+    /// reply carries only records the initiator lacks or holds older, and
+    /// the config only if it's newer. Older nodes always send and get
+    /// everything, and ignore the new fields.
     Sync {
         config: DynamicConfig,
         nodes: Vec<NodeInfo>,
+        /// Liveness of nodes with no address (see `SignedBeat`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        beats: Vec<crate::config::SignedBeat>,
+        /// What the sender holds, so a reply can leave out the rest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        have: Option<SyncDigest>,
+        /// `config` is a placeholder: the sender's isn't newer than what
+        /// the receiver has (per its digest). Never sent to older nodes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        config_elided: bool,
     },
     /// Announce an updated dynamic configuration.
     ConfigUpdate { config: DynamicConfig },
     /// Announce that a new node has joined the cluster.
     NodeJoin { id: String, addr: String },
-    /// Announce that a node has left the cluster.
-    NodeLeave { id: String },
+    /// Announce that a node has left the cluster. Only the node itself may
+    /// send it. `heartbeat` is its last one, so gossip still carrying an
+    /// older copy of the node can't re-add it (`0` from older versions).
+    NodeLeave {
+        id: String,
+        #[serde(default)]
+        heartbeat: u64,
+        /// Its final signed record (`left: true`), which peers relay on to
+        /// nodes this message doesn't reach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<crate::config::SignedNode>,
+    },
     /// Request to tunnel traffic to a service on a specific node.
     TunnelRequest {
         node_id: String,
@@ -38,6 +64,10 @@ pub enum Message {
         bind: String,
         dynamic_config: DynamicConfig,
         known_nodes: Vec<NodeInfo>,
+        /// The daemon accepts only admin-signed config changes, so a CLI
+        /// must sign its change and send it as `AdminOp::ConfigPush`.
+        #[serde(default)]
+        require_signed_config: bool,
     },
     /// Upgrade this TCP connection to a yamux multiplexed tunnel session.
     MuxTunnel {},
@@ -47,9 +77,44 @@ pub enum Message {
     AdminResponse { result: AdminResult },
 }
 
+/// What a `Sync` sender holds: the version of each node record (departed
+/// nodes' last ones included) and of its config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDigest {
+    #[serde(default)]
+    pub records: Vec<(String, u64)>,
+    #[serde(default)]
+    pub config_version: u64,
+    /// Content hash of the config, to tell two configs at one version apart.
+    #[serde(default)]
+    pub config_hash: u64,
+    /// Whether the sender wants the beats it lacks in the reply. A node
+    /// syncs with every peer each round and they'd all send the same ones,
+    /// so it asks only a few. (Absent, from a node that predates this: yes.)
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub want_beats: bool,
+    /// The beat held for each node with no address, when `want_beats`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beats: Vec<(String, u64)>,
+    /// Keep this connection for the next sync rather than opening a new one
+    /// each round: in a sync, the sender asks; in the reply, the peer agrees
+    /// (and waits for it). Absent from older nodes, which close after one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_open: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 /// A single admin operation. Extend this enum to add new mutating commands
 /// without changing the connection-dispatch table.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AdminOp {
     ServiceAdd {
@@ -92,9 +157,80 @@ pub enum AdminOp {
         owner_node_id: String,
         name: String,
     },
+    /// Revoke certificates: every one for each of `nodes` (names), and each
+    /// of `certs` (SHA-256 fingerprints).
+    Revoke {
+        #[serde(default)]
+        nodes: Vec<String>,
+        #[serde(default)]
+        certs: Vec<String>,
+    },
+    /// Undo a `Revoke` of these.
+    Unrevoke {
+        #[serde(default)]
+        nodes: Vec<String>,
+        #[serde(default)]
+        certs: Vec<String>,
+    },
+    /// Replace the whole config with `config`, which an admin computed and
+    /// signed (required by daemons with `requireSignedConfig`). Refused with
+    /// `Conflict` unless the daemon is still at `base_version`, the version
+    /// the change was made to; the CLI then re-reads and retries.
+    ConfigPush {
+        config: DynamicConfig,
+        base_version: u64,
+    },
 }
 
 impl AdminOp {
+    /// Apply this edit to `dc`, bumping its version. The daemon applies
+    /// edits for unsigned clusters; a CLI applies them itself to sign the
+    /// result. `ConfigPush` isn't an edit and is refused.
+    pub fn apply(self, dc: &mut DynamicConfig) -> Result<u64, crate::config::MutateErr> {
+        use crate::config::{MutateErr, Service};
+        match self {
+            AdminOp::ServiceAdd {
+                group,
+                name,
+                owner_node_id,
+                port,
+                domains,
+                weight,
+                max_connections,
+                protocol,
+                request_timeout_ms,
+                health_path,
+                labels,
+                meta,
+                local_port,
+            } => {
+                let svc = Service {
+                    name,
+                    node_id: owner_node_id,
+                    node_port: port,
+                    domains,
+                    weight,
+                    max_connections,
+                    protocol,
+                    request_timeout_ms,
+                    health_path,
+                    labels,
+                    meta,
+                    local_port,
+                };
+                Ok(dc.upsert_service(&group, svc))
+            }
+            AdminOp::RoutesSet { service, routes } => dc.set_routes(&service, routes),
+            AdminOp::ServiceRename { group, owner_node_id, from, to } => {
+                dc.rename_service(&group, &owner_node_id, &from, &to)
+            }
+            AdminOp::ServiceRemove { group, owner_node_id, name } => dc.remove_service(&group, &owner_node_id, &name),
+            AdminOp::Revoke { nodes, certs } => dc.revoke(&nodes, &certs),
+            AdminOp::Unrevoke { nodes, certs } => dc.unrevoke(&nodes, &certs),
+            AdminOp::ConfigPush { .. } => Err(MutateErr::Invalid("a pushed config is not an edit".into())),
+        }
+    }
+
     /// A `ServiceAdd` carrying every field of `svc`.
     pub fn service_add(group: String, svc: crate::config::Service) -> Self {
         AdminOp::ServiceAdd {
@@ -122,13 +258,28 @@ pub enum AdminResult {
     Err { code: AdminErrCode, message: String },
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AdminErrCode {
     Unauthorized,
     Validation,
     NotFound,
     Internal,
+    /// The config changed since the change was made; re-read and retry.
+    /// (Only `ConfigPush` gets it, which older CLIs never send.)
+    Conflict,
+}
+
+impl From<&crate::config::MutateErr> for AdminErrCode {
+    fn from(err: &crate::config::MutateErr) -> Self {
+        use crate::config::MutateErr;
+        match err {
+            MutateErr::GroupNotFound { .. } | MutateErr::ServiceNotFound { .. } => AdminErrCode::NotFound,
+            MutateErr::DuplicateService { .. } | MutateErr::Invalid(_) => AdminErrCode::Validation,
+            MutateErr::Unauthorized(_) => AdminErrCode::Unauthorized,
+            MutateErr::Conflict { .. } => AdminErrCode::Conflict,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +346,7 @@ mod tests {
                         local_port: None,
                     }],
                 }],
+                ..Default::default()
             },
         }
     }
@@ -274,9 +426,9 @@ mod tests {
 
     #[test]
     fn node_leave_round_trip() {
-        let msg = Message::NodeLeave { id: "n1".into() };
+        let msg = Message::NodeLeave { id: "n1".into(), heartbeat: 7, record: None };
         match msgpack_round_trip(&msg) {
-            Message::NodeLeave { id } => assert_eq!(id, "n1"),
+            Message::NodeLeave { id, heartbeat, .. } => assert_eq!((id.as_str(), heartbeat), ("n1", 7)),
             _ => panic!("wrong variant"),
         }
     }
@@ -304,6 +456,7 @@ mod tests {
                         local_port: None,
                     }],
                 }],
+                ..Default::default()
             },
         };
         match msgpack_round_trip(&msg) {
@@ -318,7 +471,10 @@ mod tests {
     #[test]
     fn sync_round_trip() {
         let msg = Message::Sync {
-            config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![] },
+            config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![], ..Default::default() },
+            beats: vec![],
+            have: None,
+            config_elided: false,
             nodes: vec![NodeInfo {
                 id: "n1".into(),
                 addr: "10.0.0.1:8080".into(),
@@ -328,10 +484,11 @@ mod tests {
                     version: 9,
                     unhealthy: vec!["api".into()],
                 },
+                ..Default::default()
             }],
         };
         match msgpack_round_trip(&msg) {
-            Message::Sync { config, nodes } => {
+            Message::Sync { config, nodes, .. } => {
                 assert_eq!(config.version, 1);
                 assert_eq!(nodes.len(), 1);
                 assert_eq!(nodes[0].id, "n1");
@@ -350,6 +507,7 @@ mod tests {
             relay: None,
             last_seen: None,
             health: Default::default(),
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&node).unwrap().contains("health"));
         // A node that recovered still reports, so peers clear the old entry.
@@ -404,11 +562,13 @@ mod tests {
             mode: "node".into(),
             node_id: "host1".into(),
             bind: "0.0.0.0:8080".into(),
-            dynamic_config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![] },
+            dynamic_config: DynamicConfig { version: 1, service_groups: vec![], routes: vec![], ..Default::default() },
             known_nodes: vec![],
+            require_signed_config: true,
         };
         match msgpack_round_trip(&msg) {
-            Message::StatusResponse { mode, node_id, .. } => {
+            Message::StatusResponse { mode, node_id, require_signed_config, .. } => {
+                assert!(require_signed_config);
                 assert_eq!(mode, "node");
                 assert_eq!(node_id, "host1");
             }

@@ -6,18 +6,13 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Operating mode of this daemon instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
+    #[default]
     Node,
     Subscribe,
     NodeSubscribe,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::Node
-    }
 }
 
 /// A single service exposed by a node.
@@ -263,8 +258,12 @@ impl SubscribeFilter {
     }
 }
 
+/// Largest encoded config (signature included) accepted as a change: a
+/// quarter of a gossip message, leaving the rest for the node list.
+pub const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+
 /// Versioned, gossip-replicated configuration shared across the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicConfig {
     pub version: u64,
@@ -272,16 +271,70 @@ pub struct DynamicConfig {
     /// L7 routing rules for `http` services, in evaluation order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<Route>,
+    /// Node (or CLI host) that made this version. Settles which of two
+    /// different changes made at the same version wins, the same way on
+    /// every node (see [`DynamicConfig::supersedes`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub changed_by: String,
+    /// Certificates no node accepts any more, for anything: connections,
+    /// node records and beats, config signatures (see
+    /// `crate::tls::Revocations`).
+    #[serde(default, skip_serializing_if = "Revoked::is_empty")]
+    pub revoked: Revoked,
+    /// An admin's signature over this config, when it has one. Nodes with
+    /// `requireSignedConfig` accept a change only if it is signed (see
+    /// `crate::signing`); everyone else keeps and relays it as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ConfigSignature>,
 }
 
-impl Default for DynamicConfig {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            service_groups: Vec::new(),
-            routes: Vec::new(),
-        }
+/// Revoked certificates (see [`DynamicConfig::revoked`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Revoked {
+    /// Names (certificate CNs) no certificate is accepted for, whoever
+    /// issued it when: for a node removed for good.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// SHA-256 fingerprints (lowercase hex) of single certificates: for a
+    /// key that leaked. The node can be issued a new certificate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certs: Vec<String>,
+}
+
+impl Revoked {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.certs.is_empty()
     }
+}
+
+/// `text` as a certificate fingerprint: 64 hex digits, any case, with or
+/// without `:` between bytes (as `openssl x509 -fingerprint -sha256`
+/// prints them). Returns it in lowercase without separators.
+pub fn normalize_fingerprint(text: &str) -> std::result::Result<String, String> {
+    let hex: String = text.chars().filter(|c| *c != ':').collect::<String>().to_ascii_lowercase();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("'{text}' is not a SHA-256 certificate fingerprint (64 hex digits)"));
+    }
+    Ok(hex)
+}
+
+/// An admin's signature over a [`DynamicConfig`].
+///
+/// It carries the exact JSON text that was signed, so it verifies no matter
+/// how the config was re-encoded on the way (an older node may drop fields
+/// it doesn't know). A verified config is always decoded from that text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSignature {
+    /// The signed config (with no `signature`), as JSON text.
+    pub config_json: String,
+    /// The signer's certificate (DER, hex). It must chain to the cluster CA
+    /// and name an admin (`adminCns`).
+    pub signer_cert: String,
+    /// ECDSA P-256/SHA-256 signature (DER, hex) over a fixed prefix and
+    /// `config_json`.
+    pub signature: String,
 }
 
 /// Failure modes for in-memory mutations of `DynamicConfig`.
@@ -294,6 +347,10 @@ pub enum MutateErr {
     ServiceNotFound { group: String, node: String, name: String },
     DuplicateService { group: String, node: String, name: String },
     Invalid(String),
+    /// Not signed (validly, by an admin) where a signature is required.
+    Unauthorized(String),
+    /// A pushed config was made to an older version than `current`.
+    Conflict { current: u64 },
 }
 
 impl fmt::Display for MutateErr {
@@ -308,7 +365,10 @@ impl fmt::Display for MutateErr {
                 f,
                 "service '{name}' already exists on node '{node}' in group '{group}'"
             ),
-            MutateErr::Invalid(msg) => write!(f, "{msg}"),
+            MutateErr::Invalid(msg) | MutateErr::Unauthorized(msg) => write!(f, "{msg}"),
+            MutateErr::Conflict { current } => {
+                write!(f, "the config changed (now version {current}) since this change was made to it")
+            }
         }
     }
 }
@@ -316,6 +376,171 @@ impl fmt::Display for MutateErr {
 impl std::error::Error for MutateErr {}
 
 impl DynamicConfig {
+    /// Whether `self` and `other` configure the same services and routes,
+    /// whatever their version, author and signature.
+    pub fn same_settings(&self, other: &DynamicConfig) -> bool {
+        let bare = |dc: &DynamicConfig| DynamicConfig {
+            version: 0,
+            changed_by: String::new(),
+            signature: None,
+            ..dc.clone()
+        };
+        bare(self) == bare(other)
+    }
+
+    /// Whether this config should replace `current`: it has a higher
+    /// version, or the same version with different content that wins the
+    /// tie-break (higher `changedBy`, then the longer serialized form, then
+    /// the larger one).
+    ///
+    /// Without the tie-break, two nodes changing the config at once both
+    /// make version N+1, each node keeps whichever arrived first, and the
+    /// cluster stays split until the next change. Comparing `changedBy`
+    /// first also keeps a newer node's config from losing to the copy an
+    /// older node relays without the fields it doesn't know (and without
+    /// `changedBy`). Then the longer form: one change, as made, against a
+    /// copy of it relayed by a node that dropped fields it doesn't know (a
+    /// signature, a newer setting). The fuller copy must win, or a rolling
+    /// upgrade would erase what the newer nodes added, cluster-wide.
+    pub fn supersedes(&self, current: &DynamicConfig) -> bool {
+        if self.version != current.version {
+            return self.version > current.version;
+        }
+        if self == current {
+            return false;
+        }
+        let key = |dc: &DynamicConfig| {
+            let bytes = serde_json::to_vec(dc).unwrap_or_default();
+            (dc.changed_by.clone(), bytes.len(), bytes)
+        };
+        key(self) > key(current)
+    }
+
+    /// Every structural problem with this config, as messages. Empty means
+    /// valid. Messages are deterministic, so two configs' lists can be
+    /// compared (see [`new_problem`]).
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems: Vec<String> = Vec::new();
+        let mut report = |problem: String| {
+            if !problems.contains(&problem) {
+                problems.push(problem);
+            }
+        };
+
+        let mut group_names = HashSet::new();
+        // A domain may be shared by instances of one service, but not
+        // claimed by two different services.
+        let mut domain_owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        // Instances of one service share a group: everything else (routes,
+        // proxies, the REST API, httpListen) knows a service by name only.
+        let mut service_group: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+
+        for group in &self.service_groups {
+            if !group_names.insert(group.name.as_str()) {
+                report(format!("duplicate service group name: '{}'", group.name));
+            }
+
+            // The same name on several nodes is one service with several
+            // instances; only the same name twice on one node is a duplicate.
+            let mut instances = HashSet::new();
+            for svc in &group.services {
+                if !instances.insert((svc.node_id.as_str(), svc.name.as_str())) {
+                    report(format!(
+                        "duplicate service '{}' on node '{}' in group '{}'",
+                        svc.name, svc.node_id, group.name
+                    ));
+                }
+                match service_group.insert(svc.name.as_str(), group.name.as_str()) {
+                    Some(other) if other != group.name => report(format!(
+                        "service '{}' is in both group '{other}' and group '{}'; all instances of a service must be in one group",
+                        svc.name, group.name
+                    )),
+                    _ => {}
+                }
+                if let Some(path) = &svc.health_path {
+                    if let Err(e) = validate_health_path(path) {
+                        report(format!("service '{}/{}' on node '{}': {e}", group.name, svc.name, svc.node_id));
+                    }
+                }
+                for domain in &svc.domains {
+                    match domain_owner.insert(domain.as_str(), svc.name.as_str()) {
+                        Some(owner) if owner != svc.name => report(format!(
+                            "domain '{}' is claimed by both '{}' and '{}/{}'",
+                            domain, owner, group.name, svc.name
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut routed: Vec<&str> = self.routes.iter().map(|r| r.service.as_str()).collect();
+        routed.sort();
+        routed.dedup();
+        for service in routed {
+            if let Err(e) = self.validate_route_target(service) {
+                report(e);
+            }
+            let routes: Vec<Route> = self.routes.iter().filter(|r| r.service == service).cloned().collect();
+            if let Err(e) = validate_routes(service, &routes) {
+                report(e);
+            }
+        }
+
+        // Fixed local ports: consistent per service and distinct across
+        // services. (Clashes with a daemon's own listeners depend on its
+        // static config; `Config::validate` checks those.)
+        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+        for name in self.service_names() {
+            match self.local_port_for(name) {
+                Err(e) => report(e),
+                Ok(Some(0)) => report(format!("localPort of '{name}' must not be 0")),
+                Ok(Some(port)) => {
+                    if let Some(other) = port_owner.insert(port, name) {
+                        report(format!("localPort {port} of '{name}' is already used by {other}"));
+                    }
+                }
+                Ok(None) => {}
+            }
+        }
+
+        for node in &self.revoked.nodes {
+            if node.is_empty() || node.contains(':') {
+                report(format!("revoked node name '{node}' is not a node name"));
+            }
+        }
+        for cert in &self.revoked.certs {
+            match normalize_fingerprint(cert) {
+                Ok(normal) if normal == *cert => {}
+                Ok(normal) => report(format!("revoked certificate '{cert}' must be written as {normal}")),
+                Err(e) => report(format!("revoked certificate: {e}")),
+            }
+        }
+
+        // It must fit in the gossip messages that carry it (with room for
+        // the node list), or it would never reach the rest of the cluster.
+        let size = rmp_serde::to_vec_named(self).map_or(usize::MAX, |bytes| bytes.len());
+        if size > MAX_CONFIG_BYTES {
+            // No byte count: changes are refused only for problems they add
+            // (see `new_problem`), and with the size in it every change to a
+            // config already over the limit would read as a new problem,
+            // even one that shrinks it.
+            report(format!(
+                "the config is too large to gossip: over the {MAX_CONFIG_BYTES}-byte limit encoded (a signed config \
+                 counts its signed copy too)"
+            ));
+        }
+        problems
+    }
+
+    /// Distinct service names, sorted.
+    fn service_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.service_groups.iter().flat_map(|g| &g.services).map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Insert a service into `group`, or replace it in place when an entry
     /// with the same `(name, node_id)` already exists. Bumps `version` on
     /// success and returns the new version.
@@ -375,6 +600,48 @@ impl DynamicConfig {
             return Err(format!("routes for '{service}' require every instance to have protocol: http"));
         }
         Ok(())
+    }
+
+    /// Revoke `nodes` (every certificate for those names) and `certs`
+    /// (fingerprints, see [`normalize_fingerprint`]). Bumps `version` and
+    /// returns the new version; refused if all were revoked already.
+    pub fn revoke(&mut self, nodes: &[String], certs: &[String]) -> Result<u64, MutateErr> {
+        let certs = certs.iter().map(|c| normalize_fingerprint(c)).collect::<std::result::Result<Vec<_>, _>>().map_err(MutateErr::Invalid)?;
+        let mut added = false;
+        for node in nodes {
+            if node.is_empty() || node.contains(':') {
+                return Err(MutateErr::Invalid(format!("'{node}' is not a node name")));
+            }
+            if !self.revoked.nodes.contains(node) {
+                self.revoked.nodes.push(node.clone());
+                added = true;
+            }
+        }
+        for cert in certs {
+            if !self.revoked.certs.contains(&cert) {
+                self.revoked.certs.push(cert);
+                added = true;
+            }
+        }
+        if !added {
+            return Err(MutateErr::Invalid("already revoked".into()));
+        }
+        self.version += 1;
+        Ok(self.version)
+    }
+
+    /// Undo [`Self::revoke`] for `nodes` and `certs`. Bumps `version` and
+    /// returns the new version; refused if none of them was revoked.
+    pub fn unrevoke(&mut self, nodes: &[String], certs: &[String]) -> Result<u64, MutateErr> {
+        let certs = certs.iter().map(|c| normalize_fingerprint(c)).collect::<std::result::Result<Vec<_>, _>>().map_err(MutateErr::Invalid)?;
+        let before = self.revoked.clone();
+        self.revoked.nodes.retain(|n| !nodes.contains(n));
+        self.revoked.certs.retain(|c| !certs.contains(c));
+        if self.revoked == before {
+            return Err(MutateErr::Invalid("not revoked".into()));
+        }
+        self.version += 1;
+        Ok(self.version)
     }
 
     /// Replace all routes for `service` with `routes` (empty clears them).
@@ -464,8 +731,16 @@ impl DynamicConfig {
     }
 }
 
+/// The first problem `after` has that `before` didn't. Changes are checked
+/// with this: one is refused for what it breaks, not for problems the config
+/// already had (which would otherwise block every unrelated change).
+pub fn new_problem(before: &DynamicConfig, after: &DynamicConfig) -> Option<String> {
+    let existing = before.problems();
+    after.problems().into_iter().find(|p| !existing.contains(p))
+}
+
 /// Identity and address of a known peer node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
     pub id: String,
@@ -473,23 +748,121 @@ pub struct NodeInfo {
     /// If set, this node is behind NAT and reachable only via this relay address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
-    /// Local-only liveness marker: when this node was last confirmed reachable
-    /// (a successful outbound gossip sync, or a reverse-connection
-    /// registration). Never gossiped or persisted — each daemon maintains it
-    /// independently. `None` means not yet confirmed.
+    /// Local-only liveness marker for load balancing: when this node was last
+    /// confirmed reachable (a successful outbound gossip sync or a
+    /// reverse-connection registration; for a node with no address, which
+    /// can't be contacted directly, a rising `heartbeat`). Never gossiped or
+    /// persisted. `None` means not yet confirmed.
     #[serde(skip)]
     pub last_seen: Option<Instant>,
     /// Health of the services this node hosts, as reported by the node itself.
     #[serde(default, skip_serializing_if = "ServiceHealth::is_unset")]
     pub health: ServiceHealth,
+    /// Liveness counter only the node itself advances (its incarnation, then
+    /// a counter; see `SharedState::next_heartbeat`), relayed by everyone
+    /// else. A rising value proves the node is alive even to peers that
+    /// can't reach it. `0`: a node too old to send one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub heartbeat: u64,
+    /// Local-only: when we last had any evidence the node is alive (direct
+    /// contact or a rising `heartbeat`). A node silent for long enough is
+    /// forgotten.
+    #[serde(skip)]
+    pub heard_at: Option<Instant>,
+    /// The node's own signed account of itself, relayed as is. When present
+    /// (and valid), `addr`, `heartbeat`, `health` and `relays` come from it
+    /// and nothing anyone else says about the node can change them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed: Option<SignedNode>,
+    /// Local-only, from the signed record: the relays (node ids) a NAT'd
+    /// node holds reverse connections to, the only ones its tunnels may go
+    /// through.
+    #[serde(skip)]
+    pub relays: Vec<String>,
+    /// Local-only: `addr` is where a relaying node reaches it (its record
+    /// says only a wildcard), not what it told us itself. Such an address
+    /// gives way to another relayer's while it doesn't work.
+    #[serde(skip)]
+    pub addr_relayed: bool,
+    /// Local-only: what its signed record says of it (`NodeRecord::subscriber`).
+    #[serde(skip)]
+    pub subscriber: bool,
+    /// Local-only: this entry was made by a reverse registration here (we
+    /// relay for the node), so registrations show whether it's alive and
+    /// it can expire like any other (see `gossip::expire_silent_nodes`).
+    #[serde(skip)]
+    pub registered_here: bool,
+    /// Local-only: the version (`heartbeat`) of the signed record held.
+    #[serde(skip)]
+    pub record_version: u64,
+    /// Local-only: the latest beat verified for a node with no address,
+    /// relayed so peers that can't reach it know it's alive.
+    #[serde(skip)]
+    pub beat: Option<SignedBeat>,
+}
+
+/// Proof that a node (one with no address, which peers can't contact) was
+/// alive at `beat`, signed by it. Much smaller than its record, which
+/// changes only when something in it does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedBeat {
+    pub id: String,
+    /// Ordered like heartbeats.
+    pub beat: u64,
+    /// ECDSA P-256/SHA-256 signature (DER, hex) by the key of the node's
+    /// record certificate.
+    pub signature: String,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// What a node says about itself; see [`NodeInfo::signed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRecord {
+    pub id: String,
+    /// Where peers connect to it; empty for an `outboundOnly` node.
+    pub addr: String,
+    /// Orders records: a node's newer record always has a higher one. It
+    /// changes only when the record does (or the node restarts); liveness
+    /// comes from direct contact or, for a node with no address, beats.
+    pub heartbeat: u64,
+    #[serde(default)]
+    pub health: ServiceHealth,
+    /// Node ids of the relays it holds reverse connections to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+    /// The node's last record: it left the cluster. Relayed like any other,
+    /// so the departure reaches nodes the leave message didn't.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub left: bool,
+    /// A subscribe-mode node: it uses services, hosts none, and is often
+    /// a client machine, so NAT'd nodes don't pick it as a relay (other
+    /// subscribers' traffic would go through it) while there are others.
+    /// Absent from older nodes' records: they may be anything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subscriber: bool,
+}
+
+/// A [`NodeRecord`] signed by its node: the exact JSON text, the node's
+/// certificate (DER, hex) and an ECDSA P-256/SHA-256 signature (DER, hex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedNode {
+    pub record_json: String,
+    pub cert: String,
+    pub signature: String,
 }
 
 /// A node's self-reported health for the services it hosts.
 ///
 /// Only the hosting node writes this; everyone else relays it through gossip.
 /// `version` orders reports so a relayed copy never overwrites a fresher one.
-/// It is derived from wall-clock milliseconds, so a restarted node's reports
-/// still supersede the ones peers held from before the restart.
+/// It is ordered like heartbeats, so a restarted node's reports still
+/// supersede the ones peers held from before the restart.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceHealth {
@@ -559,6 +932,18 @@ pub struct Config {
     /// callers can use `HTTP_PROXY` instead of per-service ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_listen: Option<String>,
+    /// Accept a config change (from gossip, admin RPC or this node's own
+    /// config file) only if a certificate named in `adminCns` signed it, so
+    /// no other node can rewrite the cluster's config. Enable it on every
+    /// node once all run a version that supports it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_signed_config: bool,
+    /// Settings this version doesn't know: most likely a typo (a
+    /// `requireSignedConfg` would leave signing off without a word), or one
+    /// from a newer version. Kept as they are when the file is rewritten;
+    /// the daemon warns of them, and `stouter check` fails on them.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 /// Where and how much to export as OpenTelemetry spans.
@@ -630,6 +1015,8 @@ impl Default for Config {
             api_port: None,
             tracing: None,
             http_listen: None,
+            require_signed_config: false,
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -637,110 +1024,61 @@ impl Default for Config {
 impl Config {
     /// Load configuration from a JSON file at `path`.
     pub fn load(path: &str) -> Result<Self> {
-        let data = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&data)?;
+        let data = std::fs::read_to_string(path).with_context(|| format!("failed to read config file '{path}'"))?;
+        let config: Self = serde_json::from_str(&data).with_context(|| format!("invalid JSON in '{path}'"))?;
         Ok(config)
     }
 
-    /// Validate structural invariants of the dynamic config:
-    /// - service group names are unique
-    /// - service names within a group are unique
-    /// - domain names are globally unique across all services
+    /// Load `path`, or the default config if there is no such file. A file
+    /// that exists but can't be read or parsed is an error, never defaults:
+    /// a command that went on and saved would replace it, settings and all.
+    pub fn load_or_default(path: &str) -> Result<Self> {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            _ => Self::load(path),
+        }
+    }
+
+    /// Everything wrong with the config: [`Config::validate_local`]'s error,
+    /// else the first of [`Config::config_problems`]. What `stouter check`
+    /// reports.
     pub fn validate(&self) -> Result<()> {
-        let mut group_names = HashSet::new();
-        // A domain may be shared by instances of one service, but not
-        // claimed by two different services.
-        let mut domain_owner: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-
-        for group in &self.dynamic_config.service_groups {
-            if !group_names.insert(group.name.as_str()) {
-                return Err(anyhow!("duplicate service group name: '{}'", group.name));
-            }
-
-            // The same name on several nodes is one service with several
-            // instances; only the same name twice on one node is a duplicate.
-            let mut instances = HashSet::new();
-            for svc in &group.services {
-                if !instances.insert((svc.node_id.as_str(), svc.name.as_str())) {
-                    return Err(anyhow!(
-                        "duplicate service '{}' on node '{}' in group '{}'",
-                        svc.name,
-                        svc.node_id,
-                        group.name
-                    ));
-                }
-                if let Some(path) = &svc.health_path {
-                    validate_health_path(path).map_err(|e| {
-                        anyhow!("service '{}/{}' on node '{}': {e}", group.name, svc.name, svc.node_id)
-                    })?;
-                }
-                for domain in &svc.domains {
-                    match domain_owner.insert(domain.as_str(), svc.name.as_str()) {
-                        Some(owner) if owner != svc.name => {
-                            return Err(anyhow!(
-                                "domain '{}' is claimed by both '{}' and '{}/{}'",
-                                domain,
-                                owner,
-                                group.name,
-                                svc.name
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        self.validate_local()?;
+        if let Some(problem) = self.unknown_settings().into_iter().next() {
+            return Err(anyhow!(problem));
         }
-
-        let mut routed: Vec<&str> = self.dynamic_config.routes.iter().map(|r| r.service.as_str()).collect();
-        routed.sort();
-        routed.dedup();
-        for service in routed {
-            self.dynamic_config.validate_route_target(service).map_err(|e| anyhow!(e))?;
-            let routes: Vec<Route> = self
-                .dynamic_config
-                .routes
-                .iter()
-                .filter(|r| r.service == service)
-                .cloned()
-                .collect();
-            validate_routes(service, &routes).map_err(|e| anyhow!(e))?;
+        match self.config_problems().into_iter().next() {
+            Some(problem) => Err(anyhow!(problem)),
+            None => Ok(()),
         }
+    }
 
-        // Fixed local ports: consistent per service, distinct across services,
-        // and clear of the daemon's own loopback listeners.
-        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+    /// Check this node's own settings (everything but `dynamicConfig`): a
+    /// problem here is the operator's to fix, so the daemon won't start
+    /// with one.
+    pub fn validate_local(&self) -> Result<()> {
         let subscribes = matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe);
-        if subscribes {
-            port_owner.insert(self.api_port(), "the REST API (apiPort)");
+        // Peers know a node by its id (its certificate's CN), and ignore one
+        // that looks like an address rather than a name.
+        if self.node_id.is_empty() {
+            return Err(anyhow!("`nodeId` is empty: set it to this host's name (`stouter init` does)"));
+        }
+        if self.node_id.contains(':') || self.node_id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(anyhow!(
+                "`nodeId` '{}' isn't a name: no ':' (peers would take it for an address and ignore the node), \
+                 spaces or control characters",
+                self.node_id
+            ));
         }
         if let Some(listen) = &self.http_listen {
             let addr: std::net::SocketAddr = listen
                 .parse()
                 .map_err(|e| anyhow!("httpListen '{listen}' is not an address like 127.0.0.1:15001: {e}"))?;
-            if addr.ip().is_loopback() || addr.ip().is_unspecified() {
-                port_owner.insert(addr.port(), "httpListen");
-            }
             if !subscribes {
                 return Err(anyhow!("`httpListen` is only valid in subscribe or nodeSubscribe mode"));
             }
-        }
-        let mut names: Vec<&str> = self
-            .dynamic_config
-            .service_groups
-            .iter()
-            .flat_map(|g| &g.services)
-            .map(|s| s.name.as_str())
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            if let Some(port) = self.dynamic_config.local_port_for(name).map_err(|e| anyhow!(e))? {
-                if port == 0 {
-                    return Err(anyhow!("localPort of '{name}' must not be 0"));
-                }
-                if let Some(other) = port_owner.insert(port, name) {
-                    return Err(anyhow!("localPort {port} of '{name}' is already used by {other}"));
-                }
+            if (addr.ip().is_loopback() || addr.ip().is_unspecified()) && addr.port() == self.api_port() {
+                return Err(anyhow!("httpListen port {} is already used by the REST API (apiPort)", addr.port()));
             }
         }
 
@@ -748,15 +1086,65 @@ impl Config {
             tracing.validate().map_err(|e| anyhow!(e))?;
         }
 
-        if self.subscribe_filter.is_some()
-            && !matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe)
-        {
+        if usize::from(self.reverse_pool_size.unwrap_or(0)) > crate::node::relay::MAX_IDLE_REVERSE_PER_NODE {
+            return Err(anyhow!(
+                "reversePoolSize may be at most {}: relays refuse more idle reverse connections from one node",
+                crate::node::relay::MAX_IDLE_REVERSE_PER_NODE
+            ));
+        }
+
+        if self.require_signed_config && self.admin_cns.is_empty() {
+            return Err(anyhow!(
+                "`requireSignedConfig` needs `adminCns`: without an admin, no change could ever be signed"
+            ));
+        }
+
+        if self.subscribe_filter.is_some() && !subscribes {
             return Err(anyhow!(
                 "`subscribeFilter` is only valid in subscribe or nodeSubscribe mode"
             ));
         }
 
         Ok(())
+    }
+
+    /// Settings in the file this version doesn't know (see [`Config::unknown`]),
+    /// as messages.
+    pub fn unknown_settings(&self) -> Vec<String> {
+        self.unknown
+            .keys()
+            .map(|key| format!("unknown setting '{key}' (a typo? it is ignored)"))
+            .collect()
+    }
+
+    /// Problems with the dynamic config, as it stands here: its own (see
+    /// [`DynamicConfig::problems`]: e.g. duplicate group, service or domain
+    /// names), and fixed `localPort`s that collide with this daemon's own
+    /// listeners. The dynamic config is the cluster's, so a daemon starts
+    /// with these, logging them: a newer version may already fix them, and
+    /// refusing to start would strand the node over someone else's change.
+    pub fn config_problems(&self) -> Vec<String> {
+        let mut problems = self.dynamic_config.problems();
+
+        // Fixed local ports must stay clear of the daemon's own loopback
+        // listeners.
+        let mut port_owner: std::collections::HashMap<u16, &str> = std::collections::HashMap::new();
+        if matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe) {
+            port_owner.insert(self.api_port(), "the REST API (apiPort)");
+            if let Some(Ok(addr)) = self.http_listen.as_deref().map(str::parse::<std::net::SocketAddr>) {
+                if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+                    port_owner.insert(addr.port(), "httpListen");
+                }
+            }
+        }
+        for name in self.dynamic_config.service_names() {
+            if let Ok(Some(port)) = self.dynamic_config.local_port_for(name) {
+                if let Some(other) = port_owner.get(&port) {
+                    problems.push(format!("localPort {port} of '{name}' is already used by {other}"));
+                }
+            }
+        }
+        problems
     }
 
     /// Load a config file and validate its structural invariants.
@@ -819,6 +1207,36 @@ impl Config {
     }
 }
 
+/// `base` if there is no such file, else `base.2`, `base.3`, and so on:
+/// where to keep a copy without writing over an earlier one (a second
+/// `config pull` used to replace the `.bak` of the first).
+pub(crate) fn unused_path(base: &str) -> String {
+    if !std::path::Path::new(base).exists() {
+        return base.to_string();
+    }
+    (2u32..).map(|n| format!("{base}.{n}")).find(|path| !std::path::Path::new(path).exists()).expect("some number is free")
+}
+
+/// Copies of `path` kept beside it with names starting `path.suffix` (see
+/// [`unused_path`]), newest first.
+pub(crate) fn kept_copies(path: &str, suffix: &str) -> Vec<String> {
+    let path = std::path::Path::new(path);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let prefix = format!("{}.{suffix}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+    let mut copies: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| {
+            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            (modified, entry.path().to_string_lossy().into_owned())
+        })
+        .collect();
+    copies.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    copies.into_iter().map(|(_, path)| path).collect()
+}
+
 /// Replace the contents of `path` with `data` atomically: write a temporary
 /// file beside it, flush it to disk, then rename it over `path`. Readers and
 /// a restarted daemon see the old contents or the new, never a partial file.
@@ -830,7 +1248,7 @@ impl Config {
 /// Falls back to writing in place (not atomic, as before) where a rename
 /// can't work: the directory isn't writable, or `path` is itself a mount
 /// point, as with a single-file `docker run -v stouter.json:...` bind mount.
-fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::ErrorKind;
 
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -908,6 +1326,11 @@ pub fn get_hostname() -> String {
 mod tests {
     use super::*;
 
+    /// The default config, for a node with a name (as every node has).
+    fn named() -> Config {
+        Config { node_id: "n1".into(), ..Config::default() }
+    }
+
     #[test]
     fn config_default_values() {
         let cfg = Config::default();
@@ -923,7 +1346,7 @@ mod tests {
         let cfg = Config {
             bind: "10.0.0.1:9090".into(),
             advertise_addr: None,
-            ..Config::default()
+            ..named()
         };
         assert_eq!(cfg.peer_addr(), "10.0.0.1:9090");
     }
@@ -933,7 +1356,7 @@ mod tests {
         let cfg = Config {
             bind: "0.0.0.0:8080".into(),
             advertise_addr: Some("1.2.3.4:9090".into()),
-            ..Config::default()
+            ..named()
         };
         assert_eq!(cfg.peer_addr(), "1.2.3.4:9090");
     }
@@ -945,7 +1368,7 @@ mod tests {
             bind: "10.0.0.1:8080".into(),
             advertise_addr: Some("external:8080".into()),
             known_nodes: vec!["peer1:8080".into()],
-            ..Config::default()
+            ..named()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
@@ -1000,7 +1423,7 @@ mod tests {
                 service_groups: vec!["web".into()],
                 services: vec![],
             }),
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_err());
     }
@@ -1011,8 +1434,9 @@ mod tests {
                 version: 1,
                 routes: vec![],
                 service_groups: vec![ServiceGroup { name: "web".into(), services }],
+                ..Default::default()
             },
-            ..Config::default()
+            ..named()
         }
     }
 
@@ -1077,11 +1501,11 @@ mod tests {
 
     #[test]
     fn http_listen_validation() {
-        let ok = Config { mode: Mode::NodeSubscribe, http_listen: Some("127.0.0.1:15001".into()), ..Config::default() };
+        let ok = Config { mode: Mode::NodeSubscribe, http_listen: Some("127.0.0.1:15001".into()), ..named() };
         ok.validate().unwrap();
-        let node_mode = Config { mode: Mode::Node, http_listen: Some("127.0.0.1:15001".into()), ..Config::default() };
+        let node_mode = Config { mode: Mode::Node, http_listen: Some("127.0.0.1:15001".into()), ..named() };
         assert!(node_mode.validate().is_err());
-        let bad = Config { mode: Mode::Subscribe, http_listen: Some("localhost".into()), ..Config::default() };
+        let bad = Config { mode: Mode::Subscribe, http_listen: Some("localhost".into()), ..named() };
         assert!(bad.validate().is_err());
     }
 
@@ -1220,7 +1644,7 @@ mod tests {
             let bad = TracingConfig { otlp_endpoint: endpoint.into(), sample_ratio: ratio, ..tc.clone() };
             assert!(bad.validate().is_err(), "{endpoint} {ratio}");
         }
-        let cfg = Config { tracing: Some(TracingConfig { sample_ratio: 2.0, ..tc }), ..Config::default() };
+        let cfg = Config { tracing: Some(TracingConfig { sample_ratio: 2.0, ..tc }), ..named() };
         assert!(cfg.validate().is_err());
     }
 
@@ -1256,6 +1680,127 @@ mod tests {
     }
 
     #[test]
+    fn the_fuller_copy_of_a_change_wins_the_tie_break() {
+        // One change, and a copy relayed by a node that drops a field it
+        // doesn't know (here localPort): same version, same author.
+        let svc: Service =
+            serde_json::from_value(serde_json::json!({"name": "api", "nodeId": "n1", "nodePort": 3000, "localPort": 15002}))
+                .unwrap();
+        let full = DynamicConfig {
+            version: 5,
+            changed_by: "n1".into(),
+            service_groups: vec![ServiceGroup { name: "g".into(), services: vec![svc] }],
+            ..Default::default()
+        };
+        let mut stripped = full.clone();
+        stripped.service_groups[0].services[0].local_port = None;
+        assert!(full.supersedes(&stripped));
+        assert!(!stripped.supersedes(&full));
+
+        // Likewise a signed config against a copy without its signature.
+        let signed = DynamicConfig {
+            signature: Some(ConfigSignature {
+                config_json: serde_json::to_string(&full).unwrap(),
+                signer_cert: "00".into(),
+                signature: "00".into(),
+            }),
+            ..full.clone()
+        };
+        assert!(signed.supersedes(&full));
+        assert!(!full.supersedes(&signed));
+    }
+
+    #[test]
+    fn unknown_settings_are_reported_and_kept() {
+        let text = r#"{"mode": "node", "bind": "127.0.0.1:1", "nodeId": "n1", "knownNodes": [],
+            "requireSignedConfg": true, "dynamicConfig": {"version": 1, "serviceGroups": []}}"#;
+        let cfg: Config = serde_json::from_str(text).unwrap();
+        // The typo leaves signing off: say so, and fail `stouter check`.
+        assert!(!cfg.require_signed_config);
+        assert_eq!(cfg.unknown_settings().len(), 1);
+        assert!(cfg.unknown_settings()[0].contains("requireSignedConfg"));
+        assert!(cfg.validate().is_err());
+        cfg.validate_local().unwrap();
+        // And a rewrite of the file keeps it (it may be a newer version's).
+        let saved = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(saved["requireSignedConfg"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_node_id_must_be_a_name() {
+        for bad in ["", "10.0.0.5:8080", "my node", "node\t1"] {
+            let cfg = Config { node_id: bad.into(), ..named() };
+            assert!(cfg.validate_local().is_err(), "{bad:?}");
+        }
+        for good in ["n1", "host-2.example.com", "node_3"] {
+            Config { node_id: good.into(), ..named() }.validate_local().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_kept_copy_never_replaces_an_earlier_one() {
+        let dir = std::env::temp_dir().join(format!("stouter_copies_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json").to_str().unwrap().to_string();
+        let base = format!("{path}.bak");
+        assert_eq!(unused_path(&base), base);
+        std::fs::write(&base, "first").unwrap();
+        assert_eq!(unused_path(&base), format!("{base}.2"));
+        std::fs::write(format!("{base}.2"), "second").unwrap();
+        assert_eq!(unused_path(&base), format!("{base}.3"));
+        assert_eq!(kept_copies(&path, "bak").len(), 2);
+        assert!(kept_copies(&path, "unapplied").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_file_that_doesnt_parse_is_never_replaced_by_defaults() {
+        let dir = std::env::temp_dir().join(format!("stouter_load_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path_str = path.to_str().unwrap();
+        // No file yet: start from defaults (`init`, a first `service add`).
+        assert_eq!(Config::load_or_default(path_str).unwrap().node_id, "");
+        // A typo: an error, so nothing goes on to save over the file.
+        let broken = r#"{"nodeId": "n1", "requireSignedConfig": true, "adminCns": ["admin"],}"#;
+        std::fs::write(&path, broken).unwrap();
+        let err = Config::load_or_default(path_str).expect_err("refused");
+        assert!(format!("{err:#}").contains("invalid JSON"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_nodes_own_settings_stop_it_starting() {
+        // A problem in the cluster's config: reported, but not the node's
+        // to fix, so it starts.
+        let dup = group_of(vec![instance("api", "n1", &[]), instance("api", "n1", &[])]);
+        dup.validate_local().unwrap();
+        assert_eq!(dup.config_problems().len(), 1, "{:?}", dup.config_problems());
+        assert!(dup.validate().is_err(), "`stouter check` still reports it");
+
+        // A fixed localPort on a port this daemon itself listens on: a
+        // problem with the config here, so likewise.
+        let mut taken = group_of(vec![on_port(instance("api", "n1", &[]), 5381)]);
+        taken.mode = Mode::Subscribe;
+        taken.validate_local().unwrap();
+        assert!(taken.config_problems()[0].contains("apiPort"), "{:?}", taken.config_problems());
+
+        // The node's own settings: refused.
+        let mut pool = group_of(vec![]);
+        pool.reverse_pool_size = Some(u16::MAX);
+        assert!(pool.validate_local().is_err());
+        let mut listen = group_of(vec![]);
+        listen.mode = Mode::Subscribe;
+        listen.http_listen = Some("not an address".into());
+        assert!(listen.validate_local().is_err());
+        listen.http_listen = Some(format!("127.0.0.1:{}", listen.api_port()));
+        assert!(listen.validate_local().is_err(), "httpListen on the API's port");
+        listen.http_listen = Some("127.0.0.1:15001".into());
+        listen.validate_local().unwrap();
+    }
+
+    #[test]
     fn validate_rejects_domain_claimed_by_two_services() {
         let cfg = group_of(vec![
             instance("api", "n1", &["x.example.com"]),
@@ -1272,7 +1817,7 @@ mod tests {
                 service_groups: vec!["web".into()],
                 services: vec![],
             }),
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -1281,7 +1826,7 @@ mod tests {
     fn nodesubscribe_mode_serde_round_trip() {
         let cfg = Config {
             mode: Mode::NodeSubscribe,
-            ..Config::default()
+            ..named()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"nodeSubscribe\""));
@@ -1297,7 +1842,7 @@ mod tests {
                 service_groups: vec!["web".into()],
                 services: vec![],
             }),
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -1307,7 +1852,7 @@ mod tests {
         let cfg = Config {
             mode: Mode::NodeSubscribe,
             outbound_only: true,
-            ..Config::default()
+            ..named()
         };
         assert!(cfg.validate().is_ok());
     }
@@ -1321,6 +1866,37 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("serviceGroups"));
         assert!(!json.contains("services"));
+    }
+
+    #[test]
+    fn revocations_are_config_edits_that_older_nodes_hash_alike() {
+        let fp = "ab".repeat(32);
+        let mut dc = DynamicConfig { version: 3, ..Default::default() };
+        // Nothing revoked: encoded exactly as before the field existed, so
+        // the config hashes the same on nodes that don't know it.
+        assert!(!serde_json::to_string(&dc).unwrap().contains("revoked"));
+
+        assert_eq!(dc.revoke(&["n1".into()], &[fp.to_uppercase()]).unwrap(), 4);
+        assert_eq!(dc.revoked, Revoked { nodes: vec!["n1".into()], certs: vec![fp.clone()] }, "fingerprints normalized");
+        assert!(dc.revoke(&["n1".into()], std::slice::from_ref(&fp)).is_err(), "already revoked");
+        assert!(dc.revoke(&["bad:name".into()], &[]).is_err());
+        assert!(dc.revoke(&[], &["not-hex".into()]).is_err());
+        assert_eq!(dc.version, 4, "refused edits change nothing");
+        let json = serde_json::to_value(&dc).unwrap();
+        assert_eq!(json["revoked"], serde_json::json!({"nodes": ["n1"], "certs": [fp]}));
+
+        assert_eq!(dc.unrevoke(&["n1".into()], &[]).unwrap(), 5);
+        assert!(dc.unrevoke(&["n1".into()], &[]).is_err(), "not revoked");
+        assert_eq!(dc.unrevoke(&[], std::slice::from_ref(&fp)).unwrap(), 6);
+        assert!(dc.revoked.is_empty());
+
+        // Hand-written entries are checked.
+        let hand: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [], "revoked": {"nodes": ["a:b"], "certs": [fp.to_uppercase(), "xyz"]},
+        }))
+        .unwrap();
+        let problems = hand.problems();
+        assert_eq!(problems.len(), 3, "{problems:?}");
     }
 
     #[test]
@@ -1516,7 +2092,7 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(!json.contains("adminCns"));
 
-        let cfg = Config { admin_cns: vec!["admin-cli".into()], ..Config::default() };
+        let cfg = Config { admin_cns: vec!["admin-cli".into()], ..named() };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"adminCns\":[\"admin-cli\"]"));
         let restored: Config = serde_json::from_str(&json).unwrap();
@@ -1539,25 +2115,25 @@ mod tests {
 
     #[test]
     fn local_target_rewrites_wildcard_v4() {
-        let cfg = Config { bind: "0.0.0.0:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "0.0.0.0:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "127.0.0.1:60001");
     }
 
     #[test]
     fn local_target_rewrites_wildcard_v6() {
-        let cfg = Config { bind: "[::]:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "[::]:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "[::1]:60001");
     }
 
     #[test]
     fn local_target_preserves_specific_address() {
-        let cfg = Config { bind: "10.0.0.5:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "10.0.0.5:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "10.0.0.5:60001");
     }
 
     #[test]
     fn local_target_preserves_unparseable_bind() {
-        let cfg = Config { bind: "myhost:60001".into(), ..Config::default() };
+        let cfg = Config { bind: "myhost:60001".into(), ..named() };
         assert_eq!(cfg.local_target(), "myhost:60001");
     }
 
@@ -1588,8 +2164,9 @@ mod tests {
                         local_port: None,
                     }],
                 }],
+                ..Default::default()
             },
-            ..Config::default()
+            ..named()
         };
         cfg.save(path_str).unwrap();
         let loaded = Config::load(path_str).unwrap();
@@ -1608,11 +2185,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.json");
         let link = dir.join("stouter.json");
-        Config { node_id: "before".into(), ..Config::default() }.save(real.to_str().unwrap()).unwrap();
+        Config { node_id: "before".into(), ..named() }.save(real.to_str().unwrap()).unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        Config { node_id: "after".into(), ..Config::default() }.save(link.to_str().unwrap()).unwrap();
+        Config { node_id: "after".into(), ..named() }.save(link.to_str().unwrap()).unwrap();
 
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "link kept");
         assert_eq!(Config::load(real.to_str().unwrap()).unwrap().node_id, "after");
@@ -1629,8 +2206,100 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stouter_new_{}_{}", std::process::id(), rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stouter.json");
-        Config { node_id: "n1".into(), ..Config::default() }.save(path.to_str().unwrap()).unwrap();
+        Config { node_id: "n1".into(), ..named() }.save(path.to_str().unwrap()).unwrap();
         assert_eq!(Config::load(path.to_str().unwrap()).unwrap().node_id, "n1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn equal_versions_resolve_to_the_same_winner_everywhere() {
+        let mut a = DynamicConfig::default();
+        a.upsert_service("g", instance("from-a", "n1", &[]));
+        a.changed_by = "node-a".into();
+        let mut b = DynamicConfig::default();
+        b.upsert_service("g", instance("from-b", "n1", &[]));
+        b.changed_by = "node-b".into();
+        assert_eq!(a.version, b.version);
+        // Exactly one wins, whichever a node holds first.
+        assert!(b.supersedes(&a) && !a.supersedes(&b));
+        assert!(!a.supersedes(&a.clone()), "identical configs never replace each other");
+        // A higher version always wins.
+        let mut older_b = b.clone();
+        older_b.version -= 1;
+        assert!(a.supersedes(&older_b));
+        // The copy an older node relays (no changedBy) never beats the
+        // newer node's original.
+        let stripped = DynamicConfig { changed_by: String::new(), ..b.clone() };
+        assert!(!stripped.supersedes(&b) && b.supersedes(&stripped));
+    }
+
+    #[test]
+    fn a_service_may_not_span_two_groups() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service("web", instance("api", "n1", &[]));
+        dc.upsert_service("ops", instance("api", "n2", &[]));
+        let problems = dc.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("both group 'web' and group 'ops'"), "{problems:?}");
+    }
+
+    #[test]
+    fn changes_are_refused_only_for_problems_they_introduce() {
+        let mut before = DynamicConfig::default();
+        before.upsert_service("g", http_instance("api", "n1", &[]));
+        before.set_routes("api", vec![route(serde_json::json!({"service": "api", "backends": [{}]}))]).unwrap();
+        assert!(before.problems().is_empty());
+
+        // Removing the only instance of a routed service leaves routes behind.
+        let mut after = before.clone();
+        after.remove_service("g", "n1", "api").unwrap();
+        assert!(new_problem(&before, &after).unwrap().contains("unknown service 'api'"));
+
+        // So does making it TCP.
+        let mut after = before.clone();
+        after.upsert_service("g", instance("api", "n1", &[]));
+        assert!(new_problem(&before, &after).unwrap().contains("protocol: http"));
+
+        // Claiming another service's domain.
+        let mut with_domain = before.clone();
+        with_domain.upsert_service("g", instance("web", "n1", &["x.example.com"]));
+        let mut after = with_domain.clone();
+        after.upsert_service("g", instance("other", "n2", &["x.example.com"]));
+        assert!(new_problem(&with_domain, &after).unwrap().contains("x.example.com"));
+
+        // A config that's already broken still accepts unrelated changes.
+        let broken = after.clone();
+        let mut fixed_elsewhere = broken.clone();
+        fixed_elsewhere.upsert_service("g", instance("unrelated", "n3", &[]));
+        assert_eq!(new_problem(&broken, &fixed_elsewhere), None);
+    }
+
+    #[test]
+    fn signed_config_requires_an_admin() {
+        let cfg = Config { require_signed_config: true, ..named() };
+        assert!(cfg.validate().unwrap_err().to_string().contains("adminCns"));
+        let cfg = Config { admin_cns: vec!["admin".into()], ..cfg };
+        cfg.validate().unwrap();
+        // Off by default, and omitted from JSON unless on.
+        assert!(!serde_json::to_string(&Config::default()).unwrap().contains("requireSignedConfig"));
+    }
+
+    #[test]
+    fn configs_too_large_to_gossip_and_oversized_pools_are_refused() {
+        let mut dc = DynamicConfig::default();
+        dc.upsert_service("g", instance("api", "n1", &[]));
+        assert!(dc.problems().is_empty());
+        let mut huge = dc.clone();
+        huge.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_CONFIG_BYTES));
+        let problem = new_problem(&dc, &huge).expect("refused");
+        assert!(problem.contains("too large to gossip"), "{problem}");
+        // A config already over the limit (an older node brought it in) can
+        // still be changed, so it can be brought back under it.
+        let mut smaller = huge.clone();
+        smaller.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_CONFIG_BYTES - 10));
+        assert_eq!(new_problem(&huge, &smaller), None);
+
+        let cfg = Config { reverse_pool_size: Some(5000), ..named() };
+        assert!(cfg.validate().unwrap_err().to_string().contains("reversePoolSize"));
     }
 }
