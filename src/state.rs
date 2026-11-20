@@ -449,6 +449,11 @@ pub struct SharedState {
     pub policies: ArcSwap<crate::authz::Policies>,
     /// Nonces of signed tunnel requests seen lately, against replays.
     pub tunnel_nonces: Mutex<crate::authz::NonceCache>,
+    /// The cluster CA, when this node holds its key: it issues renewed
+    /// certificates (see `crate::renew`).
+    pub issuer: std::sync::OnceLock<crate::pki::Issuer>,
+    /// When each node last had a certificate renewed here.
+    pub renewals: Mutex<HashMap<String, std::time::Instant>>,
     /// Addresses a sync found ourselves at (our certificate answered): with
     /// a wildcard bind, a shared `knownNodes` list can name our own address
     /// in a form we can't otherwise tell is ours.
@@ -546,6 +551,8 @@ impl SharedState {
             gossip_conns: Mutex::new(HashMap::new()),
             policies: ArcSwap::from_pointee(policies),
             tunnel_nonces: Mutex::new(crate::authz::NonceCache::default()),
+            issuer: std::sync::OnceLock::new(),
+            renewals: Mutex::new(HashMap::new()),
             own_addrs: Mutex::new(std::collections::HashSet::new()),
             unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
@@ -1108,7 +1115,7 @@ mod tests {
         revoke(&a, &[], &[]).await;
         assert!(connects(&b, &a).await, "unrevoked");
         let (c_end, _) = mesh_pair(&c, &a).await;
-        let c_cert = crate::tls::fingerprint(c.tls.as_ref().unwrap().own_cert_der());
+        let c_cert = crate::tls::fingerprint(c.tls.as_ref().unwrap().own_cert().as_ref());
         let hex: String = c_cert.iter().map(|b| format!("{b:02x}")).collect();
         drop(c_end);
         revoke(&a, &[], &[hex]).await;

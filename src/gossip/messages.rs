@@ -72,6 +72,12 @@ pub enum Message {
         /// must sign its change and send it as `AdminOp::ConfigPush`.
         #[serde(default)]
         require_signed_config: bool,
+        /// When the daemon's certificate expires (Unix seconds), and whether
+        /// it holds the CA's key (renewing other nodes' certificates).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cert_expires: Option<i64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        issues_certs: bool,
     },
     /// Ask a daemon for its config history (see `crate::history`): every
     /// version it recorded, without the configs; or one, with its config.
@@ -81,6 +87,18 @@ pub enum Message {
     },
     /// Reply to a `HistoryRequest`, oldest first.
     HistoryResponse { entries: Vec<crate::history::HistoryEntry> },
+    /// Ask a node holding the cluster CA's key for a renewed certificate
+    /// (see `crate::renew`): `csr` is a certificate request (DER, hex) for
+    /// a new key. The certificate is for whoever the connection's
+    /// certificate names, whatever the request says.
+    CertRequest { csr: String },
+    /// Reply to a `CertRequest`: the new certificate (DER, hex), or why not.
+    CertResponse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cert: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Upgrade this TCP connection to a yamux multiplexed tunnel session.
     MuxTunnel {},
     /// Mutating admin RPC. Authorized via `adminCns` allowlist on the receiver.
@@ -605,6 +623,8 @@ mod tests {
     #[test]
     fn status_response_round_trip() {
         let msg = Message::StatusResponse {
+            cert_expires: None,
+            issues_certs: false,
             mode: "node".into(),
             node_id: "host1".into(),
             bind: "0.0.0.0:8080".into(),

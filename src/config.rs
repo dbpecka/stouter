@@ -1042,6 +1042,12 @@ pub struct Config {
     /// When set, all inter-node connections are mutually authenticated with TLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_dir: Option<String>,
+    /// How long the certificates this node issues are valid, as the CA node
+    /// (its `tlsDir` holds `ca.key`): renewals, `cert issue`, its own. As
+    /// `30d`, `12h`, `45m` or `90s`. Default 10 years. Nodes renew theirs
+    /// when a third is left (see `crate::renew`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_lifetime: Option<String>,
     /// Common Names allowed to issue admin RPCs against this daemon.
     /// Empty (the default) disables admin RPC entirely; clients can still
     /// query status with any cert signed by the cluster CA.
@@ -1140,6 +1146,7 @@ impl Default for Config {
             dynamic_config: DynamicConfig::default(),
             subscribe_filter: None,
             tls_dir: None,
+            cert_lifetime: None,
             admin_cns: Vec::new(),
             api_port: None,
             tracing: None,
@@ -1187,6 +1194,9 @@ impl Config {
     /// with one.
     pub fn validate_local(&self) -> Result<()> {
         let subscribes = matches!(self.mode, Mode::Subscribe | Mode::NodeSubscribe);
+        if let Some(lifetime) = &self.cert_lifetime {
+            crate::pki::parse_lifetime(lifetime).map_err(|e| anyhow!(e))?;
+        }
         // Peers know a node by its id (its certificate's CN), and ignore one
         // that looks like an address rather than a name.
         if self.node_id.is_empty() {
@@ -1313,6 +1323,15 @@ impl Config {
     /// Port for the subscribe-mode REST API on `127.0.0.1`.
     pub fn api_port(&self) -> u16 {
         self.api_port.unwrap_or(5381)
+    }
+
+    /// The lifetime of the certificates this node issues (see
+    /// [`Self::cert_lifetime`]; checked at startup).
+    pub fn cert_lifetime(&self) -> time::Duration {
+        self.cert_lifetime
+            .as_deref()
+            .and_then(|text| crate::pki::parse_lifetime(text).ok())
+            .unwrap_or(crate::pki::DEFAULT_CERT_LIFETIME)
     }
 
     /// Connect target for querying *this* daemon from the local host.

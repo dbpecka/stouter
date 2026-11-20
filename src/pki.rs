@@ -9,23 +9,48 @@ use tracing::info;
 /// verification can be used without per-node cert customisation.
 pub const MESH_SERVER_NAME: &str = "stouter-node";
 
-/// How long a node certificate is valid from the day it is issued (but
-/// never past the CA's own expiry).
-const NODE_CERT_VALIDITY: time::Duration = time::Duration::days(10 * 365);
+/// How long a node certificate is valid from when it is issued (but never
+/// past the CA's own expiry), unless the CA node's `certLifetime` says
+/// otherwise.
+pub const DEFAULT_CERT_LIFETIME: time::Duration = time::Duration::days(10 * 365);
+
+/// Shortest `certLifetime`: renewal is checked every tenth of it.
+const MIN_CERT_LIFETIME: time::Duration = time::Duration::minutes(1);
 
 /// How long a newly generated cluster CA is valid.
 const CA_VALIDITY: time::Duration = time::Duration::days(20 * 365);
 
 /// Certificates start this far in the past, so a peer whose clock runs a
 /// little behind still accepts one issued just now.
-const CLOCK_SKEW_ALLOWANCE: time::Duration = time::Duration::days(1);
+pub const CLOCK_SKEW_ALLOWANCE: time::Duration = time::Duration::days(1);
 
 /// Validity window for a node certificate signed by `ca`: from now (less
-/// the skew allowance) for [`NODE_CERT_VALIDITY`], ending no later than the
-/// CA does, since a certificate can't outlive the CA that vouches for it.
-fn node_cert_validity(ca: &rcgen::Certificate) -> (time::OffsetDateTime, time::OffsetDateTime) {
+/// the skew allowance) for `lifetime`, ending no later than the CA does,
+/// since a certificate can't outlive the CA that vouches for it.
+fn node_cert_validity(ca: &rcgen::Certificate, lifetime: time::Duration) -> (time::OffsetDateTime, time::OffsetDateTime) {
     let now = time::OffsetDateTime::now_utc();
-    (now - CLOCK_SKEW_ALLOWANCE, (now + NODE_CERT_VALIDITY).min(ca.params().not_after))
+    (now - CLOCK_SKEW_ALLOWANCE, (now + lifetime).min(ca.params().not_after))
+}
+
+/// A certificate lifetime such as `30d`, `12h`, `45m` or `90s`.
+pub fn parse_lifetime(text: &str) -> std::result::Result<time::Duration, String> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len()));
+    let n: i64 = number.parse().map_err(|_| format!("certLifetime '{text}' is not a number and a unit (30d, 12h, 45m, 90s)"))?;
+    let lifetime = match unit {
+        "d" => time::Duration::days(n),
+        "h" => time::Duration::hours(n),
+        "m" => time::Duration::minutes(n),
+        "s" => time::Duration::seconds(n),
+        _ => return Err(format!("certLifetime '{text}' needs a unit: d, h, m or s (as in 30d)")),
+    };
+    if lifetime < MIN_CERT_LIFETIME {
+        return Err(format!("certLifetime '{text}' is shorter than a minute"));
+    }
+    if lifetime > CA_VALIDITY {
+        return Err(format!("certLifetime '{text}' is longer than the CA lasts (20 years)"));
+    }
+    Ok(lifetime)
 }
 
 pub struct PkiMaterial {
@@ -46,9 +71,16 @@ pub struct PkiMaterial {
 /// Anything else (some of the files, not a usable set) is an error, never a
 /// new CA.
 pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
+    load_or_create_with(tls_dir, node_id, DEFAULT_CERT_LIFETIME)
+}
+
+/// [`load_or_create`], issuing this node's certificate (as the CA node)
+/// for `lifetime`.
+pub fn load_or_create_with(tls_dir: &str, node_id: &str, lifetime: time::Duration) -> Result<PkiMaterial> {
     let dir = Path::new(tls_dir);
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create TLS directory {tls_dir}"))?;
+    finish_renewal(dir)?;
 
     let ca_cert_path  = dir.join("ca.crt");
     let ca_key_path   = dir.join("ca.key");
@@ -57,7 +89,7 @@ pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
 
     if ca_cert_path.exists() && ca_key_path.exists() {
         let (ca_cert_der, ca_cert_rcgen, ca_key) = load_ca(&ca_cert_path, &ca_key_path)?;
-        let (node_cert_der, node_key) = generate_node_cert(node_id, &ca_cert_rcgen, &ca_key)?;
+        let (node_cert_der, node_key) = generate_node_cert(node_id, &ca_cert_rcgen, &ca_key, lifetime)?;
         Ok(PkiMaterial { ca_cert_der, node_cert_der, node_key })
     } else if ca_cert_path.exists() && node_cert_path.exists() && node_key_path.exists() {
         load_issued(&ca_cert_path, &node_cert_path, &node_key_path)
@@ -78,7 +110,7 @@ pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
         )
     } else {
         let (ca_cert_der, ca_cert_rcgen, ca_key) = generate_ca(&ca_cert_path, &ca_key_path)?;
-        let (node_cert_der, node_key) = generate_node_cert(node_id, &ca_cert_rcgen, &ca_key)?;
+        let (node_cert_der, node_key) = generate_node_cert(node_id, &ca_cert_rcgen, &ca_key, lifetime)?;
         Ok(PkiMaterial { ca_cert_der, node_cert_der, node_key })
     }
 }
@@ -89,6 +121,9 @@ pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
 /// CA made up on the spot would only fail the handshake later, obscurely.
 pub fn load_existing(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
     let dir = Path::new(tls_dir);
+    if dir.is_dir() {
+        finish_renewal(dir)?;
+    }
     let has = |name: &str| dir.join(name).is_file();
     if has("ca.crt") && (has("ca.key") || (has("node.crt") && has("node.key"))) {
         return load_or_create(tls_dir, node_id);
@@ -106,7 +141,13 @@ pub fn load_existing(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
 /// write `ca.crt`, `node.crt`, and `node.key` (all PEM) to `out_dir`.
 ///
 /// The three files can be copied directly into the target node's `tlsDir`.
+#[cfg(test)]
 pub fn issue_cert_to_dir(tls_dir: &str, node_id: &str, out_dir: &str) -> Result<()> {
+    issue_cert_to_dir_with(tls_dir, node_id, out_dir, DEFAULT_CERT_LIFETIME)
+}
+
+/// [`issue_cert_to_dir`], for `lifetime`.
+pub fn issue_cert_to_dir_with(tls_dir: &str, node_id: &str, out_dir: &str, lifetime: time::Duration) -> Result<()> {
     let dir = Path::new(tls_dir);
     let ca_cert_path = dir.join("ca.crt");
     let ca_key_path  = dir.join("ca.key");
@@ -123,7 +164,7 @@ pub fn issue_cert_to_dir(tls_dir: &str, node_id: &str, out_dir: &str) -> Result<
     let mut params = CertificateParams::new(vec![MESH_SERVER_NAME.to_string()])
         .context("node cert params")?;
     params.distinguished_name.push(DnType::CommonName, node_id);
-    (params.not_before, params.not_after) = node_cert_validity(&ca_cert_rcgen);
+    (params.not_before, params.not_after) = node_cert_validity(&ca_cert_rcgen, lifetime);
 
     let cert = params.signed_by(&key, &ca_cert_rcgen, &ca_key)
         .context("sign node cert with CA")?;
@@ -249,6 +290,7 @@ fn generate_node_cert(
     node_id: &str,
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
+    lifetime: time::Duration,
 ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .context("generate node key")?;
@@ -256,7 +298,7 @@ fn generate_node_cert(
     let mut params = CertificateParams::new(vec![MESH_SERVER_NAME.to_string()])
         .context("node cert params")?;
     params.distinguished_name.push(DnType::CommonName, node_id);
-    (params.not_before, params.not_after) = node_cert_validity(ca_cert);
+    (params.not_before, params.not_after) = node_cert_validity(ca_cert, lifetime);
 
     let cert = params.signed_by(&key, ca_cert, ca_key)
         .context("sign node cert with CA")?;
@@ -265,6 +307,128 @@ fn generate_node_cert(
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
     Ok((der, key_der))
+}
+
+// ---------------------------------------------------------------------------
+// Renewal
+// ---------------------------------------------------------------------------
+
+/// The cluster CA, on a node whose `tlsDir` holds `ca.key`: issues renewed
+/// certificates (see `crate::renew`).
+pub struct Issuer {
+    ca_cert: rcgen::Certificate,
+    ca_key: KeyPair,
+    lifetime: time::Duration,
+}
+
+impl Issuer {
+    /// The CA in `tls_dir`, if this node holds its key.
+    pub fn load(tls_dir: &str, lifetime: time::Duration) -> Result<Option<Self>> {
+        let dir = Path::new(tls_dir);
+        let (cert_path, key_path) = (dir.join("ca.crt"), dir.join("ca.key"));
+        if !key_path.exists() {
+            return Ok(None);
+        }
+        let (_, ca_cert, ca_key) = load_ca(&cert_path, &key_path)?;
+        Ok(Some(Self { ca_cert, ca_key, lifetime }))
+    }
+
+    /// A certificate for `node_id` on the key in `csr` (DER), which the
+    /// request's own signature shows the requester holds. Only the key is
+    /// taken from the request: the name is `node_id` (whom the requester's
+    /// current certificate names), and the rest is what any node
+    /// certificate has.
+    pub fn issue_for_csr(&self, node_id: &str, csr: &[u8]) -> Result<CertificateDer<'static>> {
+        let csr = rcgen::CertificateSigningRequestParams::from_der(&csr.to_vec().into())
+            .map_err(|e| anyhow::anyhow!("certificate request: {e}"))?;
+        if rcgen::PublicKeyData::algorithm(&csr.public_key) != &rcgen::PKCS_ECDSA_P256_SHA256 {
+            bail!("certificate request: the key must be ECDSA P-256");
+        }
+        let mut params = CertificateParams::new(vec![MESH_SERVER_NAME.to_string()]).context("node cert params")?;
+        params.distinguished_name.push(DnType::CommonName, node_id);
+        (params.not_before, params.not_after) = node_cert_validity(&self.ca_cert, self.lifetime);
+        let csr = rcgen::CertificateSigningRequestParams { params, public_key: csr.public_key };
+        let cert = csr.signed_by(&self.ca_cert, &self.ca_key).context("sign renewed cert with CA")?;
+        Ok(CertificateDer::from(cert.der().to_vec()))
+    }
+
+    /// A new certificate and key for `node_id` (the CA node's own).
+    pub fn issue_new(&self, node_id: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+        generate_node_cert(node_id, &self.ca_cert, &self.ca_key, self.lifetime)
+    }
+}
+
+/// A new key, and a request (CSR, DER) for a certificate on it, signed
+/// with it: for renewal by a node without the CA's key.
+pub fn new_csr(node_id: &str) -> Result<(Vec<u8>, PrivateKeyDer<'static>)> {
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).context("generate node key")?;
+    let mut params = CertificateParams::new(vec![MESH_SERVER_NAME.to_string()]).context("csr params")?;
+    params.distinguished_name.push(DnType::CommonName, node_id);
+    let csr = params.serialize_request(&key).context("make certificate request")?;
+    Ok((csr.der().to_vec(), PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()))))
+}
+
+/// When `cert` (DER) is valid from and until, in Unix seconds.
+pub fn validity(cert: &[u8]) -> Option<(i64, i64)> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert).ok()?;
+    Some((cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp()))
+}
+
+/// Write a renewed certificate and key to `tls_dir` (as `node.crt` and
+/// `node.key`), for the next start. Each is first written in full beside
+/// its final name as `*.next`, then both are renamed into place; a crash
+/// part way leaves `*.next` files that [`finish_renewal`] puts in place at
+/// the next load, so the two never end up mismatched.
+pub fn save_renewed(tls_dir: &str, cert: &CertificateDer<'_>, key: &PrivateKeyDer<'_>) -> Result<()> {
+    let dir = Path::new(tls_dir);
+    let cert_pem = to_pem("CERTIFICATE", cert.as_ref());
+    let key_pem = match key {
+        PrivateKeyDer::Pkcs8(der) => to_pem("PRIVATE KEY", der.secret_pkcs8_der()),
+        _ => bail!("renewed key is not PKCS#8"),
+    };
+    for (name, text, private) in [("node.key", &key_pem, true), ("node.crt", &cert_pem, false)] {
+        let tmp = dir.join(format!("{name}.tmp"));
+        if private {
+            write_private_key(&tmp, text)
+        } else {
+            std::fs::write(&tmp, text).and_then(|()| std::fs::File::open(&tmp)?.sync_all())
+        }
+        .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, dir.join(format!("{name}.next"))).with_context(|| format!("write {name}.next"))?;
+    }
+    finish_renewal(dir)
+}
+
+/// `der` as a PEM block labelled `label`.
+fn to_pem(label: &str, der: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::with_capacity(der.len().div_ceil(3) * 4);
+    for chunk in der.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            b64.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
+}
+
+/// Put renewed files (`node.key.next`, `node.crt.next`) in place, finishing
+/// a [`save_renewed`] a crash cut short. Each exists only once written in
+/// full, so whichever are left belong to the newer pair.
+fn finish_renewal(dir: &Path) -> Result<()> {
+    for name in ["node.key", "node.crt"] {
+        let next = dir.join(format!("{name}.next"));
+        if next.exists() {
+            std::fs::rename(&next, dir.join(name)).with_context(|| format!("put {} in place", next.display()))?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +579,7 @@ mod validity_tests {
         let (ca_from, ca_until) = validity(&material.ca_cert_der);
         assert!(close(ca_from, now - CLOCK_SKEW_ALLOWANCE) && close(ca_until, now + CA_VALIDITY));
         let (from, until) = validity(&material.node_cert_der);
-        assert!(close(from, now - CLOCK_SKEW_ALLOWANCE) && close(until, now + NODE_CERT_VALIDITY));
+        assert!(close(from, now - CLOCK_SKEW_ALLOWANCE) && close(until, now + DEFAULT_CERT_LIFETIME));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -440,5 +604,82 @@ mod validity_tests {
         let (_, until) = validity(pem_to_der(&pem).unwrap().as_ref());
         assert_eq!(until.unix_timestamp(), ca_until.unix_timestamp());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("stouter_renew_{tag}_{}_{}", std::process::id(), rand::random::<u64>()))
+    }
+
+    #[test]
+    fn a_renewal_is_issued_for_the_requester_on_its_new_key() {
+        let dir = temp_dir("csr");
+        let ca_dir = dir.to_str().unwrap();
+        load_or_create(ca_dir, "ca-node").unwrap();
+        let issuer = Issuer::load(ca_dir, time::Duration::hours(1)).unwrap().expect("holds ca.key");
+
+        // The request asks for another name; the certificate names the
+        // node whose current certificate made the request.
+        let (csr, key) = new_csr("someone-else").unwrap();
+        let cert = issuer.issue_for_csr("n1", &csr).unwrap();
+        assert_eq!(crate::tls::cert_cn(&cert).as_deref(), Some("n1"));
+        // On the requester's new key, and valid for this cluster.
+        let material = PkiMaterial { ca_cert_der: load_or_create(ca_dir, "x").unwrap().ca_cert_der, node_cert_der: cert.clone(), node_key: key };
+        let ctx = crate::tls::TlsContext::new(&material).expect("the key is the certificate's");
+        assert_eq!(ctx.verify_cluster_cert(&cert).unwrap().as_deref(), Some("n1"));
+        // For the lifetime asked (plus the skew allowance before now).
+        let (from, until) = validity(cert.as_ref()).unwrap();
+        let lifetime = until - from - CLOCK_SKEW_ALLOWANCE.whole_seconds();
+        assert!((3590..=3610).contains(&lifetime), "{lifetime}");
+
+        assert!(issuer.issue_for_csr("n1", b"not a csr").is_err());
+        assert!(Issuer::load(temp_dir("none").to_str().unwrap(), DEFAULT_CERT_LIFETIME).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_renewed_pair_is_never_left_mismatched() {
+        let dir = temp_dir("save");
+        let ca_dir = dir.join("ca");
+        let node_dir = dir.join("n1");
+        load_or_create(ca_dir.to_str().unwrap(), "ca-node").unwrap();
+        issue_cert_to_dir(ca_dir.to_str().unwrap(), "n1", node_dir.to_str().unwrap()).unwrap();
+        let node = node_dir.to_str().unwrap();
+        let issuer = Issuer::load(ca_dir.to_str().unwrap(), DEFAULT_CERT_LIFETIME).unwrap().unwrap();
+
+        let (cert, key) = issuer.issue_new("n1").unwrap();
+        save_renewed(node, &cert, &key).unwrap();
+        let loaded = load_existing(node, "n1").unwrap();
+        assert_eq!(loaded.node_cert_der, cert, "the renewed pair is what loads");
+        crate::tls::TlsContext::new(&loaded).expect("and its key matches");
+
+        // A crash after the key was put in place but before the cert: the
+        // next load finishes the job.
+        let (cert2, key2) = issuer.issue_new("n1").unwrap();
+        save_renewed(node, &cert2, &key2).unwrap();
+        let (cert3, key3) = issuer.issue_new("n1").unwrap();
+        std::fs::write(node_dir.join("node.crt.next"), to_pem("CERTIFICATE", cert3.as_ref())).unwrap();
+        let PrivateKeyDer::Pkcs8(der) = &key3 else { unreachable!() };
+        std::fs::write(node_dir.join("node.key"), to_pem("PRIVATE KEY", der.secret_pkcs8_der())).unwrap();
+        let loaded = load_existing(node, "n1").unwrap();
+        assert_eq!(loaded.node_cert_der, cert3);
+        crate::tls::TlsContext::new(&loaded).expect("key and cert match");
+        assert!(!node_dir.join("node.crt.next").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lifetimes_read_with_their_unit() {
+        assert_eq!(parse_lifetime("30d").unwrap(), time::Duration::days(30));
+        assert_eq!(parse_lifetime("12h").unwrap(), time::Duration::hours(12));
+        assert_eq!(parse_lifetime("90s").unwrap(), time::Duration::seconds(90));
+        assert!(parse_lifetime("30").is_err());
+        assert!(parse_lifetime("10s").is_err(), "under a minute");
+        assert!(parse_lifetime("30y").is_err());
+        assert!(parse_lifetime("100000d").is_err(), "past the CA's own life");
     }
 }

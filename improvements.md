@@ -53,8 +53,9 @@ service mesh. Grouped by area, not prioritized.
   with `stouter route set|clear|list`.
 
 ## Security (identity & policy)
-- Certificate rotation without a restart, and short-lived certificates
-  (revocation exists: `stouter cert revoke`).
+- Renewal from a CA that isn't on any node (an external CA or ACME-like
+  service). Renewal without restarts (`certLifetime`) and revocation
+  (`stouter cert revoke`) exist.
 - SPIFFE-style workload identity so services — not just nodes — are principals.
 - Authorization by service rather than node, and on paths: "service A may
   call service B on path /x" (L7 RBAC). Node-level policies exist:

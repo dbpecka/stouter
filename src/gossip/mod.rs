@@ -211,6 +211,12 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
         Message::HistoryRequest { version } => {
             handle_history_request(stream, version, state).await;
         }
+        Message::CertRequest { csr } => {
+            crate::renew::handle_cert_request(stream, csr, state).await;
+        }
+        Message::CertResponse { .. } => {
+            debug!("unexpected CertResponse from {peer_addr}");
+        }
         Message::HistoryResponse { .. } => {
             debug!("unexpected HistoryResponse from {peer_addr}");
         }
@@ -468,6 +474,8 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
         dynamic_config: state.dynamic_config.read().await.clone(),
         known_nodes: snapshot_nodes(&state),
         require_signed_config: state.config.require_signed_config,
+        cert_expires: state.tls.as_ref().and_then(|tls| crate::pki::validity(tls.own_cert().as_ref())).map(|(_, until)| until),
+        issues_certs: state.issuer.get().is_some(),
     };
 
     if let Err(e) = send_message(&mut stream, &response).await {

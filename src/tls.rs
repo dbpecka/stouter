@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use tokio_rustls::rustls::pki_types::{CertificateDer, UnixTime};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use tokio_rustls::rustls::{self, pki_types::ServerName, DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
@@ -389,7 +389,42 @@ pub struct TlsContext {
     /// for a client connecting; also used to check who signed a config.
     cert_verifier: Arc<dyn ClientCertVerifier>,
     revocations: Arc<Revocations>,
-    own_cert: CertificateDer<'static>,
+    identity: Arc<Identity>,
+}
+
+/// This node's certificate and key, presented in every new handshake as
+/// server and as client, and replaced by a renewed one without a restart
+/// (see `crate::renew`). Connections already open keep the one they began
+/// with.
+#[derive(Debug)]
+struct Identity {
+    current: ArcSwap<rustls::sign::CertifiedKey>,
+}
+
+impl Identity {
+    fn certified(cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<Arc<rustls::sign::CertifiedKey>> {
+        // Checks the key is the certificate's.
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let certified = rustls::sign::CertifiedKey::from_der(vec![cert], key.clone_key(), &provider)
+            .map_err(|e| anyhow::anyhow!("certificate and key: {e}"))?;
+        Ok(Arc::new(certified))
+    }
+}
+
+impl rustls::server::ResolvesServerCert for Identity {
+    fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.current.load_full())
+    }
+}
+
+impl rustls::client::ResolvesClientCert for Identity {
+    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.current.load_full())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
 }
 
 impl TlsContext {
@@ -401,8 +436,9 @@ impl TlsContext {
         let root_store = Arc::new(root_store);
         let revocations = Arc::new(Revocations::default());
 
-        let cert_chain = vec![pki.node_cert_der.clone()];
-        let private_key = pki.node_key.clone_key();
+        let identity = Arc::new(Identity {
+            current: ArcSwap::new(Identity::certified(pki.node_cert_der.clone(), &pki.node_key)?),
+        });
 
         // Server: require clients to present a cert signed by the cluster CA.
         let client_verifier: Arc<dyn ClientCertVerifier> = Arc::new(ClientVerifier {
@@ -411,10 +447,16 @@ impl TlsContext {
                 .map_err(|e| anyhow::anyhow!("build client verifier: {e}"))?,
             revocations: revocations.clone(),
         });
-        let server_config = rustls::ServerConfig::builder()
+        let mut server_config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(client_verifier.clone())
-            .with_single_cert(cert_chain.clone(), private_key.clone_key())
-            .context("build server TLS config")?;
+            .with_cert_resolver(identity.clone());
+        // No session resumption, either way: a resumed session skips the
+        // certificate checks, and carries the certificate of the handshake
+        // it resumes, whatever has been revoked, has expired or was renewed
+        // since. Mesh connections are long-lived and pooled, so a full
+        // handshake each costs little.
+        server_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        server_config.send_tls13_tickets = 0;
 
         // Client: verify server cert against cluster CA; present own cert.
         let server_verifier = Arc::new(ServerVerifier {
@@ -423,11 +465,11 @@ impl TlsContext {
                 .map_err(|e| anyhow::anyhow!("build server verifier: {e}"))?,
             revocations: revocations.clone(),
         });
-        let client_config = rustls::ClientConfig::builder()
+        let mut client_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(server_verifier)
-            .with_client_auth_cert(cert_chain, private_key)
-            .context("build client TLS config")?;
+            .with_client_cert_resolver(identity.clone());
+        client_config.resumption = rustls::client::Resumption::disabled();
 
         let server_name = ServerName::try_from(crate::pki::MESH_SERVER_NAME)
             .map_err(|e| anyhow::anyhow!("parse mesh server name: {e}"))?
@@ -439,8 +481,22 @@ impl TlsContext {
             server_name,
             cert_verifier: client_verifier,
             revocations,
-            own_cert: pki.node_cert_der.clone(),
+            identity,
         })
+    }
+
+    /// Present `cert` (with `key`) in new handshakes from now on: a renewed
+    /// certificate. Refused unless it is from the cluster CA, not revoked,
+    /// and the key is its own.
+    pub fn rotate(&self, cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<()> {
+        self.verify_cluster_cert(&cert)?;
+        self.identity.current.store(Identity::certified(cert, key)?);
+        Ok(())
+    }
+
+    /// This node's certificate now.
+    pub fn own_cert(&self) -> CertificateDer<'static> {
+        self.identity.current.load().cert[0].clone()
     }
 
     /// The revocation list every check made with this context uses.
@@ -448,15 +504,9 @@ impl TlsContext {
         &self.revocations
     }
 
-    /// This node's own certificate (DER).
-    #[cfg(test)]
-    pub fn own_cert_der(&self) -> &[u8] {
-        self.own_cert.as_ref()
-    }
-
     /// Whether this node's own certificate is revoked.
     pub fn own_cert_revoked(&self) -> bool {
-        self.revocations.cert_revoked(self.own_cert.as_ref())
+        self.revocations.cert_revoked(self.own_cert().as_ref())
     }
 
     /// Check that `cert` (DER) was issued by the cluster CA and is currently

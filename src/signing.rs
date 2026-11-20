@@ -37,22 +37,24 @@ const NODE_DOMAIN: &[u8] = b"stouter node record v1\n";
 const BEAT_DOMAIN: &[u8] = b"stouter node beat v1\n";
 const TUNNEL_DOMAIN: &[u8] = b"stouter tunnel request v1\n";
 
-/// A signing key and the certificate vouching for it.
+/// A signing key and the certificate vouching for it, replaced together
+/// when the certificate is renewed (see `crate::renew`).
 pub struct Signer {
+    current: arc_swap::ArcSwap<SignerKey>,
+}
+
+/// One certificate and its key: a signature and the certificate sent with
+/// it always come from the same one.
+struct SignerKey {
     cert: CertificateDer<'static>,
     key: Arc<dyn SigningKey>,
 }
 
-impl Signer {
-    pub fn new(cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<Self> {
+impl SignerKey {
+    fn new(cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<Self> {
         let key = rustls::crypto::aws_lc_rs::sign::any_supported_type(key)
             .map_err(|e| anyhow!("load signing key: {e}"))?;
         Ok(Self { cert, key })
-    }
-
-    /// The signer for a node's (or the CLI's) own TLS identity.
-    pub fn from_material(material: &crate::pki::PkiMaterial) -> Result<Self> {
-        Self::new(material.node_cert_der.clone(), &material.node_key)
     }
 
     /// Hex signature over `domain` + `text`.
@@ -65,6 +67,31 @@ impl Signer {
             .sign(&[domain, text.as_bytes()].concat())
             .map_err(|e| anyhow!("sign: {e}"))?;
         Ok(hex(&signature))
+    }
+
+    fn cert_hex(&self) -> String {
+        hex(self.cert.as_ref())
+    }
+}
+
+impl Signer {
+    pub fn new(cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<Self> {
+        Ok(Self { current: arc_swap::ArcSwap::from_pointee(SignerKey::new(cert, key)?) })
+    }
+
+    /// The signer for a node's (or the CLI's) own TLS identity.
+    pub fn from_material(material: &crate::pki::PkiMaterial) -> Result<Self> {
+        Self::new(material.node_cert_der.clone(), &material.node_key)
+    }
+
+    /// Sign with `cert` and `key` from now on (a renewed certificate).
+    pub fn replace(&self, cert: CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<()> {
+        self.current.store(Arc::new(SignerKey::new(cert, key)?));
+        Ok(())
+    }
+
+    fn current(&self) -> Arc<SignerKey> {
+        self.current.load_full()
     }
 }
 
@@ -96,8 +123,9 @@ fn tunnel_text(node_id: &str, service: &str, timestamp_ms: u64, nonce: u64) -> S
 /// `signer`'s signature over a tunnel request to `service` on `node_id`.
 pub fn sign_tunnel_request(signer: &Signer, node_id: &str, service: &str, timestamp_ms: u64) -> Result<SignedCaller> {
     let nonce = rand::random::<u64>();
-    let signature = signer.sign(TUNNEL_DOMAIN, &tunnel_text(node_id, service, timestamp_ms, nonce))?;
-    Ok(SignedCaller { nonce, cert: hex(signer.cert.as_ref()), signature })
+    let key = signer.current();
+    let signature = key.sign(TUNNEL_DOMAIN, &tunnel_text(node_id, service, timestamp_ms, nonce))?;
+    Ok(SignedCaller { nonce, cert: key.cert_hex(), signature })
 }
 
 /// Who signed `caller` for a tunnel request to `service` on `node_id` at
@@ -123,8 +151,9 @@ pub fn sign(dc: &DynamicConfig, signer: &Signer) -> Result<DynamicConfig> {
     let mut signed = dc.clone();
     signed.signature = None;
     let config_json = serde_json::to_string(&signed)?;
-    let signature = signer.sign(CONFIG_DOMAIN, &config_json)?;
-    signed.signature = Some(ConfigSignature { config_json, signer_cert: hex(signer.cert.as_ref()), signature });
+    let key = signer.current();
+    let signature = key.sign(CONFIG_DOMAIN, &config_json)?;
+    signed.signature = Some(ConfigSignature { config_json, signer_cert: key.cert_hex(), signature });
     Ok(signed)
 }
 
@@ -183,8 +212,9 @@ pub fn log_refusal(state: &SharedState, version: u64, err: &anyhow::Error) {
 /// `record`, signed by the node it describes.
 pub fn sign_node(record: &NodeRecord, signer: &Signer) -> Result<SignedNode> {
     let record_json = serde_json::to_string(record)?;
-    let signature = signer.sign(NODE_DOMAIN, &record_json)?;
-    Ok(SignedNode { record_json, cert: hex(signer.cert.as_ref()), signature })
+    let key = signer.current();
+    let signature = key.sign(NODE_DOMAIN, &record_json)?;
+    Ok(SignedNode { record_json, cert: key.cert_hex(), signature })
 }
 
 /// The heartbeat a signed record claims, read without verifying it: enough
@@ -221,7 +251,7 @@ fn beat_text(id: &str, beat: u64) -> String {
 
 /// A beat for node `id`, signed by it.
 pub fn sign_beat(id: &str, beat: u64, signer: &Signer) -> Result<SignedBeat> {
-    let signature = signer.sign(BEAT_DOMAIN, &beat_text(id, beat))?;
+    let signature = signer.current().sign(BEAT_DOMAIN, &beat_text(id, beat))?;
     Ok(SignedBeat { id: id.to_string(), beat, signature })
 }
 

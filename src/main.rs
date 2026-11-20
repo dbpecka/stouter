@@ -8,6 +8,7 @@ mod metrics;
 mod mux;
 mod node;
 mod pki;
+mod renew;
 mod signing;
 mod state;
 mod subscribe;
@@ -451,7 +452,7 @@ async fn main() -> Result<()> {
             let tls_dir = cfg.tls_dir.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("tlsDir must be set in {}; mTLS is required", cli.config)
             })?;
-            let material = pki::load_or_create(tls_dir, &cfg.node_id)?;
+            let material = pki::load_or_create_with(tls_dir, &cfg.node_id, cfg.cert_lifetime())?;
             let tls_ctx = tls::TlsContext::new(&material)?;
 
             cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
@@ -463,6 +464,12 @@ async fn main() -> Result<()> {
             let _ = state.signer.set(signing::Signer::from_material(&material)?);
             // Orders this process's heartbeats above any earlier process's.
             let _ = state.incarnation.set(state::incarnation_for(&cli.config));
+            // Holding the CA's key, this node renews certificates (its own
+            // and other nodes'); every node renews its own in time.
+            if let Some(issuer) = pki::Issuer::load(tls_dir, cfg.cert_lifetime())? {
+                let _ = state.issuer.set(issuer);
+            }
+            tokio::spawn(renew::run_renewal_loop(state.clone()));
 
             if let Some(tracing_cfg) = &cfg.tracing {
                 let _ = state.tracer.set(telemetry::Tracer::start(tracing_cfg, &cfg.node_id));
@@ -565,9 +572,17 @@ async fn main() -> Result<()> {
 
                     match msg {
                         Message::StatusResponse {
-                            mode, node_id, bind, dynamic_config, known_nodes, require_signed_config,
+                            mode, node_id, bind, dynamic_config, known_nodes, require_signed_config, cert_expires,
+                            issues_certs,
                         } => {
                             print_status(&mode, &node_id, &bind, &dynamic_config, &known_nodes);
+                            if let Some(until) = cert_expires {
+                                println!(
+                                    "\nCertificate valid until {} (renewed when a third of its life is left){}",
+                                    history::format_time(until.max(0) as u64 * 1000),
+                                    if issues_certs { "; this node holds the CA's key and renews others'" } else { "" }
+                                );
+                            }
                             if require_signed_config {
                                 println!("\nConfig changes must be signed by an admin (requireSignedConfig).");
                             }
@@ -1193,7 +1208,7 @@ async fn main() -> Result<()> {
             let tls_dir = cfg.tls_dir.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("tlsDir is not set in {}", cli.config)
             })?;
-            pki::issue_cert_to_dir(tls_dir, &node, &out)?;
+            pki::issue_cert_to_dir_with(tls_dir, &node, &out, cfg.cert_lifetime())?;
             let cert = pki::read_cert(&format!("{out}/node.crt"))?;
             println!("Certificate for '{}' written to {}/", node, out);
             println!("SHA-256 fingerprint: {}", tls::fingerprint_hex(cert.as_ref()));
@@ -2248,6 +2263,8 @@ mod tests {
                             dynamic_config: config::DynamicConfig::default(),
                             known_nodes: vec![],
                             require_signed_config: false,
+                            cert_expires: None,
+                            issues_certs: false,
                         };
                         let _ = gossip::send_message(&mut stream, &reply).await;
                     }

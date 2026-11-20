@@ -63,6 +63,7 @@ Create a `stouter.json` file:
 | `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default) disables admin RPC |
 | `apiPort` | Port on `127.0.0.1` (default 5381) for the subscribe-mode REST API, or in `node` mode for `/metrics` alone. Set per-cluster when running multiple instances on one host. |
 | `requireSignedConfig` | Accept a config change only if a certificate in `adminCns` signed it (see [Signed config changes](#signed-config-changes)). Default `false`. |
+| `certLifetime` | On the CA node (its `tlsDir` holds `ca.key`): how long the certificates it issues last, as `30d`, `12h`, `45m` or `90s` (at least a minute). Default 10 years. Nodes renew theirs without restarting (see [Certificate renewal](#certificate-renewal)). |
 
 The daemon won't start if one of its own settings is wrong (an invalid
 `httpListen`, a `reversePoolSize` over the limit, `requireSignedConfig` without
@@ -282,6 +283,43 @@ Private keys (`ca.key`, and the `node.key` written by `cert issue`) are created
 readable by their owner only (`0600`); stouter warns at startup if an existing
 key is readable by other users.
 
+#### Certificate renewal
+
+Every node renews its certificate once a third of its lifetime is left, and
+switches to the new one without restarting: new connections present it, and
+its record is re-signed with it (connections already open keep going). How
+long certificates last is up to the CA node's `certLifetime` (default 10
+years); set it short (`"certLifetime": "30d"`), and a leaked key stops being
+good within weeks even if nobody revokes it.
+
+- The CA node (its `tlsDir` holds `ca.key`) issues its own new certificate,
+  in memory as always (a new one is issued at each start too).
+- Any other node makes a new key and asks a node holding the CA's key for a
+  certificate on it, over a connection made with its current certificate:
+  the new one is for whoever that certificate names, so a node can only
+  renew its own, and a revoked certificate can't connect to ask. The new
+  `node.crt` and `node.key` are written to its `tlsDir` for the next start
+  (so the directory must be writable).
+- A certificate copied into a node's `tlsDir` by hand (after `stouter cert
+  issue`) is taken up the same way, without a restart, if it lasts longer
+  than the one in use.
+- `stouter status` shows when the daemon's certificate expires.
+- Renew in time: an expired certificate can't connect to ask for another,
+  and peers refuse it. A node that can't reach a CA node keeps trying, with
+  warnings as expiry nears; one whose certificate expired logs an error and
+  needs one issued and copied in by hand. Keep the CA node reachable, or
+  put `ca.key` on more than one node.
+- With every node on this version, shorten `certLifetime`; an older node
+  doesn't renew, so a short-lived certificate would run out on it.
+- A leaked key can renew its certificate until that certificate is revoked.
+  If you can't tell which certificates the holder may have obtained, revoke
+  the node's name.
+
+TLS sessions are never resumed: a resumed session skips the certificate
+checks and carries the certificate of the handshake it resumes, however
+long ago that was. Every mesh connection runs a full handshake (they are
+long-lived and pooled, so it costs little).
+
 #### Revoking certificates
 
 A certificate from the cluster CA is otherwise trusted until it expires (10
@@ -392,6 +430,7 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 |--------|--------|-------|
 | `caps.sh BINARY` | Per-peer connection caps under load, and that stalled handshakes from several addresses can't lock peers out | python3 |
 | `policy.sh BINARY` | Service policies: the allowed subscriber still reaches a direct and a NAT'd service (signed, through a relay); the hosting nodes refuse anyone else, and unsigned requests through a relay even from the allowed node's certificate; deny and clear | python3 |
+| `renew.sh BINARY` | With `certLifetime` 90s, the CA node and another node renew without restarting and still work after their first certificates expired; the renewed one is on disk; one copied in by hand is taken up (about three minutes) | |
 | `history.sh BINARY` | Changes through one daemon are recorded with what changed, on both nodes; `config rollback` puts a version back as a newer one that reaches the other node | |
 | `revoke.sh BINARY` | `cert revoke --node` through one daemon reaches the others: every node forgets the node and refuses it; `cert unrevoke` lets it back | |
 | `multihost.sh BINARY` | Nodes on separate hosts (network namespaces), all bound to `0.0.0.0`, find each other's real addresses and tunnel | root, iproute2, python3, curl |
@@ -400,7 +439,7 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, the
 tests on macOS and Windows, a build check with Rust 1.88 (the Docker
-image's), and all seven scripts, `deploy-host.sh` over ssh from the runner
+image's), and all eight scripts, `deploy-host.sh` over ssh from the runner
 to itself.
 
 ---
