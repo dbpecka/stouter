@@ -632,6 +632,28 @@ impl DynamicConfig {
         Ok(())
     }
 
+    /// Put back `earlier`'s services, routes and policies, as a new version
+    /// (bumped and returned). Revocations are left as they are: a rollback
+    /// never lets a revoked certificate back in. Refused if nothing would
+    /// change.
+    pub fn restore(&mut self, earlier: &DynamicConfig) -> Result<u64, MutateErr> {
+        let next = DynamicConfig {
+            service_groups: earlier.service_groups.clone(),
+            routes: earlier.routes.clone(),
+            policies: earlier.policies.clone(),
+            ..self.clone()
+        };
+        if next.same_settings(self) {
+            return Err(MutateErr::Invalid(format!(
+                "version {} has the same services, routes and policies as now",
+                earlier.version
+            )));
+        }
+        *self = next;
+        self.version += 1;
+        Ok(self.version)
+    }
+
     /// Let `nodes` open tunnels to `service`. A service with no policy yet
     /// gets one, closing it to every other node (except those hosting it).
     /// Bumps `version` and returns the new version; refused if all of them
@@ -1973,6 +1995,28 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("serviceGroups"));
         assert!(!json.contains("services"));
+    }
+
+    #[test]
+    fn a_rollback_puts_back_settings_but_never_unrevokes() {
+        let earlier: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 3, "changedBy": "n1",
+            "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "n1", "nodePort": 80}]}],
+        }))
+        .unwrap();
+        let mut now: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 9, "changedBy": "n2",
+            "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "n1", "nodePort": 81}]}],
+            "policies": [{"service": "api", "allow": ["nobody"]}],
+            "revoked": {"nodes": ["stolen"]},
+        }))
+        .unwrap();
+        assert_eq!(now.restore(&earlier).unwrap(), 10, "a new version, not the old number");
+        assert_eq!(now.service_groups, earlier.service_groups);
+        assert!(now.policies.is_empty());
+        assert_eq!(now.revoked.nodes, ["stolen"], "revocations stay");
+        assert!(now.restore(&earlier).is_err(), "nothing left to change");
+        assert_eq!(now.version, 10);
     }
 
     #[test]

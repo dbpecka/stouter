@@ -94,8 +94,8 @@ service mesh. Grouped by area, not prioritized.
 - Cross-cluster failover / federation of gossip rings.
 
 ## Config & DX
-- Schema-validated, atomic config apply with version history + rollback
-  (`check` exists; add `apply`/`diff`/`history`).
+- Schema-validated, atomic config apply (`check`, `config history` and
+  `config rollback` exist; add `apply`/`diff`).
 - Namespaces or tenants so multiple teams can share one mesh without domain
   collisions.
 - kubectl-style CLI: `stouter get services`, `stouter apply -f`, `stouter logs <svc>`.

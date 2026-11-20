@@ -208,6 +208,12 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
         Message::StatusRequest => {
             handle_status_request(stream, state).await;
         }
+        Message::HistoryRequest { version } => {
+            handle_history_request(stream, version, state).await;
+        }
+        Message::HistoryResponse { .. } => {
+            debug!("unexpected HistoryResponse from {peer_addr}");
+        }
         Message::StatusResponse { .. } => {
             debug!("unexpected StatusResponse from {peer_addr}");
         }
@@ -466,6 +472,19 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
 
     if let Err(e) = send_message(&mut stream, &response).await {
         debug!("status: failed to send response: {e}");
+    }
+}
+
+/// Answer a `HistoryRequest` from this node's config history: every version
+/// recorded (without the configs), or just `version` (with its config).
+async fn handle_history_request(mut stream: MeshStream, version: Option<u64>, state: Arc<SharedState>) {
+    let mut entries = crate::history::load(&state.config_path);
+    match version {
+        Some(v) => entries.retain(|e| e.version == v),
+        None => entries.iter_mut().for_each(|e| e.config = None),
+    }
+    if let Err(e) = send_message(&mut stream, &Message::HistoryResponse { entries }).await {
+        debug!("history: failed to send response: {e}");
     }
 }
 
@@ -977,7 +996,10 @@ fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfi
     }
     cfg.dynamic_config = dc.clone();
     match cfg.save(path) {
-        Ok(()) => *known = Some(new),
+        Ok(()) => {
+            *known = Some(new);
+            crate::history::record(path, dc);
+        }
         Err(e) => error!("failed to persist state to {path}: {e}"),
     }
 }

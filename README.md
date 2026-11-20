@@ -131,6 +131,10 @@ stouter config pull --remote host1:8080
 
 # Sign the dynamic config in the local file and push it (hand edits, with requireSignedConfig)
 stouter --cert-dir /path/to/admin-certs config push --remote host1:8080
+
+# What changed when, and putting an earlier version back (see Config history)
+stouter config history
+stouter config rollback --to 12
 ```
 
 `config push` replaces the cluster's dynamic config with the file's, so it
@@ -140,6 +144,36 @@ differ, it first keeps a copy as `.bak`, or `.bak.2` and so on, never over an
 earlier one), redo the edit, and push; or pass `--force`
 to replace the cluster's config anyway. After a push the file holds the version
 pushed, so the next edit starts from it.
+
+#### Config history
+
+Each daemon records every version of the dynamic config it takes, in
+`<config>.history` beside its config file (a CLI changing the file with no
+daemon running records too), keeping the last 50:
+
+```sh
+stouter config history                        # newest first: version, when, by whom, signed by, what changed
+stouter config history --remote host2:8080    # another node's
+stouter config history --version 12           # that version's config, as JSON
+stouter config rollback --to 12               # put version 12's services, routes and policies back
+```
+
+```
+version 14  2026-11-20 23:01:05 UTC by host1
+    policy for api added: nobody
+version 13  2026-11-20 22:58:41 UTC by host1
+    service web/db on host1 added
+```
+
+A rollback is a new change, made the way `service` commands make theirs
+(through the daemon, or in the local file): it gets the next version
+number, so it reaches every node, and with `requireSignedConfig` it is
+signed like any other change. There, only a version an admin signed can be
+put back, checked by the CLI as it checks any config a daemon serves: a
+daemon's history is its own word. Revocations are never rolled back (a
+rollback can't let a revoked certificate back in): `cert unrevoke` does
+that. A node's history is what it saw: a version that came and went
+between two of its syncs isn't in it.
 
 A running daemon writes each new config into its file. If the file holds an
 edit it hasn't applied (a hand edit not yet picked up, one it refused, a
@@ -358,6 +392,7 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 |--------|--------|-------|
 | `caps.sh BINARY` | Per-peer connection caps under load, and that stalled handshakes from several addresses can't lock peers out | python3 |
 | `policy.sh BINARY` | Service policies: the allowed subscriber still reaches a direct and a NAT'd service (signed, through a relay); the hosting nodes refuse anyone else, and unsigned requests through a relay even from the allowed node's certificate; deny and clear | python3 |
+| `history.sh BINARY` | Changes through one daemon are recorded with what changed, on both nodes; `config rollback` puts a version back as a newer one that reaches the other node | |
 | `revoke.sh BINARY` | `cert revoke --node` through one daemon reaches the others: every node forgets the node and refuses it; `cert unrevoke` lets it back | |
 | `multihost.sh BINARY` | Nodes on separate hosts (network namespaces), all bound to `0.0.0.0`, find each other's real addresses and tunnel | root, iproute2, python3, curl |
 | `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
@@ -365,8 +400,8 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, the
 tests on macOS and Windows, a build check with Rust 1.88 (the Docker
-image's), and all six scripts, `deploy-host.sh` over ssh from the runner to
-itself.
+image's), and all seven scripts, `deploy-host.sh` over ssh from the runner
+to itself.
 
 ---
 

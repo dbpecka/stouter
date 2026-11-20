@@ -2,6 +2,7 @@ mod authz;
 mod config;
 mod gossip;
 mod health;
+mod history;
 mod io;
 mod metrics;
 mod mux;
@@ -98,6 +99,28 @@ enum ConfigAction {
         /// replacing whatever changed since.
         #[arg(long)]
         force: bool,
+    },
+    /// List the versions of the dynamic config a daemon took (or, with no
+    /// daemon, the local file's), with when, who and what changed
+    History {
+        /// Address `host:port` of the daemon to ask (defaults to this
+        /// host's history file).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Print this version's config, as JSON.
+        #[arg(long)]
+        version: Option<u64>,
+    },
+    /// Put back the services, routes and policies of an earlier version
+    /// (see `config history`), as a new version. Revocations stay as they are.
+    Rollback {
+        /// The version to go back to.
+        #[arg(long)]
+        to: u64,
+        /// Address `host:port` of the daemon to make the change through
+        /// (defaults to this host's daemon, else the config file).
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// Write the cluster's current dynamic config into the local config
     /// file, keeping its other settings: where to start an edit to push.
@@ -434,6 +457,8 @@ async fn main() -> Result<()> {
             cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
 
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
+            // The version this node starts on begins (or continues) its history.
+            history::record(&cli.config, &cfg.dynamic_config);
             // Signs this node's own record, which peers believe only signed.
             let _ = state.signer.set(signing::Signer::from_material(&material)?);
             // Orders this process's heartbeats above any earlier process's.
@@ -1218,6 +1243,98 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
+        // config history
+        // -----------------------------------------------------------------
+        Some(Commands::Config { action: ConfigAction::History { remote, version } }) => {
+            let local = Config::load_or_default(&cli.config)?;
+            let entries = match &remote {
+                Some(target) => fetch_history(target, version, &local, cli.cert_dir.as_deref()).await?,
+                None => {
+                    let mut entries = history::load(&cli.config);
+                    if let Some(v) = version {
+                        entries.retain(|e| e.version == v);
+                    }
+                    entries
+                }
+            };
+            let from = remote.as_deref().unwrap_or(&cli.config);
+            match version {
+                Some(v) => {
+                    let config = entries.into_iter().find_map(|e| e.config).ok_or_else(|| {
+                        anyhow::anyhow!("version {v} isn't in the history of {from}: `stouter config history` lists them")
+                    })?;
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                }
+                None if entries.is_empty() => println!("No config history recorded for {from} yet"),
+                None => {
+                    for entry in entries.iter().rev() {
+                        let who = match (&entry.signed_by, entry.changed_by.as_str()) {
+                            (Some(admin), "") => format!(", signed by {admin}"),
+                            (Some(admin), by) => format!(" by {by}, signed by {admin}"),
+                            (None, "") => String::new(),
+                            (None, by) => format!(" by {by}"),
+                        };
+                        println!("version {}  {}{who}", entry.version, history::format_time(entry.at_ms));
+                        for change in &entry.changes {
+                            println!("    {change}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // config rollback
+        // -----------------------------------------------------------------
+        Some(Commands::Config { action: ConfigAction::Rollback { to, remote } }) => {
+            let local = Config::load_or_default(&cli.config)?;
+            let target = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
+            // The version to restore: from the daemon's history, or the file's.
+            let entries = match &target {
+                Some(addr) => fetch_history(addr, Some(to), &local, cli.cert_dir.as_deref()).await?,
+                None => history::load(&cli.config),
+            };
+            let earlier = entries.into_iter().filter(|e| e.version == to).find_map(|e| e.config).ok_or_else(|| {
+                anyhow::anyhow!("version {to} isn't in the config history: `stouter config history` lists them")
+            })?;
+            // Where changes must be signed, only what an admin signed is put
+            // back: a daemon's history is its word, and signing it as given
+            // would sign whatever it made up.
+            let signed = match &target {
+                Some(addr) => {
+                    let tls_ctx = build_cli_tls(&local, cli.cert_dir.as_deref())?;
+                    signed_cluster(&local, fetch_daemon_config(addr, &tls_ctx).await?.require_signed_config)
+                }
+                None => local.require_signed_config,
+            };
+            let earlier = if signed {
+                if earlier.signature.is_none() {
+                    anyhow::bail!(
+                        "version {to} isn't admin-signed, so it can't be put back where changes must be signed: \
+                         make the change by hand (`config pull`, edit, `config push`)"
+                    );
+                }
+                let material = load_cli_material(&local, cli.cert_dir.as_deref())?;
+                let tls_ctx = tls::TlsContext::new(&material)?;
+                trusted_config(&earlier, &local, &material, &tls_ctx).with_context(|| format!("version {to}"))?
+            } else {
+                earlier
+            };
+            let op = AdminOp::Restore { config: earlier };
+            let version = if let Some(addr) = &target {
+                run_admin_rpc(addr, op, &local, cli.cert_dir.as_deref()).await?
+            } else {
+                let mut cfg = Config::load(&cli.config)?;
+                let before = cfg.dynamic_config.clone();
+                let version = op.apply(&mut cfg.dynamic_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
+                broadcast_config(&cfg, &cli.config).await?;
+                version
+            };
+            println!("Put back the services, routes and policies of version {to}, as version {version}");
+        }
+
+        // -----------------------------------------------------------------
         // policy allow / deny / clear
         // -----------------------------------------------------------------
         Some(Commands::Policy { action: action @ (PolicyAction::Allow { .. } | PolicyAction::Deny { .. } | PolicyAction::Clear { .. }) }) => {
@@ -1595,6 +1712,20 @@ fn trusted_config(
     })
 }
 
+/// A daemon's config history: every version (without configs), or one.
+async fn fetch_history(
+    target: &str,
+    version: Option<u64>,
+    cfg: &Config,
+    cert_dir: Option<&str>,
+) -> Result<Vec<history::HistoryEntry>> {
+    let tls_ctx = build_cli_tls(cfg, cert_dir)?;
+    match daemon_request(target, &tls_ctx, &Message::HistoryRequest { version }).await? {
+        Message::HistoryResponse { entries } => Ok(entries),
+        _ => anyhow::bail!("unexpected response from {target} (a daemon too old to keep a config history?)"),
+    }
+}
+
 /// One line saying who may reach a service under `policy`.
 fn describe_policy(policy: &config::Policy) -> String {
     if policy.allow.is_empty() {
@@ -1853,7 +1984,9 @@ fn save_local_change(
         // An edit invalidates any signature the config carried.
         cfg.dynamic_config.signature = None;
     }
-    cfg.save(path)
+    cfg.save(path)?;
+    history::record(path, &cfg.dynamic_config);
+    Ok(())
 }
 
 /// This host's TLS identity, from its `tlsDir`, for telling peers about a

@@ -73,6 +73,14 @@ pub enum Message {
         #[serde(default)]
         require_signed_config: bool,
     },
+    /// Ask a daemon for its config history (see `crate::history`): every
+    /// version it recorded, without the configs; or one, with its config.
+    HistoryRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
+    },
+    /// Reply to a `HistoryRequest`, oldest first.
+    HistoryResponse { entries: Vec<crate::history::HistoryEntry> },
     /// Upgrade this TCP connection to a yamux multiplexed tunnel session.
     MuxTunnel {},
     /// Mutating admin RPC. Authorized via `adminCns` allowlist on the receiver.
@@ -176,6 +184,10 @@ pub enum AdminOp {
     PolicyDeny { service: String, nodes: Vec<String> },
     /// Drop `service`'s policy, opening it to every node.
     PolicyClear { service: String },
+    /// Put back the services, routes and policies of `config` (an earlier
+    /// version, from the history), as a new version. Revocations stay as
+    /// they are.
+    Restore { config: DynamicConfig },
     /// Undo a `Revoke` of these.
     Unrevoke {
         #[serde(default)]
@@ -239,6 +251,7 @@ impl AdminOp {
             AdminOp::PolicyAllow { service, nodes } => dc.allow_callers(&service, &nodes),
             AdminOp::PolicyDeny { service, nodes } => dc.deny_callers(&service, &nodes),
             AdminOp::PolicyClear { service } => dc.clear_policy(&service),
+            AdminOp::Restore { config } => dc.restore(&config),
             AdminOp::Revoke { nodes, certs } => dc.revoke(&nodes, &certs),
             AdminOp::Unrevoke { nodes, certs } => dc.unrevoke(&nodes, &certs),
             AdminOp::ConfigPush { .. } => Err(MutateErr::Invalid("a pushed config is not an edit".into())),
