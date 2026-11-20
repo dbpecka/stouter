@@ -320,9 +320,10 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 | `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
 | `deploy-host.sh [user@host]` | `deploy.sh` against a real host: the container runs and answers, a redeploy keeps the CA | ssh with keys, sudo and Docker on the host |
 
-CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, checks
-the build with Rust 1.88 (the Docker image's) and on macOS and Windows, and
-runs all five scripts, `deploy-host.sh` over ssh from the runner to itself.
+CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, the
+tests on macOS and Windows, a build check with Rust 1.88 (the Docker
+image's), and all five scripts, `deploy-host.sh` over ssh from the runner to
+itself.
 
 ---
 
@@ -447,10 +448,11 @@ Limits, so one peer can't exhaust a node:
   (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, and 1024
   idle reverse connections, and 2 sync connections kept open between rounds.
   Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
-  so an idle one whose peer vanished is closed within about a minute. On
-  Linux, so is one with data waiting to be acknowledged (`TCP_USER_TIMEOUT`,
-  60s), where TCP would otherwise retransmit for about 15 minutes; elsewhere
-  keepalive covers only idle connections.
+  so an idle one whose peer vanished is closed within about a minute. So is
+  one with data waiting to be acknowledged, after 60s of retransmitting
+  (`TCP_USER_TIMEOUT` on Linux, `TCP_RXT_CONNDROPTIME` on macOS, `TCP_MAXRT`
+  on Windows), where TCP would otherwise retransmit for many minutes (about
+  15 on Linux). Other systems keep their own retransmission limits.
 - At most 512 TLS handshakes may be in progress at once, 128 from one IPv4
   address or IPv6 /64. Until it completes its handshake a connection could
   be anyone's, so this keeps a host with no certificate from tying up every
@@ -692,7 +694,7 @@ All async tasks share a single `Arc<State>` that contains:
 | `tunnel_pool` | Pre-warmed TCP connections keyed by address |
 | `mux_pool` | Yamux sessions keyed by address |
 
-`StreamPool<T>` is a generic pooling primitive backed by a `VecDeque` with async `notify` for waiters. `InFlightTracker` counts active connections and signals a drain channel on zero for graceful shutdown. Subscribers close their idle HTTP keep-alive connections to a node that leaves, and to NAT'd nodes reached through a relay that leaves, so neither waits out the 30-second drain for connections nobody is using.
+`StreamPool<T>` is a generic pooling primitive backed by a `VecDeque` with async `notify` for waiters. `InFlightTracker` counts active connections and signals a drain channel on zero for graceful shutdown. Subscribers close their idle HTTP keep-alive connections to a node that leaves, and to NAT'd nodes reached through a relay that leaves, so neither waits out the 30-second drain for connections nobody is using. They do the same for a NAT'd node whose tunnels move to another of its relays (the one before stopped answering, say): a request sent on a pooled connection through a relay that vanished would otherwise wait for TCP to give up.
 
 ### Subscribe REST API
 

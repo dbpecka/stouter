@@ -46,6 +46,14 @@ rand = "0.9"
 # Certificate validity dates (rcgen's own dependency, with the clock enabled).
 time = { version = "0.3", default-features = false, features = ["std"] }
 
+# Socket options socket2 doesn't cover: how long unacknowledged data is
+# retransmitted to a peer before the connection is dropped (see io.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 tower = "0.5"
 # Paused, manually advanced time for tests of timeouts.

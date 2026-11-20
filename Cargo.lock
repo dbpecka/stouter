@@ -1479,6 +1479,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
@@ -1498,6 +1499,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "x509-parser",
  "yamux",
 ]

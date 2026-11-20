@@ -148,33 +148,23 @@ async fn manage_proxies(
         // A node that left may still be draining, and our idle HTTP
         // keep-alive connections to it look like open tunnels to it: close
         // them, so its drain doesn't wait out the pool's idle timeout. The
-        // same for a relay that left: idle connections to NAT'd nodes that
-        // go through it are open tunnels through it (and the pools are
-        // keyed by service, so they would never be closed otherwise).
-        {
-            let gone: HashSet<&str> =
-                prev_nodes.iter().map(String::as_str).filter(|id| !nodes.contains_key(*id)).collect();
-            if !gone.is_empty() {
-                let behind_gone_relay: HashSet<&str> = prev_relays
-                    .iter()
-                    .filter(|(_, relay)| gone.contains(relay.as_str()))
-                    .map(|(natd, _)| natd.as_str())
-                    .collect();
-                let index = state.service_index.load();
-                let hosted: HashSet<&str> = index
-                    .keys()
-                    .filter(|(node, _)| gone.contains(node.as_str()) || behind_gone_relay.contains(node.as_str()))
-                    .map(|(_, svc)| svc.as_str())
-                    .collect();
-                http_proxies.reset_pools(|name| hosted.contains(name));
-            }
-        }
-        prev_nodes = nodes.keys().cloned().collect();
-        prev_relays = nodes
+        // same for NAT'd nodes whose tunnels now go another way (see
+        // [`nodes_to_unpool`]); the pools are keyed by service, so they
+        // would never be closed otherwise.
+        let relays_now: HashMap<String, String> = nodes
             .values()
             .filter(|node| node.addr.is_empty())
             .filter_map(|node| Some((node.id.clone(), proxy::tunnel_route(node, &state)?.1?)))
             .collect();
+        let unpool = nodes_to_unpool(&prev_nodes, &prev_relays, &nodes, &relays_now);
+        if !unpool.is_empty() {
+            let index = state.service_index.load();
+            let hosted: HashSet<&str> =
+                index.keys().filter(|(node, _)| unpool.contains(node.as_str())).map(|(_, svc)| svc.as_str()).collect();
+            http_proxies.reset_pools(|name| hosted.contains(name));
+        }
+        prev_nodes = nodes.keys().cloned().collect();
+        prev_relays = relays_now;
 
         // Build the desired set: "group/service" keys where at least one
         // node is reachable, with what proxy setup and the REST API need.
@@ -345,6 +335,27 @@ fn proxied_nodes(dc: &crate::config::DynamicConfig, config: &crate::config::Conf
         .filter(|(_, s)| names.contains(s.name.as_str()) && s.node_id != config.node_id)
         .map(|(_, s)| s.node_id.clone())
         .collect()
+}
+
+/// The nodes whose services' idle HTTP keep-alive connections should be
+/// closed, given the known nodes and the relay each NAT'd node's tunnels go
+/// through (NAT'd node id -> relay id), as of the previous pass and now:
+/// nodes that left, NAT'd nodes behind a relay that left, and NAT'd nodes
+/// whose tunnels now go through another relay (the one before stopped
+/// answering, say). A pooled connection through a relay that vanished
+/// would hold each request sent on it until TCP gave up.
+fn nodes_to_unpool(
+    prev_nodes: &HashSet<String>,
+    prev_relays: &HashMap<String, String>,
+    nodes: &HashMap<String, crate::config::NodeInfo>,
+    relays_now: &HashMap<String, String>,
+) -> HashSet<String> {
+    let gone: HashSet<&str> = prev_nodes.iter().map(String::as_str).filter(|id| !nodes.contains_key(*id)).collect();
+    let rerouted = prev_relays
+        .iter()
+        .filter(|(natd, relay)| gone.contains(relay.as_str()) || relays_now.get(*natd).is_some_and(|now| now != *relay))
+        .map(|(natd, _)| natd.as_str());
+    gone.iter().copied().chain(rerouted).map(str::to_string).collect()
 }
 
 /// Where this daemon's tunnels go: the connect address (see
@@ -573,5 +584,27 @@ mod tests {
             ..all
         };
         assert_eq!(sorted(proxied_nodes(&dc(), &by_group)), ["a", "b", "d", "e"]);
+    }
+    #[test]
+    fn keep_alives_are_closed_to_nodes_that_left_or_now_go_another_way() {
+        let ids = |list: &[&str]| -> HashSet<String> { list.iter().map(|s| s.to_string()).collect() };
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        let known = |list: &[&str]| -> HashMap<String, crate::config::NodeInfo> {
+            list.iter().map(|id| (id.to_string(), crate::config::NodeInfo { id: id.to_string(), ..Default::default() })).collect()
+        };
+        let before = ids(&["a", "r1", "r2", "x", "y"]);
+        let relays_before = map(&[("x", "r1"), ("y", "r2")]);
+
+        // Nothing changed.
+        let none = nodes_to_unpool(&before, &relays_before, &known(&["a", "r1", "r2", "x", "y"]), &relays_before);
+        assert!(none.is_empty());
+        // a left; so did r2, which y went through (y now has no route).
+        let left = nodes_to_unpool(&before, &relays_before, &known(&["r1", "x", "y"]), &map(&[("x", "r1")]));
+        assert_eq!(left, ids(&["a", "r2", "y"]));
+        // r1 stopped answering (still known, not live): x's tunnels moved to r2.
+        let moved = nodes_to_unpool(&before, &relays_before, &known(&["a", "r1", "r2", "x", "y"]), &map(&[("x", "r2"), ("y", "r2")]));
+        assert_eq!(moved, ids(&["x"]));
     }
 }

@@ -47,10 +47,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
 
-  # The other platforms releases are built for: the binary and the tests
-  # compile.
-  build:
-    name: Build (${{ matrix.os }})
+  # The other platforms releases are built for.
+  other-platforms:
+    name: Tests (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +65,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
 
   e2e:
     name: End-to-end (caps, multi-host, revocation)
