@@ -116,6 +116,10 @@ stouter service list
 # Issue a signed node certificate (run on the CA node)
 stouter cert issue --node host2 --out /path/to/certs
 
+# Only api-1 and api-2 may reach db from now on (see Service authorization)
+stouter policy allow --service db --from api-1 --from api-2
+stouter policy list
+
 # Revoke a node's certificates: every one for a node removed for good, or
 # one certificate whose key leaked (see Revoking certificates)
 stouter cert revoke --node host2
@@ -282,6 +286,44 @@ revoked, as the certificate would be refused everywhere.
 - Every node must run a version that knows revocations: an older one ignores
   the list, and one relaying an unsigned config drops it.
 
+### Service authorization
+
+By default any node in the cluster can open a tunnel to any service. A
+service's policy limits that to the nodes it lists (and the nodes hosting the
+service, whose instances may reach one another):
+
+```sh
+stouter policy allow --service db --from api-1 --from api-2   # creates the policy: db is closed to every other node
+stouter policy deny  --service db --from api-2                # api-2 no longer (db stays closed, even with nobody left)
+stouter policy clear --service db                             # no policy: db open to every node again
+stouter policy list
+```
+
+Policies are part of the dynamic config (`policies`: `service` and `allow`,
+a list of node names), so they reach every node by gossip, and go through
+the daemon (`--remote`) or the local file like `service` commands. With
+`requireSignedConfig`, only an admin can change them.
+
+- The node hosting a service enforces its policy: a caller could skip a
+  check of its own. It refuses a tunnel from any other node with an error
+  saying why, and counts it in `stouter_tunnel_denied_total{service}`.
+- Who is asking is the certificate at the other end of the connection,
+  when the caller connects directly. A NAT'd node gets its tunnels through a
+  relay, whose certificate says only who the relay is; so callers sign their
+  requests to NAT'd nodes, and those nodes take a request through a relay
+  for a service with a policy only if it is signed by a node the policy
+  lists. A relay can pass a request on but not make one up for another node,
+  and a request passed on twice is refused. (A relay still carries the
+  tunnel's bytes, as it always has: it can tamper with or cut off the
+  tunnels that go through it.)
+- A subscriber doesn't proxy a service its policy keeps it from, so local
+  callers are refused at once; it logs which.
+- The grant is to a node: every local process on an allowed node can use its
+  proxy. Telling them apart needs per-service identities (not yet).
+- Older nodes neither sign their requests nor check policies: a NAT'd node
+  with a policy refuses their requests through a relay. Upgrade the nodes
+  that call a protected service before adding its policy.
+
 ### Docker
 
 ```sh
@@ -315,6 +357,7 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 | Script | Checks | Needs |
 |--------|--------|-------|
 | `caps.sh BINARY` | Per-peer connection caps under load, and that stalled handshakes from several addresses can't lock peers out | python3 |
+| `policy.sh BINARY` | Service policies: the allowed subscriber still reaches a direct and a NAT'd service (signed, through a relay); the hosting nodes refuse anyone else, and unsigned requests through a relay even from the allowed node's certificate; deny and clear | python3 |
 | `revoke.sh BINARY` | `cert revoke --node` through one daemon reaches the others: every node forgets the node and refuses it; `cert unrevoke` lets it back | |
 | `multihost.sh BINARY` | Nodes on separate hosts (network namespaces), all bound to `0.0.0.0`, find each other's real addresses and tunnel | root, iproute2, python3, curl |
 | `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
@@ -322,7 +365,7 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, the
 tests on macOS and Windows, a build check with Rust 1.88 (the Docker
-image's), and all five scripts, `deploy-host.sh` over ssh from the runner to
+image's), and all six scripts, `deploy-host.sh` over ssh from the runner to
 itself.
 
 ---

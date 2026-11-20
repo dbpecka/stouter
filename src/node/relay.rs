@@ -156,15 +156,18 @@ pub async fn relay_tunnel<S>(
     node_id: &str,
     service_name: &str,
     timestamp_ms: u64,
+    caller: Option<crate::config::SignedCaller>,
     state: &Arc<SharedState>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // The caller's signature goes on as it came: the NAT'd node checks it.
     let msg = Message::TunnelRequest {
         node_id: node_id.to_string(),
         service_name: service_name.to_string(),
         timestamp_ms,
+        caller,
     };
 
     // Forward the request down a reverse connection and read the NAT'd
@@ -297,7 +300,7 @@ mod tests {
         tokio::time::pause();
         let (subscriber, mut ours) = tokio::io::duplex(4096);
         let started = tokio::time::Instant::now();
-        let err = relay_tunnel(subscriber, "x", "svc", now_ms(), &relay).await.unwrap_err();
+        let err = relay_tunnel(subscriber, "x", "svc", now_ms(), None, &relay).await.unwrap_err();
         // 3 tries of 5s each would be 15s, as long as the subscriber waits.
         assert!(started.elapsed() <= RELAY_DEADLINE + Duration::from_secs(1), "{:?} ({err})", started.elapsed());
         let mut status = [0u8; 1];

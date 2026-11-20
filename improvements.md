@@ -56,7 +56,9 @@ service mesh. Grouped by area, not prioritized.
 - Certificate rotation without a restart, and short-lived certificates
   (revocation exists: `stouter cert revoke`).
 - SPIFFE-style workload identity so services — not just nodes — are principals.
-- Authorization policies: "service A may call service B on path /x" (L7 RBAC).
+- Authorization by service rather than node, and on paths: "service A may
+  call service B on path /x" (L7 RBAC). Node-level policies exist:
+  `stouter policy allow`.
 - Finer-grained admin RBAC (per-group or per-operation rather than one allowlist).
 
 ## Traffic management
@@ -101,4 +103,5 @@ service mesh. Grouped by area, not prioritized.
 
 ## Next up
 1. **M5 — Workload identity + L7 authorization** — per-service identities in
-   certs, enforced on hosting nodes.
+   certs, enforced on hosting nodes. (Node-level service policies, enforced
+   on hosting nodes with signed tunnel requests through relays, are done.)

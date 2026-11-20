@@ -175,6 +175,7 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
             node_id,
             service_name,
             timestamp_ms,
+            caller,
         } => {
             metrics::counter!("stouter_connections_total", "type" => "tunnel").increment(1);
             if let Err(e) = crate::node::tunnel::handle_tunnel(
@@ -182,6 +183,8 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
                 node_id,
                 service_name,
                 timestamp_ms,
+                caller,
+                false,
                 state,
             )
             .await

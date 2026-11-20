@@ -52,6 +52,10 @@ pub enum Message {
         node_id: String,
         service_name: String,
         timestamp_ms: u64,
+        /// The caller's signature over the request, sent when it may go
+        /// through a relay (see `crate::authz`). Older nodes don't send it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<crate::config::SignedCaller>,
     },
     /// NAT'd node registering a reverse connection with a relay.
     ReverseRegistration { node_id: String, timestamp_ms: u64 },
@@ -165,6 +169,13 @@ pub enum AdminOp {
         #[serde(default)]
         certs: Vec<String>,
     },
+    /// Let `nodes` open tunnels to `service` (a service with no policy
+    /// gets one, closing it to every other node).
+    PolicyAllow { service: String, nodes: Vec<String> },
+    /// Stop `nodes` opening tunnels to `service`.
+    PolicyDeny { service: String, nodes: Vec<String> },
+    /// Drop `service`'s policy, opening it to every node.
+    PolicyClear { service: String },
     /// Undo a `Revoke` of these.
     Unrevoke {
         #[serde(default)]
@@ -225,6 +236,9 @@ impl AdminOp {
                 dc.rename_service(&group, &owner_node_id, &from, &to)
             }
             AdminOp::ServiceRemove { group, owner_node_id, name } => dc.remove_service(&group, &owner_node_id, &name),
+            AdminOp::PolicyAllow { service, nodes } => dc.allow_callers(&service, &nodes),
+            AdminOp::PolicyDeny { service, nodes } => dc.deny_callers(&service, &nodes),
+            AdminOp::PolicyClear { service } => dc.clear_policy(&service),
             AdminOp::Revoke { nodes, certs } => dc.revoke(&nodes, &certs),
             AdminOp::Unrevoke { nodes, certs } => dc.unrevoke(&nodes, &certs),
             AdminOp::ConfigPush { .. } => Err(MutateErr::Invalid("a pushed config is not an edit".into())),
@@ -524,15 +538,34 @@ mod tests {
             node_id: "host1".into(),
             service_name: "web".into(),
             timestamp_ms: 1234567890,
+            caller: None,
         };
         match msgpack_round_trip(&msg) {
-            Message::TunnelRequest { node_id, service_name, timestamp_ms } => {
+            Message::TunnelRequest { node_id, service_name, timestamp_ms, caller } => {
                 assert_eq!(node_id, "host1");
                 assert_eq!(service_name, "web");
                 assert_eq!(timestamp_ms, 1234567890);
+                assert_eq!(caller, None);
             }
             _ => panic!("wrong variant"),
         }
+        // Unsigned, it encodes as before, so older nodes read it unchanged.
+        assert!(!rmp_serde::to_vec_named(&msg).unwrap().windows(6).any(|w| w == b"caller"));
+        // Signed, an older node (which knows no `caller`) still reads it.
+        let signed = Message::TunnelRequest {
+            node_id: "host1".into(),
+            service_name: "web".into(),
+            timestamp_ms: 1,
+            caller: Some(crate::config::SignedCaller { nonce: 7, cert: "ab".into(), signature: "cd".into() }),
+        };
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "camelCase")]
+        enum Old {
+            TunnelRequest { node_id: String, service_name: String, timestamp_ms: u64 },
+        }
+        let Old::TunnelRequest { node_id, service_name, timestamp_ms } =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&signed).unwrap()).unwrap();
+        assert_eq!((node_id.as_str(), service_name.as_str(), timestamp_ms), ("host1", "web", 1));
     }
 
     #[test]

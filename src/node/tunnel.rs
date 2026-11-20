@@ -74,11 +74,18 @@ pub(crate) async fn refuse_if_draining<W: AsyncWrite + Unpin>(stream: &mut W, st
 /// 2. Locate the requested service on this node (or relay if targeting another node).
 /// 3. Open a TCP connection to `127.0.0.1:{node_port}`.
 /// 4. Write `0x00` (success) and then transparently copy bytes in both directions.
+///
+/// `caller` is the request's signature, if the caller signed it; with
+/// `via_relay`, the request came on a reverse connection this node keeps at
+/// a relay, so the certificate at the other end is the relay's and only a
+/// signature says who asks (see `crate::authz`).
 pub async fn handle_tunnel(
     mut client: MeshStream,
     node_id: String,
     service_name: String,
     timestamp_ms: u64,
+    caller: Option<crate::config::SignedCaller>,
+    via_relay: bool,
     state: Arc<SharedState>,
 ) -> Result<()> {
     refuse_if_draining(&mut client, &state).await?;
@@ -99,8 +106,15 @@ pub async fn handle_tunnel(
     // --- Check if this tunnel targets us or needs relaying ---
     let our_node_id = &state.config.node_id;
     if !node_id.is_empty() && node_id != *our_node_id {
-        return super::relay::relay_tunnel(client, &node_id, &service_name, timestamp_ms, &state)
+        return super::relay::relay_tunnel(client, &node_id, &service_name, timestamp_ms, caller, &state)
             .await;
+    }
+
+    // --- Only a caller its policy allows ---
+    let via = if via_relay { crate::authz::Via::Relay } else { crate::authz::Via::Direct(client.peer_cn()) };
+    if let Err(why) = crate::authz::authorize(&state, &service_name, timestamp_ms, caller.as_ref(), via) {
+        send_tunnel_error(&mut client, &why).await;
+        bail!("{why}");
     }
 
     // --- Locate service and connect ---

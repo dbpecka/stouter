@@ -441,10 +441,23 @@ async fn establish_tunnel_untimed(
         .context("system time before Unix epoch")?
         .as_millis() as u64;
 
+    // A NAT'd node is reached through a relay or a reverse connection,
+    // where the certificate it sees is the relay's: sign the request, so it
+    // knows who asks (see `crate::authz`). Directly, our certificate says.
+    let caller = if node.addr.is_empty() {
+        state.signer.get().and_then(|signer| {
+            crate::signing::sign_tunnel_request(signer, &node.id, &service_name, timestamp_ms)
+                .map_err(|e| tracing::warn!("can't sign the tunnel request to {}: {e:#}", node.id))
+                .ok()
+        })
+    } else {
+        None
+    };
     let msg = Message::TunnelRequest {
         node_id: node.id.clone(),
         service_name,
         timestamp_ms,
+        caller,
     };
     let connect_start = Instant::now();
 

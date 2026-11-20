@@ -134,6 +134,9 @@ async fn manage_proxies(
     // Service keys skipped because their name is taken by another group,
     // so each conflict is reported once.
     let mut name_conflicts: HashSet<String> = HashSet::new();
+    // Services skipped because their policy doesn't let this node reach
+    // them, so each is reported once.
+    let mut policy_skipped: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -187,6 +190,16 @@ async fn manage_proxies(
                         continue;
                     }
                 }
+                // One this node may not reach (see `crate::authz`): no
+                // proxy, so local callers are refused at once rather than
+                // cut off by the node hosting it.
+                if !crate::authz::may_reach(&state, &svc.name, &state.config.node_id) {
+                    if policy_skipped.insert(svc.name.clone()) {
+                        tracing::info!("not proxying '{}': its policy doesn't let this node reach it", svc.name);
+                    }
+                    continue;
+                }
+                policy_skipped.remove(&svc.name);
                 let key = format!("{}/{}", group.name, svc.name);
                 match name_owner.get(&svc.name) {
                     Some(owner) if *owner != group.name => {

@@ -189,8 +189,9 @@ impl MuxPool {
 /// Each incoming yamux stream carries one tunnel lifecycle:
 /// TunnelRequest → status byte → bidirectional proxy.
 pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
+    // Who opened the session: the caller of every tunnel on it.
+    let peer: Arc<str> = Arc::from(stream.peer_cn().unwrap_or(""));
     let compat_stream = stream.compat();
-    let peer = String::from("mux-peer");
     let config = yamux::Config::default();
     let mut connection = yamux::Connection::new(compat_stream, config, yamux::Mode::Server);
 
@@ -201,13 +202,14 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
         match next {
             Some(Ok(yamux_stream)) => {
                 let state = state.clone();
+                let peer = peer.clone();
                 // Each stream is a tunnel; the session itself isn't tracked,
                 // so an idle session doesn't hold up a drain.
                 let in_flight = state.in_flight.track();
                 tokio::spawn(async move {
                     let _in_flight = in_flight;
                     let compat = yamux_stream.compat();
-                    if let Err(e) = handle_mux_stream(compat, state).await {
+                    if let Err(e) = handle_mux_stream(compat, &peer, state).await {
                         debug!("mux stream error: {e}");
                     }
                 });
@@ -227,6 +229,7 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
 /// Handle a single yamux stream carrying a tunnel request.
 async fn handle_mux_stream(
     mut stream: Compat<yamux::Stream>,
+    peer: &str,
     state: Arc<SharedState>,
 ) -> Result<()> {
     let msg = gossip::recv_message(&mut stream)
@@ -238,6 +241,7 @@ async fn handle_mux_stream(
             node_id,
             service_name,
             timestamp_ms,
+            caller,
         } => {
             crate::node::tunnel::refuse_if_draining(&mut stream, &state).await?;
 
@@ -262,9 +266,17 @@ async fn handle_mux_stream(
                     &node_id,
                     &service_name,
                     timestamp_ms,
+                    caller,
                     &state,
                 )
                 .await;
+            }
+
+            // Only a caller its policy allows.
+            let via = crate::authz::Via::Direct(Some(peer).filter(|p| !p.is_empty()));
+            if let Err(why) = crate::authz::authorize(&state, &service_name, timestamp_ms, caller.as_ref(), via) {
+                send_tunnel_error(&mut stream, &why).await;
+                bail!("{why}");
             }
 
             // Connect to local service
@@ -425,7 +437,7 @@ mod tests {
         for _ in 0..256 {
             let (stream, session) = pool.open_stream(&addr, None).await.unwrap();
             let mut stream = stream.compat();
-            let request = Message::TunnelRequest { node_id: "x".into(), service_name: "svc".into(), timestamp_ms: now_ms() };
+            let request = Message::TunnelRequest { node_id: "x".into(), service_name: "svc".into(), timestamp_ms: now_ms(), caller: None };
             gossip::send_message(&mut stream, &request).await.unwrap();
             held.push((stream, session));
         }

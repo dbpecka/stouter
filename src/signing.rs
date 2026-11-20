@@ -26,7 +26,7 @@ use tokio_rustls::rustls::sign::SigningKey;
 use tokio_rustls::rustls::{self, SignatureScheme};
 use tracing::{debug, warn};
 
-use crate::config::{ConfigSignature, DynamicConfig, NodeRecord, SignedBeat, SignedNode};
+use crate::config::{ConfigSignature, DynamicConfig, NodeRecord, SignedBeat, SignedCaller, SignedNode};
 use crate::state::SharedState;
 use crate::tls::TlsContext;
 
@@ -35,6 +35,7 @@ use crate::tls::TlsContext;
 const CONFIG_DOMAIN: &[u8] = b"stouter signed config v1\n";
 const NODE_DOMAIN: &[u8] = b"stouter node record v1\n";
 const BEAT_DOMAIN: &[u8] = b"stouter node beat v1\n";
+const TUNNEL_DOMAIN: &[u8] = b"stouter tunnel request v1\n";
 
 /// A signing key and the certificate vouching for it.
 pub struct Signer {
@@ -81,6 +82,36 @@ fn verify_text(domain: &[u8], text: &str, cert: &str, signature: &str, tls: &Tls
         .verify_signature(webpki::aws_lc_rs::ECDSA_P256_SHA256, &[domain, text.as_bytes()].concat(), &signature)
         .map_err(|_| anyhow!("the signature does not verify"))?;
     Ok(signer)
+}
+
+// ---------------------------------------------------------------------------
+// Tunnel requests
+// ---------------------------------------------------------------------------
+
+/// The text a caller signs for a tunnel request.
+fn tunnel_text(node_id: &str, service: &str, timestamp_ms: u64, nonce: u64) -> String {
+    serde_json::to_string(&(node_id, service, timestamp_ms, nonce)).expect("plain values encode")
+}
+
+/// `signer`'s signature over a tunnel request to `service` on `node_id`.
+pub fn sign_tunnel_request(signer: &Signer, node_id: &str, service: &str, timestamp_ms: u64) -> Result<SignedCaller> {
+    let nonce = rand::random::<u64>();
+    let signature = signer.sign(TUNNEL_DOMAIN, &tunnel_text(node_id, service, timestamp_ms, nonce))?;
+    Ok(SignedCaller { nonce, cert: hex(signer.cert.as_ref()), signature })
+}
+
+/// Who signed `caller` for a tunnel request to `service` on `node_id` at
+/// `timestamp_ms`: the Common Name of a certificate from the cluster CA
+/// (not revoked) whose key made the signature.
+pub fn verify_tunnel_request(
+    caller: &SignedCaller,
+    node_id: &str,
+    service: &str,
+    timestamp_ms: u64,
+    tls: &TlsContext,
+) -> Result<String> {
+    let text = tunnel_text(node_id, service, timestamp_ms, caller.nonce);
+    verify_text(TUNNEL_DOMAIN, &text, &caller.cert, &caller.signature, tls)
 }
 
 // ---------------------------------------------------------------------------

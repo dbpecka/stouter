@@ -68,7 +68,7 @@ jobs:
       - run: cargo test --locked
 
   e2e:
-    name: End-to-end (caps, multi-host, revocation)
+    name: End-to-end (caps, multi-host, revocation, policies)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -84,6 +84,8 @@ jobs:
         run: sudo tests/e2e/multihost.sh target/debug/stouter
       - name: Revoking a node's certificate reaches the cluster
         run: tests/e2e/revoke.sh target/debug/stouter
+      - name: Service policies, direct and through a relay
+        run: tests/e2e/policy.sh target/debug/stouter
 
   docker:
     name: End-to-end (deploy.sh, docker stop)

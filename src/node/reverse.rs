@@ -206,6 +206,7 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
             node_id,
             service_name,
             timestamp_ms,
+            caller,
         } => {
             // Spawn tunnel handling in a background task so this worker can
             // immediately reconnect and replenish the pool.
@@ -214,7 +215,8 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
             tokio::spawn(async move {
                 let _in_flight = in_flight;
                 if let Err(e) =
-                    super::tunnel::handle_tunnel(stream, node_id, service_name, timestamp_ms, state)
+                    // Through a relay: who asks is only what the caller signed.
+                    super::tunnel::handle_tunnel(stream, node_id, service_name, timestamp_ms, caller, true, state)
                         .await
                 {
                     debug!("reverse tunnel error: {e}");

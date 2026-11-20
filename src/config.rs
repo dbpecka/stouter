@@ -276,6 +276,10 @@ pub struct DynamicConfig {
     /// every node (see [`DynamicConfig::supersedes`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub changed_by: String,
+    /// Which nodes may open tunnels to which services (see `crate::authz`).
+    /// A service with no policy is open to every node in the cluster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<Policy>,
     /// Certificates no node accepts any more, for anything: connections,
     /// node records and beats, config signatures (see
     /// `crate::tls::Revocations`).
@@ -286,6 +290,18 @@ pub struct DynamicConfig {
     /// `crate::signing`); everyone else keeps and relays it as is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<ConfigSignature>,
+}
+
+/// Who may reach a service (see [`DynamicConfig::policies`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Policy {
+    /// The service, by name (all its instances).
+    pub service: String,
+    /// Node names (certificate CNs) that may open tunnels to it, besides
+    /// each node hosting it. Empty: none.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// Revoked certificates (see [`DynamicConfig::revoked`]).
@@ -504,6 +520,20 @@ impl DynamicConfig {
             }
         }
 
+        let mut with_policy = HashSet::new();
+        for policy in &self.policies {
+            if policy.service.is_empty() {
+                report("a policy names no service".to_string());
+            } else if !with_policy.insert(policy.service.as_str()) {
+                report(format!("service '{}' has two policies; merge them into one", policy.service));
+            }
+            for node in &policy.allow {
+                if node.is_empty() || node.contains(':') {
+                    report(format!("policy for '{}': '{node}' is not a node name", policy.service));
+                }
+            }
+        }
+
         for node in &self.revoked.nodes {
             if node.is_empty() || node.contains(':') {
                 report(format!("revoked node name '{node}' is not a node name"));
@@ -600,6 +630,67 @@ impl DynamicConfig {
             return Err(format!("routes for '{service}' require every instance to have protocol: http"));
         }
         Ok(())
+    }
+
+    /// Let `nodes` open tunnels to `service`. A service with no policy yet
+    /// gets one, closing it to every other node (except those hosting it).
+    /// Bumps `version` and returns the new version; refused if all of them
+    /// may already.
+    pub fn allow_callers(&mut self, service: &str, nodes: &[String]) -> Result<u64, MutateErr> {
+        if service.is_empty() {
+            return Err(MutateErr::Invalid("name the service".into()));
+        }
+        if let Some(bad) = nodes.iter().find(|n| n.is_empty() || n.contains(':')) {
+            return Err(MutateErr::Invalid(format!("'{bad}' is not a node name")));
+        }
+        let had_policy = self.policies.iter().any(|p| p.service == service);
+        if !had_policy {
+            self.policies.push(Policy { service: service.to_string(), allow: Vec::new() });
+        }
+        let policy = self.policies.iter_mut().find(|p| p.service == service).expect("just ensured");
+        let mut added = !had_policy;
+        for node in nodes {
+            if !policy.allow.contains(node) {
+                policy.allow.push(node.clone());
+                added = true;
+            }
+        }
+        if !added {
+            return Err(MutateErr::Invalid(format!("every one of them may already reach '{service}'")));
+        }
+        self.version += 1;
+        Ok(self.version)
+    }
+
+    /// Stop `nodes` opening tunnels to `service`. The policy stays, even
+    /// empty (only the nodes hosting it may then reach it): use
+    /// [`Self::clear_policy`] to open the service again. Bumps `version`
+    /// and returns the new version.
+    pub fn deny_callers(&mut self, service: &str, nodes: &[String]) -> Result<u64, MutateErr> {
+        let Some(policy) = self.policies.iter_mut().find(|p| p.service == service) else {
+            return Err(MutateErr::Invalid(format!(
+                "service '{service}' has no policy, so every node may reach it: allow the ones that may instead"
+            )));
+        };
+        let before = policy.allow.len();
+        policy.allow.retain(|n| !nodes.contains(n));
+        if policy.allow.len() == before {
+            return Err(MutateErr::Invalid(format!("none of them may reach '{service}' now")));
+        }
+        self.version += 1;
+        Ok(self.version)
+    }
+
+    /// Drop `service`'s policy, opening it to every node. Bumps `version`
+    /// and returns the new version.
+    pub fn clear_policy(&mut self, service: &str) -> Result<u64, MutateErr> {
+        let before = self.policies.len();
+        self.policies.retain(|p| p.service != service);
+        if self.policies.len() == before {
+            return Err(MutateErr::Invalid(format!("service '{service}' has no policy")));
+        }
+        self.version += 1;
+        Ok(self.version)
     }
 
     /// Revoke `nodes` (every certificate for those names) and `certs`
@@ -854,6 +945,22 @@ pub struct NodeRecord {
 pub struct SignedNode {
     pub record_json: String,
     pub cert: String,
+    pub signature: String,
+}
+
+/// A caller's signature over a tunnel request (see `crate::authz`), so the
+/// node hosting the service knows who asks even when a relay passes the
+/// request on: the relay's own certificate is all it sees of the connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedCaller {
+    /// Random, so no two requests sign the same text, and a request passed
+    /// on twice (a relay replaying it) is noticed.
+    pub nonce: u64,
+    /// The caller's certificate (DER, hex): who it is.
+    pub cert: String,
+    /// ECDSA P-256/SHA-256 signature (DER, hex) over a fixed prefix and the
+    /// request: target node, service, timestamp and nonce.
     pub signature: String,
 }
 
@@ -1866,6 +1973,39 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("serviceGroups"));
         assert!(!json.contains("services"));
+    }
+
+    #[test]
+    fn policies_are_config_edits_that_older_nodes_hash_alike() {
+        let mut dc = DynamicConfig { version: 1, ..Default::default() };
+        assert!(!serde_json::to_string(&dc).unwrap().contains("policies"), "none: encoded as before");
+        let names = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
+
+        // The first allow closes the service to everyone else.
+        assert_eq!(dc.allow_callers("db", &names(&["api-1"])).unwrap(), 2);
+        assert_eq!(dc.policies, vec![Policy { service: "db".into(), allow: names(&["api-1"]) }]);
+        assert_eq!(dc.allow_callers("db", &names(&["api-1", "api-2"])).unwrap(), 3);
+        assert!(dc.allow_callers("db", &names(&["api-2"])).is_err(), "already allowed");
+        assert!(dc.allow_callers("db", &names(&["bad:name"])).is_err());
+        assert!(dc.allow_callers("", &names(&["api-1"])).is_err());
+
+        // Denying everyone leaves it closed; clearing opens it again.
+        assert_eq!(dc.deny_callers("db", &names(&["api-1", "api-2"])).unwrap(), 4);
+        assert_eq!(dc.policies, vec![Policy { service: "db".into(), allow: vec![] }]);
+        assert!(dc.deny_callers("db", &names(&["api-1"])).is_err(), "none of them allowed");
+        assert!(dc.deny_callers("web", &names(&["api-1"])).is_err(), "no policy to deny from");
+        assert_eq!(dc.clear_policy("db").unwrap(), 5);
+        assert!(dc.clear_policy("db").is_err());
+        assert_eq!(dc.version, 5, "refused edits change nothing");
+
+        // Hand-written policies are checked.
+        let hand: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [],
+            "policies": [{"service": "db", "allow": ["a:b"]}, {"service": "db"}, {"service": "", "allow": []}],
+        }))
+        .unwrap();
+        let problems = hand.problems();
+        assert_eq!(problems.len(), 3, "{problems:?}");
     }
 
     #[test]

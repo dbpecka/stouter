@@ -1,3 +1,4 @@
+mod authz;
 mod config;
 mod gossip;
 mod health;
@@ -61,6 +62,11 @@ enum Commands {
     Route {
         #[command(subcommand)]
         action: RouteAction,
+    },
+    /// Manage which nodes may reach which services
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
     },
     /// Manage TLS certificates
     Cert {
@@ -144,6 +150,49 @@ enum CertAction {
     Fingerprint {
         /// Certificate file (PEM), such as a node's node.crt
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Let nodes open tunnels to a service. A service with no policy yet
+    /// gets one, closing it to every other node (except those hosting it)
+    Allow {
+        #[arg(long)]
+        service: String,
+        /// A node that may reach it. Repeatable.
+        #[arg(long = "from", required = true)]
+        nodes: Vec<String>,
+        /// Address `host:port` of the daemon to make the change through
+        /// (defaults to this host's daemon, else the config file).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Stop nodes opening tunnels to a service (the policy stays, even
+    /// empty: `policy clear` opens the service again)
+    Deny {
+        #[arg(long)]
+        service: String,
+        /// A node that may no longer reach it. Repeatable.
+        #[arg(long = "from", required = true)]
+        nodes: Vec<String>,
+        /// Address `host:port` of the daemon to make the change through.
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Remove a service's policy, opening it to every node again
+    Clear {
+        #[arg(long)]
+        service: String,
+        /// Address `host:port` of the daemon to make the change through.
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// List policies
+    List {
+        /// Address `host:port` of a daemon to ask (defaults to the config file).
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -1169,6 +1218,61 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
+        // policy allow / deny / clear
+        // -----------------------------------------------------------------
+        Some(Commands::Policy { action: action @ (PolicyAction::Allow { .. } | PolicyAction::Deny { .. } | PolicyAction::Clear { .. }) }) => {
+            let (op, remote) = match action {
+                PolicyAction::Allow { service, nodes, remote } => (AdminOp::PolicyAllow { service, nodes }, remote),
+                PolicyAction::Deny { service, nodes, remote } => (AdminOp::PolicyDeny { service, nodes }, remote),
+                PolicyAction::Clear { service, remote } => (AdminOp::PolicyClear { service }, remote),
+                PolicyAction::List { .. } => unreachable!("matched above"),
+            };
+            let service = match &op {
+                AdminOp::PolicyAllow { service, .. } | AdminOp::PolicyDeny { service, .. } | AdminOp::PolicyClear { service } => service.clone(),
+                _ => unreachable!("policy ops only"),
+            };
+            let local = Config::load_or_default(&cli.config)?;
+            let remote = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
+            let (version, dc) = if let Some(target) = &remote {
+                let version = run_admin_rpc(target, op, &local, cli.cert_dir.as_deref()).await?;
+                (version, fetch_remote_dynamic_config(target, &local, cli.cert_dir.as_deref()).await.ok())
+            } else {
+                let mut cfg = Config::load(&cli.config)?;
+                let before = cfg.dynamic_config.clone();
+                let version = op.apply(&mut cfg.dynamic_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+                save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
+                broadcast_config(&cfg, &cli.config).await?;
+                (version, Some(cfg.dynamic_config))
+            };
+            match dc.as_ref().map(|dc| dc.policies.iter().find(|p| p.service == service)) {
+                Some(Some(policy)) => println!("{} (version {version})", describe_policy(policy)),
+                Some(None) => println!("Service '{service}' has no policy: every node may reach it (version {version})"),
+                None => println!("Policy for '{service}' changed (version {version})"),
+            }
+            if dc.as_ref().is_some_and(|dc| !dc.service_groups.iter().flat_map(|g| &g.services).any(|s| s.name == service)) {
+                eprintln!("note: no service named '{service}' is configured (yet)");
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // policy list
+        // -----------------------------------------------------------------
+        Some(Commands::Policy { action: PolicyAction::List { remote } }) => {
+            let dc = if let Some(target) = remote {
+                let cfg = Config::load_or_default(&cli.config)?;
+                fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?
+            } else {
+                Config::load(&cli.config)?.dynamic_config
+            };
+            if dc.policies.is_empty() {
+                println!("No policies: every node may reach every service (version {})", dc.version);
+            }
+            for policy in &dc.policies {
+                println!("{}", describe_policy(policy));
+            }
+        }
+
+        // -----------------------------------------------------------------
         // cert revoked
         // -----------------------------------------------------------------
         Some(Commands::Cert { action: CertAction::Revoked { remote } }) => {
@@ -1489,6 +1593,15 @@ fn trusted_config(
             if cfg.admin_cns.is_empty() { "none listed".to_string() } else { cfg.admin_cns.join(", ") }
         ))
     })
+}
+
+/// One line saying who may reach a service under `policy`.
+fn describe_policy(policy: &config::Policy) -> String {
+    if policy.allow.is_empty() {
+        format!("Service '{}' may be reached only by the nodes hosting it", policy.service)
+    } else {
+        format!("Service '{}' may be reached by {} (and the nodes hosting it)", policy.service, policy.allow.join(", "))
+    }
 }
 
 /// Refuse revoking the certificate this CLI uses: it would lock the CLI out,

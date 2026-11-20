@@ -445,6 +445,10 @@ pub struct SharedState {
     /// Sync connections peers kept open after the last round, by address
     /// (see `gossip::sync_with_peer`).
     pub(crate) gossip_conns: Mutex<HashMap<String, MeshStream>>,
+    /// Who may reach which service (the config's policies, see `crate::authz`).
+    pub policies: ArcSwap<crate::authz::Policies>,
+    /// Nonces of signed tunnel requests seen lately, against replays.
+    pub tunnel_nonces: Mutex<crate::authz::NonceCache>,
     /// Addresses a sync found ourselves at (our certificate answered): with
     /// a wildcard bind, a shared `knownNodes` list can name our own address
     /// in a form we can't otherwise tell is ours.
@@ -502,6 +506,7 @@ impl SharedState {
         let bootstrap_peers = config.known_nodes.clone();
         let service_index = build_service_index(&dynamic_config);
         let routes = build_route_index(&dynamic_config);
+        let policies = crate::authz::build(&dynamic_config);
         if let Some(tls) = &tls {
             tls.revocations().set(&dynamic_config.revoked);
             if tls.own_cert_revoked() {
@@ -539,6 +544,8 @@ impl SharedState {
             forgotten: Mutex::new(HashMap::new()),
             sync_backoff: Mutex::new(Backoff::new(SYNC_BACKOFF_BASE, SYNC_BACKOFF_MAX)),
             gossip_conns: Mutex::new(HashMap::new()),
+            policies: ArcSwap::from_pointee(policies),
+            tunnel_nonces: Mutex::new(crate::authz::NonceCache::default()),
             own_addrs: Mutex::new(std::collections::HashSet::new()),
             unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
@@ -679,6 +686,7 @@ impl SharedState {
     pub fn index_config(&self, dc: &DynamicConfig) {
         self.service_index.store(Arc::new(build_service_index(dc)));
         self.routes.store(Arc::new(build_route_index(dc)));
+        self.policies.store(Arc::new(crate::authz::build(dc)));
         self.apply_revocations(dc);
     }
 
