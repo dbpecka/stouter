@@ -153,13 +153,16 @@ pub async fn renew(state: &Arc<SharedState>) -> Result<i64> {
     if crate::tls::cert_cn(&cert).as_deref() != Some(id.as_str()) {
         bail!("the renewed certificate isn't for '{id}'");
     }
-    switch_to(state, cert.clone(), &key)?;
+    // Saved before it is used, so what is in use is what the next start
+    // loads; a save that fails leaves the renewal due, to be tried again.
     if persist {
-        if let Some(dir) = state.config.tls_dir.as_deref() {
+        if let (Some(dir), Some(tls)) = (state.config.tls_dir.as_deref(), state.tls.as_deref()) {
+            tls.check_identity(&cert, &key)?;
             crate::pki::save_renewed(dir, &cert, &key)
-                .with_context(|| format!("the renewed certificate is in use but couldn't be saved to {dir}"))?;
+                .with_context(|| format!("couldn't save the renewed certificate to {dir}"))?;
         }
     }
+    switch_to(state, cert.clone(), &key)?;
     Ok(crate::pki::validity(cert.as_ref()).map_or(0, |(_, until)| until))
 }
 

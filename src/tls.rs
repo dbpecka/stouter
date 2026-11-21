@@ -494,6 +494,13 @@ impl TlsContext {
         Ok(())
     }
 
+    /// Whether `cert` with `key` would do for [`Self::rotate`]: from the
+    /// cluster CA, not revoked, and the key its own.
+    pub fn check_identity(&self, cert: &CertificateDer<'static>, key: &PrivateKeyDer<'_>) -> Result<()> {
+        self.verify_cluster_cert(cert)?;
+        Identity::certified(cert.clone(), key).map(|_| ())
+    }
+
     /// This node's certificate now.
     pub fn own_cert(&self) -> CertificateDer<'static> {
         self.identity.current.load().cert[0].clone()

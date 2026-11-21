@@ -375,10 +375,11 @@ pub fn validity(cert: &[u8]) -> Option<(i64, i64)> {
 }
 
 /// Write a renewed certificate and key to `tls_dir` (as `node.crt` and
-/// `node.key`), for the next start. Each is first written in full beside
-/// its final name as `*.next`, then both are renamed into place; a crash
-/// part way leaves `*.next` files that [`finish_renewal`] puts in place at
-/// the next load, so the two never end up mismatched.
+/// `node.key`), for the next start. Both are written in full first, then
+/// staged beside their final names as `*.next` (the key first), then
+/// renamed into place (the key first); [`finish_renewal`] completes or
+/// discards whatever a crash part way leaves, so the two never end up
+/// mismatched.
 pub fn save_renewed(tls_dir: &str, cert: &CertificateDer<'_>, key: &PrivateKeyDer<'_>) -> Result<()> {
     let dir = Path::new(tls_dir);
     let cert_pem = to_pem("CERTIFICATE", cert.as_ref());
@@ -386,17 +387,21 @@ pub fn save_renewed(tls_dir: &str, cert: &CertificateDer<'_>, key: &PrivateKeyDe
         PrivateKeyDer::Pkcs8(der) => to_pem("PRIVATE KEY", der.secret_pkcs8_der()),
         _ => bail!("renewed key is not PKCS#8"),
     };
-    for (name, text, private) in [("node.key", &key_pem, true), ("node.crt", &cert_pem, false)] {
-        let tmp = dir.join(format!("{name}.tmp"));
-        if private {
-            write_private_key(&tmp, text)
-        } else {
-            std::fs::write(&tmp, text).and_then(|()| std::fs::File::open(&tmp)?.sync_all())
-        }
-        .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, dir.join(format!("{name}.next"))).with_context(|| format!("write {name}.next"))?;
-    }
+    let (key_tmp, cert_tmp) = (dir.join("node.key.tmp"), dir.join("node.crt.tmp"));
+    write_private_key(&key_tmp, &key_pem).with_context(|| format!("write {}", key_tmp.display()))?;
+    write_synced(&cert_tmp, &cert_pem).with_context(|| format!("write {}", cert_tmp.display()))?;
+    std::fs::rename(&key_tmp, dir.join("node.key.next")).context("stage node.key.next")?;
+    std::fs::rename(&cert_tmp, dir.join("node.crt.next")).context("stage node.crt.next")?;
     finish_renewal(dir)
+}
+
+/// Write `text` to `path` and flush it to disk, through the handle that
+/// wrote it (Windows flushes only through one with write access).
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 /// `der` as a PEM block labelled `label`.
@@ -418,17 +423,31 @@ fn to_pem(label: &str, der: &[u8]) -> String {
     pem
 }
 
-/// Put renewed files (`node.key.next`, `node.crt.next`) in place, finishing
-/// a [`save_renewed`] a crash cut short. Each exists only once written in
-/// full, so whichever are left belong to the newer pair.
+/// Finish a [`save_renewed`] a crash cut short, from the staged files
+/// left (`node.key.next` is staged, and put in place, before
+/// `node.crt.next`):
+/// - both: staged in full; put both in place, the key first;
+/// - the certificate alone: the key is already in place; put it there too;
+/// - the key alone: its certificate was never staged; discard it, keeping
+///   the pair in place (putting it there would pair it with the old
+///   certificate, and the node couldn't start).
 fn finish_renewal(dir: &Path) -> Result<()> {
-    for name in ["node.key", "node.crt"] {
-        let next = dir.join(format!("{name}.next"));
-        if next.exists() {
-            std::fs::rename(&next, dir.join(name)).with_context(|| format!("put {} in place", next.display()))?;
+    let (key_next, cert_next) = (dir.join("node.key.next"), dir.join("node.crt.next"));
+    let put = |next: &Path, name: &str| {
+        std::fs::rename(next, dir.join(name)).with_context(|| format!("put {} in place", next.display()))
+    };
+    match (key_next.exists(), cert_next.exists()) {
+        (true, true) => {
+            put(&key_next, "node.key")?;
+            put(&cert_next, "node.crt")
         }
+        (false, true) => put(&cert_next, "node.crt"),
+        (true, false) => {
+            tracing::warn!("discarding {}: a renewal stopped before its certificate was saved", key_next.display());
+            std::fs::remove_file(&key_next).with_context(|| format!("remove {}", key_next.display()))
+        }
+        (false, false) => Ok(()),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +688,17 @@ mod renewal_tests {
         assert_eq!(loaded.node_cert_der, cert3);
         crate::tls::TlsContext::new(&loaded).expect("key and cert match");
         assert!(!node_dir.join("node.crt.next").exists());
+
+        // A save stopped after staging the key, before the certificate (a
+        // failed write, a crash): the key is discarded, and the pair in
+        // place still loads and matches.
+        let (_, key4) = issuer.issue_new("n1").unwrap();
+        let PrivateKeyDer::Pkcs8(der) = &key4 else { unreachable!() };
+        std::fs::write(node_dir.join("node.key.next"), to_pem("PRIVATE KEY", der.secret_pkcs8_der())).unwrap();
+        let loaded = load_existing(node, "n1").unwrap();
+        assert_eq!(loaded.node_cert_der, cert3);
+        crate::tls::TlsContext::new(&loaded).expect("still a matching pair");
+        assert!(!node_dir.join("node.key.next").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
