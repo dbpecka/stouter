@@ -997,9 +997,22 @@ fn build_service_index(dc: &DynamicConfig) -> HashMap<(String, String), Service>
     idx
 }
 
+/// Routes by service, leaving out any with nowhere to send a request (no
+/// backends, or none with a weight): changes made here are checked for
+/// those, but a config from elsewhere (a peer, an older version) may hold
+/// one, and every request it matched would fail.
 fn build_route_index(dc: &DynamicConfig) -> HashMap<String, Vec<Route>> {
     let mut idx: HashMap<String, Vec<Route>> = HashMap::new();
-    for route in &dc.routes {
+    for (i, route) in dc.routes.iter().enumerate() {
+        if route.backends.iter().all(|b| b.weight == 0) {
+            tracing::warn!(
+                "ignoring route {} of service '{}' in config version {}: it has no backend to send requests to",
+                route.label(i),
+                route.service,
+                dc.version
+            );
+            continue;
+        }
         idx.entry(route.service.clone()).or_default().push(route.clone());
     }
     idx

@@ -600,7 +600,7 @@ fn select_route(routes: &[Route], method: &Method, path: &str, headers: &HeaderM
                 false
             }
         })
-        .unwrap_or(&route.backends[0]);
+        .or(route.backends.first())?;
     Some(RoutedTo { label: route.label(index), labels: backend.labels.clone() })
 }
 
@@ -1132,6 +1132,22 @@ mod tests {
 
     fn routes(json: serde_json::Value) -> Vec<Route> {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// A route with nowhere to send a request (in a config from elsewhere:
+    /// changes made here are checked) is left out, not a crash.
+    #[test]
+    fn a_route_with_no_backends_is_left_out() {
+        let empty = routes(serde_json::json!([{"service": "api", "match": {"pathPrefix": "/v2"}, "backends": []}]));
+        assert!(select_route(&empty, &Method::GET, "/v2/x", &HeaderMap::new()).is_none());
+        let dc = crate::config::DynamicConfig { routes: empty, ..Default::default() };
+        let state = SharedState::new(
+            crate::config::Config { dynamic_config: dc, ..Default::default() },
+            String::new(),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        );
+        assert!(state.routes.load().get("api").is_none());
     }
 
     #[test]
