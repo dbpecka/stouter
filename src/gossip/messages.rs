@@ -259,7 +259,7 @@ impl AdminOp {
                     meta,
                     local_port,
                 };
-                Ok(dc.upsert_service(&group, svc))
+                dc.upsert_service(&group, svc)
             }
             AdminOp::RoutesSet { service, routes } => dc.set_routes(&service, routes),
             AdminOp::ServiceRename { group, owner_node_id, from, to } => {

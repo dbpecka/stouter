@@ -34,7 +34,7 @@ cluster" means one without `requireSignedConfig`.
   checking revocation as of now.
   Fixed: signed configs carry `signedAt`; the signer's certificate is checked as of then (revocation as of now); configs dated over an hour ahead, or over an hour before the held one, are refused; `stouter status` shows the signer and their certificate's expiry.
 
-- [ ] **3. The CLI never loads the revocation list.**
+- [x] **3. The CLI never loads the revocation list.**
   Every CLI `TlsContext` (`src/main.rs` 1087, 1172, 1333, 1652, 1780, 1986; via
   `build_cli_tls` / `TlsContext::new`) starts with an empty list; only the daemon
   sets one (`src/state.rs:516`, `641`). A config forged with a revoked admin's key
@@ -45,8 +45,9 @@ cluster" means one without `requireSignedConfig`.
   Fix: load the local config's `revoked` into every CLI TLS context before
   connecting or verifying; refuse a served config that drops a revocation the
   local config holds unless an admin signed the removal.
+  Fixed: every CLI command loads the local config's revocations into its TLS context, so it refuses a daemon presenting a revoked certificate and a config signed with one. (A served config older than the local one, dropping a revocation an admin did sign, is #6.)
 
-- [ ] **4. A config at version `u64::MAX` can never be replaced.**
+- [x] **4. A config at version `u64::MAX` can never be replaced.**
   `DynamicConfig::supersedes` (`src/config.rs:421-433`) has no upper bound on
   versions; every edit does `self.version += 1` (`src/config.rs` 594, 653, 683,
   702, 714, 742, 756, 772, 801, 842; `src/gossip/mod.rs` 458, 601, 631;
@@ -57,10 +58,11 @@ cluster" means one without `requireSignedConfig`.
   Recovery means hand-editing every node's file.
   Fix: refuse a config whose version jumps more than a bounded amount past the
   one held; use `checked_add` and turn overflow into an error.
+  Fixed: a config more than 2^28 versions past the one held is refused (gossip, push, config file); every edit takes its version with `checked_add`, refusing a change at `u64::MAX` instead of wrapping or panicking.
 
 ## Medium
 
-- [ ] **5. CPU exhaustion through beat signatures.**
+- [x] **5. CPU exhaustion through beat signatures.**
   `check_signatures` (`src/gossip/mod.rs:1506-1537`) verifies every beat in a
   sync: no per-node dedup, no cap, on a tokio worker (called from `merge_sync`,
   `:1060`). 20,000 beats took 1.4–2.3 s; an 8 MiB sync holds ~45,000. A few
@@ -68,6 +70,7 @@ cluster" means one without `requireSignedConfig`.
   README's limits section).
   Fix: keep only the highest beat per node per sync, cap checks per sync, and
   run the checks in `spawn_blocking`.
+  Fixed: only each node's newest beat is checked, only for nodes with no address (the only ones that beat) or forgotten ones, at most 4096 per sync, on blocking threads (as many syncs at once as there are CPUs).
 
 - [ ] **6. A lying daemon can steer an admin's signature.**
   (a) The CLI builds a change on whatever signed config the daemon serves

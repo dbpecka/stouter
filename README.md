@@ -351,6 +351,9 @@ revoked, as the certificate would be refused everywhere.
   other, and a revoked admin's signature counts for nothing from then on. A
   config that revokes the certificate that signed it is refused (another
   admin must revoke it), and the CLI won't revoke the certificate it uses.
+  The CLI refuses the certificates its own config revokes too, whether on a
+  daemon it connects to or on a config it is to build a change on: a config
+  forged with a revoked admin's key isn't signed over by another admin.
   Without `requireSignedConfig`, any member can change the config, so any
   member can revoke (or unrevoke) any other.
 - A node keeps running with its own certificate revoked, and logs an error:
@@ -590,10 +593,16 @@ Limits, so one peer can't exhaust a node:
   `httpListen` alike: it never stops the daemon or a proxy.
 - A tunnel's error message is read only up to 64 KiB and within 5 seconds:
   its length comes from the peer, and a 4 GiB one used to abort the daemon.
-- Signatures in a sync are checked before the node list is locked, and at
-  most 256 records for nodes not yet known are checked per sync (the rest
-  wait for the next one). A peer sending junk can't stall gossip or reverse
-  registrations behind its checks.
+- Signatures in a sync are checked before the node list is locked, on
+  blocking threads (as many syncs at once as there are CPUs), not the ones
+  serving tunnels and admin requests. Per sync, at most 256 records for nodes
+  not yet known are checked (the rest wait for the next one), and only each
+  node's newest beat, only for nodes with no address (the only ones that
+  beat), at most 4096 of them. A peer sending junk can't stall gossip,
+  tunnels or reverse registrations behind its checks.
+- A config more than 2^28 versions past the one a node holds is refused, from
+  a peer, a push or the config file: each change adds one, and a config at
+  the last version there is (`u64::MAX`) could never be followed by another.
 - Peers that don't answer a sync are retried with backoff, from one round
   up to about 3 minutes, so a dead address costs a dial every few minutes,
   not every 10 seconds. One that syncs with us, or whose newer signed record

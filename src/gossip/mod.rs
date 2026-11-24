@@ -457,7 +457,9 @@ fn accept_push(
         .ok_or_else(|| MutateErr::Unauthorized("no TLS context to check signatures with".into()))?;
     let (verified, signer) = crate::signing::verify(&pushed, tls, &state.config.admin_cns)
         .map_err(|e| MutateErr::Unauthorized(format!("{e:#}")))?;
-    if let Some(why) = crate::signing::signed_too_early(&verified, current) {
+    if let Some(why) =
+        crate::signing::signed_too_early(&verified, current).or_else(|| crate::config::too_far_ahead(&verified, current))
+    {
         return Err(MutateErr::Invalid(why));
     }
     if current.version != base_version {
@@ -606,7 +608,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 info!(
                     "manual config edit detected; auto-bumping version {} -> {}",
                     current_version,
-                    current_version + 1
+                    current_version.saturating_add(1)
                 );
                 file_dc
             } else {
@@ -623,21 +625,29 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 }
                 continue;
             };
-            // The same check a change from the CLI or the admin RPC gets: an
+            // Keep the version monotonic so peers accept the update.
+            let version = if new_dc.version <= current_version {
+                dc.next_version().map_err(|e| e.to_string())
+            } else {
+                Ok(new_dc.version)
+            };
+            // The same checks a change from the CLI or the admin RPC gets: an
             // edit that breaks the config (two services claiming a domain, a
-            // route to a service that isn't there) isn't sent cluster-wide.
-            if let Some(problem) = crate::config::new_problem(&dc, &new_dc) {
+            // route to a service that isn't there), or that peers would
+            // refuse for its version, isn't sent cluster-wide.
+            let problem = match &version {
+                Err(e) => Some(e.clone()),
+                Ok(_) => crate::config::too_far_ahead(&new_dc, &dc).or_else(|| crate::config::new_problem(&dc, &new_dc)),
+            };
+            let (None, Ok(version)) = (problem.clone(), version) else {
                 let key = config_text(&new_dc);
                 if warned_problem.as_ref() != Some(&key) {
-                    warn!("ignoring the edit to {}: {problem}", state.config_path);
+                    warn!("ignoring the edit to {}: {}", state.config_path, problem.unwrap_or_default());
                     warned_problem = Some(key);
                 }
                 continue;
-            }
-            // Keep the version monotonic so peers accept the update.
-            if new_dc.version <= current_version {
-                new_dc.version = current_version + 1;
-            }
+            };
+            new_dc.version = version;
             // The change entered the cluster here, unsigned.
             new_dc.changed_by = state.config.node_id.clone();
             new_dc.signature = None;
@@ -1065,7 +1075,7 @@ async fn merge_sync(
     let now = Instant::now();
     // Signatures are checked first, without the node list's lock: checking
     // is the slow part, and any peer can send junk to check.
-    let checked = check_signatures(state, &nodes, &beats);
+    let Some((nodes, beats, checked)) = check_signatures_off_thread(state, nodes, beats).await else { return };
     // Node info isn't persisted (the config file only holds bootstrap
     // peers), so a change here writes nothing to disk.
     state.update_known_nodes(|kn| {
@@ -1465,6 +1475,8 @@ struct Checked {
     records: std::collections::HashMap<String, (String, crate::config::NodeRecord)>,
     /// (node id, beat, signature) of each beat that verified.
     beats: std::collections::HashSet<(String, u64, String)>,
+    /// How many beat signatures were checked, verified or not.
+    beat_checks: usize,
 }
 
 /// Most records in one Sync checked for nodes we don't know yet. A real
@@ -1473,12 +1485,21 @@ struct Checked {
 /// message. Nodes we know are checked only when their record is newer.
 const MAX_NEW_RECORDS_PER_SYNC: usize = 256;
 
+/// Most beats checked in one Sync. Only nodes with no address beat, and
+/// each is checked once per sync (its newest beat), so a cluster sends
+/// fewer; past this, which ones get checked is left to chance, so that no
+/// node's beats are the ones dropped every time.
+const MAX_BEATS_PER_SYNC: usize = 4096;
+
 /// Check, without holding the node list's lock, the signatures that
 /// merging `nodes` and `beats` would need: each node's record if it claims
 /// to be newer than the one we hold (at most [`MAX_NEW_RECORDS_PER_SYNC`] of
-/// them for nodes we don't know), and each beat newer than what we have,
-/// against its node's record (or, for one we forgot, the record kept in its
-/// tombstone).
+/// them for nodes we don't know), and each node's newest beat if it is newer
+/// than what we have (at most [`MAX_BEATS_PER_SYNC`]), against its node's
+/// record (or, for one we forgot, the record kept in its tombstone).
+///
+/// Slow (a signature check each), so run off the async workers: see
+/// [`check_signatures_off_thread`].
 fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::config::SignedBeat]) -> Checked {
     let mut checked = Checked::default();
     let Some(tls) = state.tls.as_deref() else { return checked };
@@ -1511,25 +1532,51 @@ fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::con
             Err(e) => debug!("ignoring a record for node {} that doesn't verify: {e:#}", node.id),
         }
     }
+    // The certificate of each record just received that checked out (it
+    // may be newer than the one held, with a new key).
+    let mut received: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for node in nodes {
+        if let (Some(signed), Some((json, _))) = (&node.signed, checked.records.get(&node.id)) {
+            if signed.record_json == *json {
+                received.entry(node.id.as_str()).or_insert(signed.cert.as_str());
+            }
+        }
+    }
+    // The newest beat for each node that has something to check it
+    // against: one we hold with no address (nodes with one don't beat:
+    // they're seen alive by being reached), one we forgot (kept in its
+    // tombstone), or one whose record just came in.
+    let mut newest: std::collections::HashMap<&str, (&crate::config::SignedBeat, Option<String>)> =
+        std::collections::HashMap::new();
     for beat in beats {
-        // Against the record we hold (or keep in its tombstone), and the
-        // one just received for it if that checked out (it may be newer,
-        // with a new certificate).
+        if newest.get(beat.id.as_str()).is_some_and(|(b, _)| b.beat >= beat.beat) {
+            continue;
+        }
         let held = match known.get(&beat.id) {
-            Some(node) if beat.beat > node.heartbeat => node.signed.as_ref().map(|s| s.cert.clone()),
+            Some(node) if node.addr.is_empty() && beat.beat > node.heartbeat => {
+                node.signed.as_ref().map(|s| s.cert.clone())
+            }
             Some(_) => continue,
             None => state.forgotten_cert(&beat.id).filter(|(last, _)| beat.beat > *last).map(|(_, cert)| cert),
         };
-        let received = checked.records.get(&beat.id).and_then(|(json, _)| {
-            nodes
-                .iter()
-                .filter_map(|n| n.signed.as_ref().filter(|s| n.id == beat.id && s.record_json == *json))
-                .map(|s| s.cert.clone())
-                .next()
-        });
+        if held.is_none() && !received.contains_key(beat.id.as_str()) {
+            continue;
+        }
+        newest.insert(beat.id.as_str(), (beat, held));
+    }
+    let mut todo: Vec<_> = newest.into_values().collect();
+    if todo.len() > MAX_BEATS_PER_SYNC {
+        use rand::seq::SliceRandom;
+        todo.shuffle(&mut rand::rng());
+        todo.truncate(MAX_BEATS_PER_SYNC);
+    }
+    for (beat, held) in todo {
+        let received = received.get(beat.id.as_str()).copied();
         let mut last_err = None;
         // A record held from before its certificate was revoked vouches for nothing.
-        for cert in held.iter().chain(received.iter()).filter(|cert| !tls.revocations().cert_hex_revoked(cert)) {
+        let certs = held.as_deref().into_iter().chain(received);
+        for cert in certs.filter(|cert| !tls.revocations().cert_hex_revoked(cert)) {
+            checked.beat_checks += 1;
             match crate::signing::verify_beat(beat, cert) {
                 Ok(()) => {
                     checked.beats.insert((beat.id.clone(), beat.beat, beat.signature.clone()));
@@ -1544,6 +1591,29 @@ fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::con
         }
     }
     checked
+}
+
+/// [`check_signatures`] on a blocking thread, a few syncs at a time (as
+/// many as there are CPUs), so that peers sending signatures to check can't
+/// hold up the async workers (and with them tunnels and admin requests).
+/// Hands `nodes` and `beats` back with the result.
+async fn check_signatures_off_thread(
+    state: &Arc<SharedState>,
+    nodes: Vec<NodeInfo>,
+    beats: Vec<crate::config::SignedBeat>,
+) -> Option<(Vec<NodeInfo>, Vec<crate::config::SignedBeat>, Checked)> {
+    static CHECKING: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let slots = CHECKING.get_or_init(|| {
+        tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get))
+    });
+    let _slot = slots.acquire().await.ok()?;
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let checked = check_signatures(&state, &nodes, &beats);
+        (nodes, beats, checked)
+    })
+    .await
+    .ok()
 }
 
 /// Take `beat` for the node it names if it's newer than what we have and
@@ -2051,6 +2121,34 @@ mod tests {
         assert_eq!(file.version, 5, "a stale file is left alone, not overwritten");
     }
 
+    /// No config can take the cluster to a version so high that no change
+    /// could follow: one at most `MAX_VERSION_STEP` past the one held is
+    /// taken, from a peer or from the file; one past that is not.
+    #[tokio::test(start_paused = true)]
+    async fn no_config_takes_the_cluster_to_the_last_version() {
+        use crate::config::MAX_VERSION_STEP;
+        let state = state_for("me");
+        let at = |version: u64| DynamicConfig { version, changed_by: "x".into(), ..named_services(&["api"]) };
+        {
+            let mut dc = state.dynamic_config.write().await;
+            assert!(!adopt_if_newer(&state, &mut dc, at(u64::MAX), "test"), "a jump to the end");
+            assert!(!adopt_if_newer(&state, &mut dc, at(MAX_VERSION_STEP + 1), "test"));
+            assert!(adopt_if_newer(&state, &mut dc, at(MAX_VERSION_STEP), "test"), "far, but within the bound");
+            assert!(!adopt_if_newer(&state, &mut dc, at(u64::MAX), "test"));
+            assert_eq!(dc.version, MAX_VERSION_STEP);
+        }
+
+        // A hand edit to the file, the same.
+        let memory = DynamicConfig { version: 5, ..named_services(&["old"]) };
+        let (taken, _) = poll_once(DynamicConfig { version: u64::MAX, ..named_services(&["edited"]) }, memory.clone()).await;
+        assert_eq!(taken, memory, "refused");
+        // And a config already at the last version (written by hand on
+        // every node): changes to it are refused, not wrapped to version 0.
+        let last = DynamicConfig { version: u64::MAX, ..named_services(&["old"]) };
+        let (taken, _) = poll_once(DynamicConfig { version: u64::MAX, ..named_services(&["edited"]) }, last.clone()).await;
+        assert_eq!(taken, last);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn poll_adopts_hand_edits_and_newer_files() {
         // Edited without bumping the version: adopted, bumped and persisted.
@@ -2219,7 +2317,7 @@ mod tests {
         let mut dc = DynamicConfig::default();
         let mut api: crate::config::Service =
             serde_json::from_value(serde_json::json!({"name": "api", "nodeId": "n1", "nodePort": 1, "protocol": "http"})).unwrap();
-        dc.upsert_service("g", api.clone());
+        dc.upsert_service("g", api.clone()).unwrap();
         dc.set_routes("api", vec![serde_json::from_value(serde_json::json!({"service": "api", "backends": [{}]})).unwrap()]).unwrap();
         let cfg = Config { node_id: "n1".into(), admin_cns: vec!["admin".into()], dynamic_config: dc, ..Config::default() };
         std::fs::create_dir_all(&dir).unwrap();
@@ -2375,6 +2473,11 @@ mod tests {
         let dc = c.node.dynamic_config.read().await.clone();
         assert_eq!(dc.version, 2);
         assert_eq!(dc.changed_by, "admin", "adopted exactly as signed");
+        // Even an admin's signature can't take the config to a version so
+        // high no change could follow (say, made with a leaked key).
+        let last = DynamicConfig { version: u64::MAX, changed_by: "admin".into(), ..named_services(&[]) };
+        assert_eq!(rpc(push(signed_by(&c.admin, &last), 2)).await, Err(AdminErrCode::Validation));
+        assert_eq!(c.node.dynamic_config.read().await.version, 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3158,6 +3261,43 @@ mod tests {
         let newer = record("x", "x:2", 20, &x);
         merge_sync(&sub, None, vec![newer, junk("x")], vec![], &SyncSource::default()).await;
         assert_eq!(sub.known_nodes.load()["x"].addr, "x:2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Beats cost a signature check each, so a sync of junk beats gets few
+    /// checked: the newest per node, only for nodes that beat (those with no
+    /// address), and at most MAX_BEATS_PER_SYNC.
+    #[tokio::test]
+    async fn a_sync_full_of_beats_gets_few_checked() {
+        let (dir, sub, x, m) = signed_nodes_setup();
+        // x has no address (it beats); m has one (it doesn't).
+        merge_sync(&sub, None, vec![record("x", "", 10, &x), record("m", "m:1", 10, &m)], vec![], &SyncSource::default())
+            .await;
+        let real = crate::signing::sign_beat("x", 20_000, &x).unwrap();
+        let junk = |id: &str, beat: u64| crate::config::SignedBeat { id: id.into(), beat, ..real.clone() };
+        let mut beats: Vec<_> = (11..20_000).map(|b| junk("x", b)).collect();
+        beats.push(real.clone());
+        beats.extend((11..10_000).map(|b| junk("m", b)));
+        beats.extend((0..10_000).map(|i| junk(&format!("u{i}"), 11)));
+        let checked = check_signatures(&sub, &[], &beats);
+        assert_eq!(checked.beat_checks, 1, "only x's newest");
+        assert!(checked.beats.contains(&(real.id.clone(), real.beat, real.signature.clone())));
+
+        // Many nodes that beat, each with a beat to check: capped.
+        sub.update_known_nodes(|kn| {
+            let x_now = kn["x"].clone();
+            for i in 0..MAX_BEATS_PER_SYNC + 500 {
+                kn.insert(format!("n{i}"), NodeInfo { id: format!("n{i}"), ..x_now.clone() });
+            }
+        })
+        .await;
+        let beats: Vec<_> = (0..MAX_BEATS_PER_SYNC + 500).map(|i| junk(&format!("n{i}"), 30_000)).collect();
+        assert_eq!(check_signatures(&sub, &[], &beats).beat_checks, MAX_BEATS_PER_SYNC);
+
+        // Through merge_sync (checked off the async workers), x's beat is taken.
+        let newer = crate::signing::sign_beat("x", 20_001, &x).unwrap();
+        merge_sync(&sub, None, vec![], vec![newer], &SyncSource::default()).await;
+        assert_eq!(sub.known_nodes.load()["x"].heartbeat, 20_001);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

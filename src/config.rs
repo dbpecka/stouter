@@ -397,7 +397,37 @@ impl fmt::Display for MutateErr {
 
 impl std::error::Error for MutateErr {}
 
+/// How far past the version a node holds a config it is offered may be.
+/// Every change adds one, so a cluster's configs never come near it. What it
+/// stops is a config at a version so high (`u64::MAX`) that no change could
+/// follow, which would take a hand edit on every node to undo: from version
+/// 0, getting there would take 2^36 configs adopted one after the other.
+pub const MAX_VERSION_STEP: u64 = 1 << 28;
+
+/// Why `incoming` mustn't replace `held`: its version is more than
+/// [`MAX_VERSION_STEP`] past `held`'s.
+pub fn too_far_ahead(incoming: &DynamicConfig, held: &DynamicConfig) -> Option<String> {
+    (incoming.version.saturating_sub(held.version) > MAX_VERSION_STEP).then(|| {
+        format!(
+            "config version {} is more than {MAX_VERSION_STEP} versions past the one held here ({}), \
+             and each change adds only one",
+            incoming.version, held.version
+        )
+    })
+}
+
 impl DynamicConfig {
+    /// The version the next change to this config gets.
+    pub fn next_version(&self) -> Result<u64, MutateErr> {
+        self.version.checked_add(1).ok_or_else(|| {
+            MutateErr::Invalid(format!(
+                "the config is at the highest version there is ({}), so no change can follow it: \
+                 set a lower version by hand in every node's config file",
+                self.version
+            ))
+        })
+    }
+
     /// Whether `self` and `other` configure the same services and routes,
     /// whatever their version, author and signature.
     pub fn same_settings(&self, other: &DynamicConfig) -> bool {
@@ -581,7 +611,8 @@ impl DynamicConfig {
     /// Insert a service into `group`, or replace it in place when an entry
     /// with the same `(name, node_id)` already exists. Bumps `version` on
     /// success and returns the new version.
-    pub fn upsert_service(&mut self, group: &str, service: Service) -> u64 {
+    pub fn upsert_service(&mut self, group: &str, service: Service) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         if let Some(g) = self.service_groups.iter_mut().find(|g| g.name == group) {
             if let Some(existing) = g
                 .services
@@ -598,8 +629,8 @@ impl DynamicConfig {
                 services: vec![service],
             });
         }
-        self.version += 1;
-        self.version
+        self.version = version;
+        Ok(version)
     }
 
     /// The fixed local proxy port for `service`: the `localPort` its
@@ -644,6 +675,7 @@ impl DynamicConfig {
     /// never lets a revoked certificate back in. Refused if nothing would
     /// change.
     pub fn restore(&mut self, earlier: &DynamicConfig) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let next = DynamicConfig {
             service_groups: earlier.service_groups.clone(),
             routes: earlier.routes.clone(),
@@ -657,8 +689,8 @@ impl DynamicConfig {
             )));
         }
         *self = next;
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Let `nodes` open tunnels to `service`. A service with no policy yet
@@ -666,6 +698,7 @@ impl DynamicConfig {
     /// Bumps `version` and returns the new version; refused if all of them
     /// may already.
     pub fn allow_callers(&mut self, service: &str, nodes: &[String]) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         if service.is_empty() {
             return Err(MutateErr::Invalid("name the service".into()));
         }
@@ -687,8 +720,8 @@ impl DynamicConfig {
         if !added {
             return Err(MutateErr::Invalid(format!("every one of them may already reach '{service}'")));
         }
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Stop `nodes` opening tunnels to `service`. The policy stays, even
@@ -696,6 +729,7 @@ impl DynamicConfig {
     /// [`Self::clear_policy`] to open the service again. Bumps `version`
     /// and returns the new version.
     pub fn deny_callers(&mut self, service: &str, nodes: &[String]) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let Some(policy) = self.policies.iter_mut().find(|p| p.service == service) else {
             return Err(MutateErr::Invalid(format!(
                 "service '{service}' has no policy, so every node may reach it: allow the ones that may instead"
@@ -706,26 +740,28 @@ impl DynamicConfig {
         if policy.allow.len() == before {
             return Err(MutateErr::Invalid(format!("none of them may reach '{service}' now")));
         }
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Drop `service`'s policy, opening it to every node. Bumps `version`
     /// and returns the new version.
     pub fn clear_policy(&mut self, service: &str) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let before = self.policies.len();
         self.policies.retain(|p| p.service != service);
         if self.policies.len() == before {
             return Err(MutateErr::Invalid(format!("service '{service}' has no policy")));
         }
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Revoke `nodes` (every certificate for those names) and `certs`
     /// (fingerprints, see [`normalize_fingerprint`]). Bumps `version` and
     /// returns the new version; refused if all were revoked already.
     pub fn revoke(&mut self, nodes: &[String], certs: &[String]) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let certs = certs.iter().map(|c| normalize_fingerprint(c)).collect::<std::result::Result<Vec<_>, _>>().map_err(MutateErr::Invalid)?;
         let mut added = false;
         for node in nodes {
@@ -746,13 +782,14 @@ impl DynamicConfig {
         if !added {
             return Err(MutateErr::Invalid("already revoked".into()));
         }
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Undo [`Self::revoke`] for `nodes` and `certs`. Bumps `version` and
     /// returns the new version; refused if none of them was revoked.
     pub fn unrevoke(&mut self, nodes: &[String], certs: &[String]) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let certs = certs.iter().map(|c| normalize_fingerprint(c)).collect::<std::result::Result<Vec<_>, _>>().map_err(MutateErr::Invalid)?;
         let before = self.revoked.clone();
         self.revoked.nodes.retain(|n| !nodes.contains(n));
@@ -760,13 +797,14 @@ impl DynamicConfig {
         if self.revoked == before {
             return Err(MutateErr::Invalid("not revoked".into()));
         }
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Replace all routes for `service` with `routes` (empty clears them).
     /// Bumps `version` and returns the new version.
     pub fn set_routes(&mut self, service: &str, routes: Vec<Route>) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         if !routes.is_empty() {
             self.validate_route_target(service).map_err(MutateErr::Invalid)?;
         }
@@ -776,8 +814,8 @@ impl DynamicConfig {
         self.routes.retain(|r| r.service != service);
         let at = insert_at.unwrap_or(self.routes.len()).min(self.routes.len());
         self.routes.splice(at..at, routes);
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Remove the service identified by `(group, owner_node_id, name)`.
@@ -788,6 +826,7 @@ impl DynamicConfig {
         owner_node_id: &str,
         name: &str,
     ) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let g = self
             .service_groups
             .iter_mut()
@@ -805,8 +844,8 @@ impl DynamicConfig {
             });
         }
 
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 
     /// Rename the service identified by `(group, owner_node_id, from)` to
@@ -818,6 +857,7 @@ impl DynamicConfig {
         from: &str,
         to: &str,
     ) -> Result<u64, MutateErr> {
+        let version = self.next_version()?;
         let g = self
             .service_groups
             .iter_mut()
@@ -846,8 +886,8 @@ impl DynamicConfig {
             })?;
         svc.name = to.to_string();
 
-        self.version += 1;
-        Ok(self.version)
+        self.version = version;
+        Ok(version)
     }
 }
 
@@ -1481,6 +1521,25 @@ pub fn get_hostname() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn no_change_follows_the_last_version() {
+        let mut dc = DynamicConfig { version: u64::MAX - 1, ..DynamicConfig::default() };
+        assert_eq!(dc.upsert_service("g", instance("api", "n1", &[])), Ok(u64::MAX));
+        let before = dc.clone();
+        assert!(matches!(dc.upsert_service("g", instance("web", "n1", &[])), Err(MutateErr::Invalid(_))));
+        assert!(dc.remove_service("g", "n1", "api").is_err());
+        assert!(dc.revoke(&["x".into()], &[]).is_err());
+        assert!(dc.restore(&DynamicConfig::default()).is_err());
+        assert_eq!(dc, before, "refused before anything changed");
+
+        let held = DynamicConfig { version: 7, ..DynamicConfig::default() };
+        let at = |version| DynamicConfig { version, ..DynamicConfig::default() };
+        assert!(too_far_ahead(&at(7 + MAX_VERSION_STEP), &held).is_none());
+        assert!(too_far_ahead(&at(8 + MAX_VERSION_STEP), &held).is_some());
+        assert!(too_far_ahead(&at(u64::MAX), &held).is_some());
+        assert!(too_far_ahead(&at(0), &held).is_none(), "older is for supersedes to say");
+    }
+
     /// The default config, for a node with a name (as every node has).
     fn named() -> Config {
         Config { node_id: "n1".into(), ..Config::default() }
@@ -1739,7 +1798,7 @@ mod tests {
     fn set_routes_replaces_one_service_in_place() {
         let mut dc = DynamicConfig::default();
         for name in ["api", "web"] {
-            dc.upsert_service("g", http_instance(name, "n1", &[]));
+            dc.upsert_service("g", http_instance(name, "n1", &[])).unwrap();
         }
         let r = |svc: &str, name: &str| route(serde_json::json!({"name": name, "service": svc, "backends": [{}]}));
         dc.set_routes("api", vec![r("api", "a1"), r("api", "a2")]).unwrap();
@@ -1754,7 +1813,7 @@ mod tests {
     #[test]
     fn routes_require_existing_http_service() {
         let mut dc = DynamicConfig::default();
-        dc.upsert_service("g", instance("tcp-svc", "n1", &[]));
+        dc.upsert_service("g", instance("tcp-svc", "n1", &[])).unwrap();
         let r = |svc: &str| route(serde_json::json!({"service": svc, "backends": [{}]}));
         assert!(matches!(dc.set_routes("missing", vec![r("missing")]), Err(MutateErr::Invalid(_))));
         assert!(matches!(dc.set_routes("tcp-svc", vec![r("tcp-svc")]), Err(MutateErr::Invalid(_))));
@@ -2128,7 +2187,7 @@ mod tests {
                 meta: Default::default(),
                 local_port: None,
             },
-        );
+        ).unwrap();
         assert_eq!(v, 1);
         assert_eq!(dc.version, 1);
         assert_eq!(dc.service_groups.len(), 1);
@@ -2142,11 +2201,11 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let v = dc.upsert_service(
             "web",
             Service { name: "ui".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups.len(), 1);
         assert_eq!(dc.service_groups[0].services.len(), 2);
@@ -2158,7 +2217,7 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let v = dc.upsert_service(
             "web",
             Service {
@@ -2175,7 +2234,7 @@ mod tests {
                 meta: [("traefik.scheme".to_string(), "h2c".to_string())].into(),
                 local_port: None,
             },
-        );
+        ).unwrap();
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups[0].services.len(), 1);
         let svc = &dc.service_groups[0].services[0];
@@ -2197,11 +2256,11 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 2);
     }
 
@@ -2211,7 +2270,7 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let v = dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(v, 2);
         assert!(dc.service_groups[0].services.is_empty());
@@ -2230,7 +2289,7 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let err = dc.remove_service("web", "n1", "api").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
     }
@@ -2241,11 +2300,11 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n2".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         dc.remove_service("web", "n1", "api").unwrap();
         assert_eq!(dc.service_groups[0].services.len(), 1);
         assert_eq!(dc.service_groups[0].services[0].node_id, "n2");
@@ -2257,7 +2316,7 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let v = dc.rename_service("web", "n1", "api", "api2").unwrap();
         assert_eq!(v, 2);
         assert_eq!(dc.service_groups[0].services[0].name, "api2");
@@ -2276,7 +2335,7 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "ui".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::ServiceNotFound { .. }));
     }
@@ -2287,11 +2346,11 @@ mod tests {
         dc.upsert_service(
             "web",
             Service { name: "api".into(), node_id: "n1".into(), node_port: 3000, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         dc.upsert_service(
             "web",
             Service { name: "api2".into(), node_id: "n1".into(), node_port: 3001, domains: vec![], weight: 1, max_connections: None, protocol: Protocol::Tcp, request_timeout_ms: None, health_path: None, labels: Default::default(), meta: Default::default(), local_port: None },
-        );
+        ).unwrap();
         let err = dc.rename_service("web", "n1", "api", "api2").unwrap_err();
         assert!(matches!(err, MutateErr::DuplicateService { .. }));
     }
@@ -2424,10 +2483,10 @@ mod tests {
     #[test]
     fn equal_versions_resolve_to_the_same_winner_everywhere() {
         let mut a = DynamicConfig::default();
-        a.upsert_service("g", instance("from-a", "n1", &[]));
+        a.upsert_service("g", instance("from-a", "n1", &[])).unwrap();
         a.changed_by = "node-a".into();
         let mut b = DynamicConfig::default();
-        b.upsert_service("g", instance("from-b", "n1", &[]));
+        b.upsert_service("g", instance("from-b", "n1", &[])).unwrap();
         b.changed_by = "node-b".into();
         assert_eq!(a.version, b.version);
         // Exactly one wins, whichever a node holds first.
@@ -2446,8 +2505,8 @@ mod tests {
     #[test]
     fn a_service_may_not_span_two_groups() {
         let mut dc = DynamicConfig::default();
-        dc.upsert_service("web", instance("api", "n1", &[]));
-        dc.upsert_service("ops", instance("api", "n2", &[]));
+        dc.upsert_service("web", instance("api", "n1", &[])).unwrap();
+        dc.upsert_service("ops", instance("api", "n2", &[])).unwrap();
         let problems = dc.problems();
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("both group 'web' and group 'ops'"), "{problems:?}");
@@ -2456,7 +2515,7 @@ mod tests {
     #[test]
     fn changes_are_refused_only_for_problems_they_introduce() {
         let mut before = DynamicConfig::default();
-        before.upsert_service("g", http_instance("api", "n1", &[]));
+        before.upsert_service("g", http_instance("api", "n1", &[])).unwrap();
         before.set_routes("api", vec![route(serde_json::json!({"service": "api", "backends": [{}]}))]).unwrap();
         assert!(before.problems().is_empty());
 
@@ -2467,20 +2526,20 @@ mod tests {
 
         // So does making it TCP.
         let mut after = before.clone();
-        after.upsert_service("g", instance("api", "n1", &[]));
+        after.upsert_service("g", instance("api", "n1", &[])).unwrap();
         assert!(new_problem(&before, &after).unwrap().contains("protocol: http"));
 
         // Claiming another service's domain.
         let mut with_domain = before.clone();
-        with_domain.upsert_service("g", instance("web", "n1", &["x.example.com"]));
+        with_domain.upsert_service("g", instance("web", "n1", &["x.example.com"])).unwrap();
         let mut after = with_domain.clone();
-        after.upsert_service("g", instance("other", "n2", &["x.example.com"]));
+        after.upsert_service("g", instance("other", "n2", &["x.example.com"])).unwrap();
         assert!(new_problem(&with_domain, &after).unwrap().contains("x.example.com"));
 
         // A config that's already broken still accepts unrelated changes.
         let broken = after.clone();
         let mut fixed_elsewhere = broken.clone();
-        fixed_elsewhere.upsert_service("g", instance("unrelated", "n3", &[]));
+        fixed_elsewhere.upsert_service("g", instance("unrelated", "n3", &[])).unwrap();
         assert_eq!(new_problem(&broken, &fixed_elsewhere), None);
     }
 
@@ -2497,7 +2556,7 @@ mod tests {
     #[test]
     fn configs_too_large_to_gossip_and_oversized_pools_are_refused() {
         let mut dc = DynamicConfig::default();
-        dc.upsert_service("g", instance("api", "n1", &[]));
+        dc.upsert_service("g", instance("api", "n1", &[])).unwrap();
         assert!(dc.problems().is_empty());
         let mut huge = dc.clone();
         huge.service_groups[0].services[0].meta.insert("blob".into(), "x".repeat(MAX_CONFIG_BYTES));

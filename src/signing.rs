@@ -229,13 +229,18 @@ pub fn verify(dc: &DynamicConfig, tls: &TlsContext, admin_cns: &[String]) -> Res
 /// The config this node may adopt for `incoming`, holding `held`: as is,
 /// or, with `requireSignedConfig`, only if an admin signed it (decoded from
 /// the signed text), and not well before `held` was (see [`signed_too_early`]).
+/// Either way, not one whose version is implausibly far past `held`'s (see
+/// [`crate::config::too_far_ahead`]).
 pub fn admit(state: &SharedState, incoming: DynamicConfig, held: &DynamicConfig) -> Result<DynamicConfig> {
     if !state.config.require_signed_config {
+        if let Some(why) = crate::config::too_far_ahead(&incoming, held) {
+            bail!("{why}");
+        }
         return Ok(incoming);
     }
     let tls = state.tls.as_deref().ok_or_else(|| anyhow!("no TLS context to check signatures with"))?;
     let config = verify(&incoming, tls, &state.config.admin_cns)?.0;
-    if let Some(why) = signed_too_early(&config, held) {
+    if let Some(why) = signed_too_early(&config, held).or_else(|| crate::config::too_far_ahead(&config, held)) {
         bail!("{why}");
     }
     Ok(config)
@@ -265,7 +270,7 @@ pub fn signed_too_early(incoming: &DynamicConfig, held: &DynamicConfig) -> Optio
 /// version is refused, debug after that (peers keep offering it every sync).
 pub fn log_refusal(state: &SharedState, version: u64, err: &anyhow::Error) {
     if state.rejected_config_version.swap(version, Ordering::Relaxed) != version {
-        warn!("refusing config version {version}: {err:#} (requireSignedConfig)");
+        warn!("refusing config version {version}: {err:#}");
     } else {
         debug!("refusing config version {version} again: {err:#}");
     }

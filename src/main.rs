@@ -454,6 +454,7 @@ async fn main() -> Result<()> {
             })?;
             let material = pki::load_or_create_with(tls_dir, &cfg.node_id, cfg.cert_lifetime())?;
             let tls_ctx = tls::TlsContext::new(&material)?;
+            tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
 
             cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
 
@@ -668,7 +669,7 @@ async fn main() -> Result<()> {
                     local_port,
                 };
                 let before = cfg.dynamic_config.clone();
-                let version = cfg.dynamic_config.upsert_service(&group_name, service);
+                let version = cfg.dynamic_config.upsert_service(&group_name, service).map_err(|e| anyhow::anyhow!("{e}"))?;
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = local_tls(&cfg)?;
@@ -1084,7 +1085,7 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&cli.config)?;
             let target = remote.unwrap_or_else(|| cfg.local_target());
             let material = load_cli_material(&cfg, cli.cert_dir.as_deref())?;
-            let tls_ctx = tls::TlsContext::new(&material)?;
+            let tls_ctx = cli_tls_context(&cfg, &material)?;
             let mut desired = cfg.dynamic_config.clone();
             desired.signature = None;
             let mut pushed = None;
@@ -1126,7 +1127,10 @@ async fn main() -> Result<()> {
                 // behind the rest of the cluster (the file came from a node
                 // that is ahead) would otherwise get a version the cluster
                 // already has, and lose this change to it.
-                let next = config::DynamicConfig { version: reported.version.max(desired.version) + 1, ..desired.clone() };
+                let version = reported.version.max(desired.version).checked_add(1).with_context(|| {
+                    format!("{} is at the highest version there is: set a lower version in it", cli.config)
+                })?;
+                let next = config::DynamicConfig { version, ..desired.clone() };
                 // Refused only for problems the push adds: measured against
                 // the verified config, or else what the target reports (as
                 // the target itself will).
@@ -1169,7 +1173,7 @@ async fn main() -> Result<()> {
             let mut cfg = Config::load(&cli.config)?;
             let target = remote.unwrap_or_else(|| cfg.local_target());
             let material = load_cli_material(&cfg, cli.cert_dir.as_deref())?;
-            let tls_ctx = tls::TlsContext::new(&material)?;
+            let tls_ctx = cli_tls_context(&cfg, &material)?;
             let daemon = fetch_daemon_config(&target, &tls_ctx).await?;
             let current = if !signed_cluster(&cfg, daemon.require_signed_config) {
                 daemon.dynamic_config
@@ -1330,7 +1334,7 @@ async fn main() -> Result<()> {
                     );
                 }
                 let material = load_cli_material(&local, cli.cert_dir.as_deref())?;
-                let tls_ctx = tls::TlsContext::new(&material)?;
+                let tls_ctx = cli_tls_context(&local, &material)?;
                 trusted_config(&earlier, &local, &material, &tls_ctx).with_context(|| format!("version {to}"))?
             } else {
                 earlier
@@ -1554,7 +1558,18 @@ fn load_cli_material(cfg: &Config, cert_dir: Option<&str>) -> Result<pki::PkiMat
 /// Build a `TlsContext` for an outbound CLI connection, preferring an
 /// explicit `--cert-dir` over the local config's `tlsDir`.
 fn build_cli_tls(cfg: &Config, cert_dir: Option<&str>) -> Result<tls::TlsContext> {
-    tls::TlsContext::new(&load_cli_material(cfg, cert_dir)?)
+    cli_tls_context(cfg, &load_cli_material(cfg, cert_dir)?)
+}
+
+/// The CLI's TLS context for `material`, refusing the certificates the
+/// local config revokes (as a daemon refuses those its config does): for
+/// connecting, and for checking who signed a config a daemon serves. With
+/// none loaded, a config forged with a revoked admin's key, served by a
+/// lying daemon, would pass, and the admin's change on top of it be signed.
+fn cli_tls_context(cfg: &Config, material: &pki::PkiMaterial) -> Result<tls::TlsContext> {
+    let tls_ctx = tls::TlsContext::new(material)?;
+    tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
+    Ok(tls_ctx)
 }
 
 /// Open an mTLS connection to a daemon, giving up after `CONNECT_TIMEOUT`.
@@ -1649,7 +1664,7 @@ async fn try_admin_rpc(
     cert_dir: Option<&str>,
 ) -> Result<std::result::Result<u64, (AdminErrCode, String)>> {
     let material = load_cli_material(cfg, cert_dir)?;
-    let tls_ctx = tls::TlsContext::new(&material)?;
+    let tls_ctx = cli_tls_context(cfg, &material)?;
     for attempt in 1..=PUSH_ATTEMPTS {
         let daemon = fetch_daemon_config(target, &tls_ctx).await?;
         if !signed_cluster(cfg, daemon.require_signed_config) {
@@ -1802,7 +1817,7 @@ fn signed_cluster(cfg: &Config, daemon_says: bool) -> bool {
 /// [`trusted_config`]) when it requires signed configs.
 async fn fetch_trusted_config(target: &str, cfg: &Config, cert_dir: Option<&str>) -> Result<config::DynamicConfig> {
     let material = load_cli_material(cfg, cert_dir)?;
-    let tls_ctx = tls::TlsContext::new(&material)?;
+    let tls_ctx = cli_tls_context(cfg, &material)?;
     let daemon = fetch_daemon_config(target, &tls_ctx).await?;
     if !signed_cluster(cfg, daemon.require_signed_config) {
         return Ok(daemon.dynamic_config);
@@ -2011,7 +2026,7 @@ fn save_local_change(
                  sign one first with `stouter config push`"
             );
         }
-        let tls_ctx = tls::TlsContext::new(&material)?;
+        let tls_ctx = cli_tls_context(cfg, &material)?;
         let verified = trusted_config(before, cfg, &material, &tls_ctx).with_context(|| format!("the config in {path}"))?;
         if !verified.same_settings(before) {
             anyhow::bail!(
@@ -2319,6 +2334,42 @@ mod tests {
         assert!(format!("{err:#}").contains("certificate is for 'mallory'"), "{err:#}");
         // --node says which, and nothing is asked.
         assert_eq!(owner_node(Some("n1".into()), Some(&lying), &cfg, admin_dir).await.unwrap(), "n1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An admin's CLI knows what its config revokes: a config signed with a
+    /// revoked admin's key (say, leaked) isn't built on, and a daemon
+    /// answering with a revoked certificate isn't talked to.
+    #[tokio::test]
+    async fn the_cli_refuses_what_its_config_revokes() {
+        let (dir, certs) = cluster_certs(&["alice", "bob", "m"]);
+        let alice_dir = dir.join("alice");
+        let alice_dir = alice_dir.to_str();
+        let mut cfg = Config {
+            require_signed_config: true,
+            admin_cns: vec!["alice".into(), "bob".into()],
+            ..Config::default()
+        };
+        cfg.dynamic_config.revoked.nodes.push("bob".into());
+
+        let mut forged = api_on_port(6666);
+        forged.version = 11;
+        let forged = signing::sign(&forged, &signing::Signer::from_material(&certs["bob"]).unwrap()).unwrap();
+        // Without the revocation list, bob's signature would pass.
+        let blind = tls::TlsContext::new(&certs["alice"]).unwrap();
+        assert!(trusted_config(&forged, &cfg, &certs["alice"], &blind).is_ok());
+        let tls_ctx = cli_tls_context(&cfg, &certs["alice"]).unwrap();
+        let err = trusted_config(&forged, &cfg, &certs["alice"], &tls_ctx).expect_err("revoked");
+        assert!(format!("{err:#}").to_lowercase().contains("revoked"), "{err:#}");
+
+        // A daemon presenting bob's certificate: refused at the handshake.
+        let as_bob = status_answerer(&certs["bob"], "bob", "node").await;
+        let err = fetch_trusted_config(&as_bob, &cfg, alice_dir).await.expect_err("refused");
+        assert!(!format!("{err:#}").contains("isn't admin-signed"), "got as far as the config: {err:#}");
+        // A member's daemon is talked to (and its unsigned config refused).
+        let as_m = status_answerer(&certs["m"], "m", "node").await;
+        let err = fetch_trusted_config(&as_m, &cfg, alice_dir).await.expect_err("unsigned");
+        assert!(format!("{err:#}").contains("isn't admin-signed"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
