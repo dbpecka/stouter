@@ -34,6 +34,7 @@ sleep $(( started + 100 - $(date +%s) > 0 ? started + 100 - $(date +%s) : 0 ))
 status() { "$BIN" --config "$WORK/$1.json" status ${2:+--remote "$2"} 2>/dev/null | grep -q "running (node mode)"; }
 check "past its first certificate's expiry, B still answers (with its renewed one on disk)" status B
 check "and A reaches B over a new connection" status A 127.0.0.1:27902
+check "A (the CA node) answers past its first certificate's expiry too" status A
 check "B keeps syncing with A" sh -c "! sed 's/\x1b\[[0-9;]*m//g' '$WORK/A.log' | grep -q 'forgetting node B\|node B.*expired'"
 check "status shows the certificate's expiry" sh -c "'$BIN' --config '$WORK/B.json' status | grep -q 'Certificate valid until'"
 
