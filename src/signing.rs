@@ -369,6 +369,16 @@ pub fn sign_beat(id: &str, beat: u64, signer: &Signer) -> Result<SignedBeat> {
 
 /// Check that `beat` was signed with the key of `cert` (hex DER): the
 /// certificate of the node's record, already verified when the record was.
+/// Whether the certificate `cert` (DER, hex) has expired, or can't be read:
+/// a beat signed with its key says nothing about the node now. Records are
+/// checked against the cluster CA as of now, so this matters for beats,
+/// which are checked against the certificate of a record already held.
+pub fn cert_hex_expired(cert: &str) -> bool {
+    unhex(cert).ok().and_then(|der| crate::pki::validity(&der)).is_none_or(|(_, until)| {
+        u64::try_from(until).unwrap_or(0) < now_secs()
+    })
+}
+
 pub fn verify_beat(beat: &SignedBeat, cert: &str) -> Result<()> {
     let cert = CertificateDer::from(unhex(cert).context("certificate")?);
     let end_entity = webpki::EndEntityCert::try_from(&cert).map_err(|e| anyhow!("certificate: {e:?}"))?;

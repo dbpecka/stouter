@@ -1621,7 +1621,9 @@ fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::con
         let mut last_err = None;
         // A record held from before its certificate was revoked vouches for nothing.
         let certs = held.as_deref().into_iter().chain(received);
-        for cert in certs.filter(|cert| !tls.revocations().cert_hex_revoked(cert)) {
+        // Nor one whose certificate has expired since: its key keeping a
+        // node alive (or bringing it back) would outlast the certificate.
+        for cert in certs.filter(|cert| !tls.revocations().cert_hex_revoked(cert) && !crate::signing::cert_hex_expired(cert)) {
             checked.beat_checks += 1;
             match crate::signing::verify_beat(beat, cert) {
                 Ok(()) => {
@@ -3517,6 +3519,25 @@ mod tests {
         let newer = record("x", "x:2", 20, &x);
         merge_sync(&sub, None, vec![newer, junk("x")], vec![], &SyncSource::default()).await;
         assert_eq!(sub.known_nodes.load()["x"].addr, "x:2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A beat signed with the key of a certificate that has expired since
+    /// the node's record was taken keeps nothing alive.
+    #[tokio::test]
+    async fn a_beat_from_an_expired_certificate_counts_for_nothing() {
+        let (dir, sub, _, _) = signed_nodes_setup();
+        let short = crate::pki::load_or_create_with(dir.to_str().unwrap(), "x", ::time::Duration::seconds(2)).unwrap();
+        let x = crate::signing::Signer::from_material(&short).unwrap();
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![], &SyncSource::default()).await;
+        let beat = |n: u64| crate::signing::sign_beat("x", n, &x).unwrap();
+        let checked = |b: crate::config::SignedBeat| {
+            let key = (b.id.clone(), b.beat, b.signature.clone());
+            check_signatures(&sub, &[], &[b]).beats.contains(&key)
+        };
+        assert!(checked(beat(11)), "while the certificate is valid");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!checked(beat(12)), "not once it has expired");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
