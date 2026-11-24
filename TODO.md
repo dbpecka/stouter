@@ -261,8 +261,9 @@ against the code. Numbered on from the list above.
 - [ ] **40. `requestTimeoutMs` can be exceeded up to twice over** when a request ends up
   on a pooled connection that came free while its own tunnel was being set
   up (the background setup keeps extending its deadline).
-- [ ] **41. The HTTP pool's 60 s idle timeout is never enforced** (no `pool_timer`), so
+- [x] **41. The HTTP pool's 60 s idle timeout is never enforced** (no `pool_timer`), so
   idle tunnels linger until the node's 300 s timeout.
+  Fixed: the proxy's and the telemetry exporter's clients have a pool timer, so idle connections are closed on time.
 - [x] **42. At startup, an edit with its version raised by hand keeps the old signature**
   (`status` and history name an admin who never signed it).
   Fixed: #31 routes offline edits through the config poll, which now clears the signature and `signedAt` of any edit it takes and makes this node its author (the time tie-break of #29 applies only to configs that are signed).

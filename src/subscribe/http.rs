@@ -499,12 +499,22 @@ async fn answer_within<F: Future>(limit: Duration, setup: &TunnelSetup, sent: F)
 
 /// A pooled HTTP/1.1 client whose connections are tunnels to `service_name`.
 fn build_client(service_name: &str, state: &Arc<SharedState>) -> Client<TunnelConnector, ProxyBody> {
+    build_client_with(service_name, state, POOL_IDLE_TIMEOUT)
+}
+
+/// [`build_client`], with connections closed after `idle` unused.
+fn build_client_with(service_name: &str, state: &Arc<SharedState>, idle: Duration) -> Client<TunnelConnector, ProxyBody> {
     let connector = TunnelConnector {
         service_name: service_name.to_string(),
         state: state.clone(),
     };
     Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .pool_idle_timeout(idle)
+        // Without a timer the pool only notices an idle connection expired
+        // when it is next taken: idle tunnels (and the node's connections
+        // to its backend behind them) lingered until something else closed
+        // them, holding up a node's drain.
+        .pool_timer(hyper_util::rt::TokioTimer::new())
         // The URI authority is a synthetic per-node pool key; the
         // client's own Host header is forwarded instead.
         .set_host(false)
@@ -1317,6 +1327,78 @@ mod tests {
         assert_eq!(get_through(proxy("c")).await, 200);
         // But an answer slower than the timeout still times out.
         assert_eq!(get_through(proxy("d")).await, 504);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An idle pooled connection is closed after the pool's idle timeout
+    /// (1 s here), and with it the tunnel and what the node holds for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_pooled_connections_are_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("stouter_idle_{}_{}", std::process::id(), rand::random::<u64>()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let node = crate::state::test_support::tls_state(&dir, "n");
+        let open = Arc::new(AtomicUsize::new(0));
+        {
+            let open = open.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else { return };
+                    let (node, open) = (node.clone(), open.clone());
+                    tokio::spawn(async move {
+                        let Ok(mut stream) = node.tls_accept(tcp).await else { return };
+                        let Ok(crate::gossip::messages::Message::TunnelRequest { .. }) =
+                            crate::gossip::recv_message(&mut stream).await
+                        else {
+                            return;
+                        };
+                        stream.write_all(&[0]).await.unwrap();
+                        open.fetch_add(1, Ordering::SeqCst);
+                        let mut buf = vec![0; 8192];
+                        let mut got = 0;
+                        loop {
+                            match stream.read(&mut buf[got..]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got += n,
+                            }
+                            if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                                got = 0;
+                                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+                            }
+                        }
+                        open.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+        let cfg = crate::config::Config {
+            node_id: "sub".into(),
+            mode: crate::config::Mode::Subscribe,
+            dynamic_config: serde_json::from_value(serde_json::json!({
+                "version": 1, "serviceGroups": [{"name": "g", "services": [
+                    {"name": "api", "nodeId": "n", "nodePort": 80, "protocol": "http"}
+                ]}],
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        let sub = crate::state::test_support::tls_state_with(&dir, cfg, String::new());
+        sub.update_known_nodes(|kn| {
+            kn.insert(
+                "n".into(),
+                crate::config::NodeInfo { id: "n".into(), addr: addr.clone(), last_seen: Some(Instant::now()), ..Default::default() },
+            );
+        })
+        .await;
+        sub.rebuild_service_index().await;
+        let proxy = HttpProxy::new("api".into(), sub.clone(), Arc::new(Balancer::new()));
+        proxy.client.store(Arc::new(build_client_with("api", &sub, Duration::from_secs(1))));
+        assert_eq!(get_through(proxy.clone()).await, 200);
+        assert_eq!(open.load(Ordering::SeqCst), 1, "kept for the next request");
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(open.load(Ordering::SeqCst), 0, "closed once idle");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

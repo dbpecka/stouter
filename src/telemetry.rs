@@ -147,7 +147,9 @@ fn resource_attributes(service_name: &str, node_id: &str) -> Attributes {
 }
 
 async fn run_exporter(mut rx: mpsc::Receiver<Command>, endpoint: String, resource: Attributes) {
-    let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    // A timer, or the pool's idle timeout is only checked on reuse.
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).pool_timer(hyper_util::rt::TokioTimer::new()).build_http();
     let mut batch: Vec<SpanRecord> = Vec::with_capacity(MAX_BATCH);
     let mut interval = tokio::time::interval(EXPORT_INTERVAL);
     let mut failing = false;
