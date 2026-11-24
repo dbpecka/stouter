@@ -404,9 +404,25 @@ impl std::error::Error for MutateErr {}
 /// 0, getting there would take 2^36 configs adopted one after the other.
 pub const MAX_VERSION_STEP: u64 = 1 << 28;
 
+/// Highest version a node holding no config yet (version 0) takes: it has
+/// nothing to measure a step from, and a cluster's version may be far past
+/// [`MAX_VERSION_STEP`] (set by hand, say, to a date). Far enough below
+/// `u64::MAX` that changes can always follow.
+pub const MAX_FIRST_VERSION: u64 = 1 << 62;
+
 /// Why `incoming` mustn't replace `held`: its version is more than
-/// [`MAX_VERSION_STEP`] past `held`'s.
+/// [`MAX_VERSION_STEP`] past `held`'s, or, for a node holding no config yet,
+/// above [`MAX_FIRST_VERSION`].
 pub fn too_far_ahead(incoming: &DynamicConfig, held: &DynamicConfig) -> Option<String> {
+    if held.version == 0 {
+        return (incoming.version > MAX_FIRST_VERSION).then(|| {
+            format!(
+                "config version {} is above {MAX_FIRST_VERSION}, too close to the last version there is for changes \
+                 to follow it",
+                incoming.version
+            )
+        });
+    }
     (incoming.version.saturating_sub(held.version) > MAX_VERSION_STEP).then(|| {
         format!(
             "config version {} is more than {MAX_VERSION_STEP} versions past the one held here ({}), \
@@ -1699,6 +1715,13 @@ mod tests {
         assert!(too_far_ahead(&at(8 + MAX_VERSION_STEP), &held).is_some());
         assert!(too_far_ahead(&at(u64::MAX), &held).is_some());
         assert!(too_far_ahead(&at(0), &held).is_none(), "older is for supersedes to say");
+        // A node holding nothing yet takes a cluster's config at any version
+        // changes can follow, however far past the step.
+        let empty = DynamicConfig::default();
+        assert!(too_far_ahead(&at(1_764_000_000), &empty).is_none(), "a date set by hand");
+        assert!(too_far_ahead(&at(MAX_FIRST_VERSION), &empty).is_none());
+        assert!(too_far_ahead(&at(MAX_FIRST_VERSION + 1), &empty).is_some());
+        assert!(too_far_ahead(&at(u64::MAX), &empty).is_some());
     }
 
     /// The default config, for a node with a name (as every node has).

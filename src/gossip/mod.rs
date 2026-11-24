@@ -2217,11 +2217,15 @@ mod tests {
         let at = |version: u64| DynamicConfig { version, changed_by: "x".into(), ..named_services(&["api"]) };
         {
             let mut dc = state.dynamic_config.write().await;
+            // Holding nothing yet, a node takes any version changes can
+            // follow (the bound is absolute there), but not the last ones.
             assert!(!adopt_if_newer(&state, &mut dc, at(u64::MAX), "test"), "a jump to the end");
-            assert!(!adopt_if_newer(&state, &mut dc, at(MAX_VERSION_STEP + 1), "test"));
-            assert!(adopt_if_newer(&state, &mut dc, at(MAX_VERSION_STEP), "test"), "far, but within the bound");
+            assert!(adopt_if_newer(&state, &mut dc, at(1), "test"));
+            // Holding one, at most MAX_VERSION_STEP past it.
+            assert!(!adopt_if_newer(&state, &mut dc, at(MAX_VERSION_STEP + 2), "test"));
+            assert!(adopt_if_newer(&state, &mut dc, at(MAX_VERSION_STEP + 1), "test"), "far, but within the bound");
             assert!(!adopt_if_newer(&state, &mut dc, at(u64::MAX), "test"));
-            assert_eq!(dc.version, MAX_VERSION_STEP);
+            assert_eq!(dc.version, MAX_VERSION_STEP + 1);
         }
 
         // A hand edit to the file, the same.
