@@ -29,7 +29,7 @@ use tracing::{debug, info};
 
 use super::balancer::{Balancer, Pick};
 use super::proxy::{
-    establish_tunnel, note_tunnel_failure, own_node, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
+    establish_tunnel, establish_tunnel_within, note_tunnel_failure, own_node, prefer_healthy, service_backends, Tunnel, MAX_TUNNEL_ATTEMPTS,
 };
 use crate::config::{labels_match, Route};
 use crate::telemetry::{Attributes, SpanEvent, SpanKind, SpanRecord};
@@ -932,14 +932,11 @@ impl tower_service::Service<Uri> for TunnelConnector {
                 .ok_or_else(|| format!("unknown node {node_id}"))?;
             let tunnel = match &setup {
                 Some(setup) => {
-                    let result = tokio::time::timeout(setup.limit, establish_tunnel(&node, service_name, &state)).await;
+                    // Within the request's limit, a NAT'd node's relays
+                    // share it, so a dead one still leaves time for the next.
+                    let result = establish_tunnel_within(&node, service_name, &state, setup.limit).await;
                     setup.set_setting_up(false);
-                    result.map_err(|_| {
-                        format!(
-                            "setting up a tunnel to node {node_id} took over the request timeout ({} ms)",
-                            setup.limit.as_millis()
-                        )
-                    })??
+                    result?
                 }
                 None => establish_tunnel(&node, service_name, &state).await?,
             };

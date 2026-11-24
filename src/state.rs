@@ -41,6 +41,11 @@ pub const RECONNECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// A relay counts as one this node uses while it holds a reverse
 /// connection there, or registered one this recently (connections are
 /// consumed by tunnels and replaced, so the count dips during bursts).
+/// How long a relay that didn't answer a tunnel in time is tried after a
+/// NAT'd node's other relays: a little less than gossip takes to mark a
+/// dead one stale.
+const RELAY_LAGGING_FOR: Duration = Duration::from_secs(20);
+
 /// How long after starting a node counts as catching up with the cluster:
 /// a dozen gossip rounds.
 pub const CATCH_UP: Duration = Duration::from_secs(120);
@@ -476,6 +481,9 @@ pub struct SharedState {
     pub(crate) peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
     /// When each NAT'd node last registered a reverse connection here.
     relayed_here: Mutex<HashMap<String, std::time::Instant>>,
+    /// Relays that didn't answer a tunnel in time, until when they are tried
+    /// last (see [`SharedState::relay_lagging`]).
+    lagging_relays: Mutex<HashMap<String, std::time::Instant>>,
     /// Until when this node counts as catching up after starting (see
     /// [`SharedState::catching_up`]).
     pub(crate) catch_up_until: Mutex<std::time::Instant>,
@@ -581,6 +589,7 @@ impl SharedState {
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
             relayed_here: Mutex::new(HashMap::new()),
+            lagging_relays: Mutex::new(HashMap::new()),
             catch_up_until: Mutex::new(std::time::Instant::now() + CATCH_UP),
             warned_expired_signer: Mutex::new(None),
             edited_offline: std::sync::atomic::AtomicBool::new(false),
@@ -915,6 +924,20 @@ impl SharedState {
         self.synced.load(std::sync::atomic::Ordering::Relaxed)
             || !self.catching_up()
             || (self.bootstrap_peers.is_empty() && self.known_nodes.load().is_empty())
+    }
+
+    /// Note that relay `relay` (a node id) didn't answer a tunnel in time:
+    /// for [`RELAY_LAGGING_FOR`], tunnels try a NAT'd node's other relays
+    /// first, rather than each spend part of its time on this one.
+    pub fn note_relay_lagging(&self, relay: &str) {
+        let mut lagging = self.lagging_relays.lock().unwrap();
+        lagging.retain(|_, until| *until > std::time::Instant::now());
+        lagging.insert(relay.to_string(), std::time::Instant::now() + RELAY_LAGGING_FOR);
+    }
+
+    /// Whether relay `relay` recently didn't answer a tunnel in time.
+    pub fn relay_lagging(&self, relay: &str) -> bool {
+        self.lagging_relays.lock().unwrap().get(relay).is_some_and(|until| *until > std::time::Instant::now())
     }
 
     /// Note that NAT'd node `node` (as its certificate says) just registered

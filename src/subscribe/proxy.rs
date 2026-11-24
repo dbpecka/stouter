@@ -366,9 +366,23 @@ pub(super) async fn establish_tunnel(
     service_name: String,
     state: &Arc<SharedState>,
 ) -> Result<Tunnel> {
-    tokio::time::timeout(TUNNEL_SETUP_TIMEOUT, establish_tunnel_untimed(node, service_name, state))
+    establish_tunnel_within(node, service_name, state, TUNNEL_SETUP_TIMEOUT).await
+}
+
+/// [`establish_tunnel`], within `budget` (at most [`TUNNEL_SETUP_TIMEOUT`]):
+/// a NAT'd node's relays share it (see [`RELAY_ROUTE_TIMEOUT`]), so a short
+/// budget still leaves the next relay its turn.
+pub(super) async fn establish_tunnel_within(
+    node: &NodeInfo,
+    service_name: String,
+    state: &Arc<SharedState>,
+    budget: Duration,
+) -> Result<Tunnel> {
+    let budget = budget.min(TUNNEL_SETUP_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + budget;
+    tokio::time::timeout(budget, establish_tunnel_untimed(node, service_name, state, deadline))
         .await
-        .map_err(|_| anyhow::anyhow!("tunnel setup to node {} timed out", node.id))?
+        .map_err(|_| anyhow::anyhow!("tunnel setup to node {} timed out after {} ms", node.id, budget.as_millis()))?
 }
 
 /// Where to connect for a tunnel to `node`, and the node whose certificate
@@ -408,6 +422,10 @@ pub(crate) fn tunnel_routes(node: &NodeInfo, state: &SharedState) -> Vec<(String
         relays.sort_by_key(|r| {
             (
                 std::cmp::Reverse(crate::state::node_is_live(r, now)),
+                // One that just failed to answer in time goes after the
+                // others for a while (gossip takes half a minute to mark a
+                // dead one stale).
+                state.relay_lagging(&r.id),
                 std::cmp::Reverse(crate::node::reverse::rendezvous_score(&chooser, &r.id)),
             )
         });
@@ -416,16 +434,19 @@ pub(crate) fn tunnel_routes(node: &NodeInfo, state: &SharedState) -> Vec<(String
     node.relay.iter().map(|relay| (relay.clone(), state.node_at(relay))).collect()
 }
 
-/// For a NAT'd node with several relays: the time to try each but the last
-/// before moving on to the next, within the one tunnel setup. A relay that
-/// went down, or whose host stopped answering, costs this much, not the
-/// client's tunnel (until gossip marks it stale, half a minute later).
+/// For a NAT'd node with several relays: the most time to try each but the
+/// last before moving on to the next, within the one tunnel setup (less
+/// when the setup's budget is short: each relay left gets an equal share).
+/// A relay that went down, or whose host stopped answering, costs this
+/// much, not the client's tunnel; and it is tried last for a while (see
+/// `SharedState::relay_lagging`).
 const RELAY_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn establish_tunnel_untimed(
     node: &NodeInfo,
     service_name: String,
     state: &Arc<SharedState>,
+    deadline: tokio::time::Instant,
 ) -> Result<Tunnel> {
     // Our own instance (a `nodeSubscribe` node): no tunnel needed.
     if node.id == state.config.node_id {
@@ -488,9 +509,17 @@ async fn establish_tunnel_untimed(
     for (i, (addr, expect)) in routes.iter().enumerate() {
         let attempt = tunnel_via(addr, expect.as_deref(), &msg, state, connect_start);
         let result = if i + 1 < routes.len() {
-            tokio::time::timeout(RELAY_ROUTE_TIMEOUT, attempt)
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer through {addr} within {}s", RELAY_ROUTE_TIMEOUT.as_secs())))
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let slice = RELAY_ROUTE_TIMEOUT.min(left / (routes.len() - i) as u32);
+            match tokio::time::timeout(slice, attempt).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if let Some(relay) = expect {
+                        state.note_relay_lagging(relay);
+                    }
+                    Err(anyhow::anyhow!("no answer through {addr} within {} ms", slice.as_millis()))
+                }
+            }
         } else {
             attempt.await
         };
@@ -805,6 +834,65 @@ mod tests {
         use tokio::io::AsyncReadExt;
         tunnel.read_to_string(&mut got).await.unwrap();
         assert_eq!(got, "via the second relay");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A NAT'd node's first relay accepts connections but never answers.
+    /// Within a 1 s budget (a short requestTimeoutMs), the setup still gets
+    /// to the next relay in time, and the first is tried last for a while.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_budget_leaves_time_for_the_next_relay() {
+        use crate::state::test_support::tls_state;
+        let dir = std::env::temp_dir().join(format!("stouter_budget_{}_{}", std::process::id(), rand::random::<u64>()));
+        let sub = tls_state(&dir, "sub");
+        let natd = natd_with_relays("x", &["r1", "r2"]);
+        let relay = |id: &str| NodeInfo { id: id.into(), addr: format!("{id}:1"), last_seen: Some(Instant::now()), ..Default::default() };
+        sub.update_known_nodes(|kn| {
+            kn.insert("r1".into(), relay("r1"));
+            kn.insert("r2".into(), relay("r2"));
+        })
+        .await;
+        let (first, second) = match &tunnel_routes(&natd, &sub)[..] {
+            [a, b] => (a.1.clone().unwrap(), b.1.clone().unwrap()),
+            other => panic!("{other:?}"),
+        };
+        // The first takes connections and says nothing.
+        let hung = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_addr = hung.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = hung.accept().await {
+                held.push(tcp);
+            }
+        });
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap().to_string();
+        let second_state = tls_state(&dir, &second);
+        tokio::spawn(async move {
+            let (tcp, _) = up.accept().await.unwrap();
+            let mut stream = second_state.tls_accept(tcp).await.unwrap();
+            let Ok(Message::TunnelRequest { .. }) = gossip::recv_message(&mut stream).await else { return };
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&[0]).await.unwrap();
+            stream.write_all(b"via the second relay").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        sub.update_known_nodes(|kn| {
+            kn.get_mut(&first).unwrap().addr = hung_addr.clone();
+            kn.get_mut(&second).unwrap().addr = up_addr.clone();
+        })
+        .await;
+
+        let started = Instant::now();
+        let mut tunnel = establish_tunnel_within(&natd, "api".into(), &sub, Duration::from_secs(1))
+            .await
+            .expect("through the second relay, in time");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        let mut got = String::new();
+        use tokio::io::AsyncReadExt;
+        tunnel.read_to_string(&mut got).await.unwrap();
+        assert_eq!(got, "via the second relay");
+        assert_eq!(tunnel_routes(&natd, &sub)[0].1.as_deref(), Some(second.as_str()), "the hung relay goes last");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
