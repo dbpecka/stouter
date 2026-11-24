@@ -1090,7 +1090,7 @@ async fn merge_sync(
     let now = Instant::now();
     // Signatures are checked first, without the node list's lock: checking
     // is the slow part, and any peer can send junk to check.
-    let Some((nodes, beats, checked)) = check_signatures_off_thread(state, nodes, beats).await else { return };
+    let Some((nodes, beats, checked)) = check_signatures_off_thread(state, nodes, beats, source.cn).await else { return };
     // Node info isn't persisted (the config file only holds bootstrap
     // peers), so a change here writes nothing to disk.
     state.update_known_nodes(|kn| {
@@ -1628,12 +1628,33 @@ fn check_signatures(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::con
 /// many as there are CPUs), so that peers sending signatures to check can't
 /// hold up the async workers (and with them tunnels and admin requests).
 /// Hands `nodes` and `beats` back with the result.
+///
+/// A sync with nothing to check skips the queue; one peer may have at most
+/// [`MAX_CHECKING_SYNCS_PER_PEER`] syncs being checked at once (more are
+/// dropped: the next round sends them again), so a peer sending junk to
+/// check can't queue ahead of everyone else's syncs.
 async fn check_signatures_off_thread(
     state: &Arc<SharedState>,
     nodes: Vec<NodeInfo>,
     beats: Vec<crate::config::SignedBeat>,
+    peer: Option<&str>,
 ) -> Option<(Vec<NodeInfo>, Vec<crate::config::SignedBeat>, Checked)> {
     static CHECKING: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    static LAST_LIMIT_WARNING: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if !needs_checks(state, &nodes, &beats) {
+        return Some((nodes, beats, Checked::default()));
+    }
+    let peer = peer.unwrap_or("");
+    let Some(_turn) = state.try_peer_slot("sync-check", peer, MAX_CHECKING_SYNCS_PER_PEER) else {
+        warn_rarely(
+            &LAST_LIMIT_WARNING,
+            format_args!(
+                "dropping a sync from '{peer}': it already has {MAX_CHECKING_SYNCS_PER_PEER} syncs having their \
+                 signatures checked"
+            ),
+        );
+        return None;
+    };
     let slots = CHECKING.get_or_init(|| {
         tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get))
     });
@@ -1645,6 +1666,31 @@ async fn check_signatures_off_thread(
     })
     .await
     .ok()
+}
+
+/// Most syncs from one peer having their signatures checked at once: an
+/// honest peer has one it started and one we did.
+const MAX_CHECKING_SYNCS_PER_PEER: usize = 2;
+
+/// Whether [`check_signatures`] would check anything in `nodes` and `beats`
+/// (cheaply, with no signature checked): a record claiming to be newer than
+/// the one held, or a beat newer than the last from a node that beats.
+fn needs_checks(state: &SharedState, nodes: &[NodeInfo], beats: &[crate::config::SignedBeat]) -> bool {
+    if state.tls.is_none() {
+        return false;
+    }
+    let known = state.known_nodes.load();
+    let newer_record = nodes.iter().any(|node| {
+        node.signed.as_ref().is_some_and(|signed| {
+            let held = known.get(&node.id).filter(|n| n.signed.is_some()).map(|n| n.record_version);
+            matches!(crate::signing::claimed_heartbeat(signed), Some(claimed) if held.is_none_or(|h| claimed > h))
+        })
+    });
+    newer_record
+        || beats.iter().any(|beat| match known.get(&beat.id) {
+            Some(node) => node.addr.is_empty() && node.signed.is_some() && beat.beat > node.heartbeat,
+            None => state.forgotten_cert(&beat.id).is_some_and(|(last, _)| beat.beat > last),
+        })
 }
 
 /// Take `beat` for the node it names if it's newer than what we have and
@@ -3458,6 +3504,51 @@ mod tests {
         let newer = crate::signing::sign_beat("x", 20_001, &x).unwrap();
         merge_sync(&sub, None, vec![], vec![newer], &SyncSource::default()).await;
         assert_eq!(sub.known_nodes.load()["x"].heartbeat, 20_001);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member floods a node with syncs full of records to check: only two
+    /// of its syncs are checked at once (the rest are dropped), so another
+    /// peer's sync isn't queued behind them all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_peers_junk_syncs_dont_hold_up_anothers() {
+        let (dir, sub, x, m) = signed_nodes_setup();
+        // A junk record: m's valid cluster certificate, a signature over other text.
+        let junk = |i: usize| {
+            let mut r = record(&format!("j{i}"), "10.9.9.9:1", 10, &m);
+            r.signed.as_mut().unwrap().record_json = format!("{{\"id\":\"j{i}\",\"addr\":\"\",\"heartbeat\":10}}");
+            r
+        };
+        let nodes: Vec<NodeInfo> = (0..MAX_NEW_RECORDS_PER_SYNC).map(junk).collect();
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let mut tasks = Vec::new();
+        for _ in 0..50 * cpus {
+            let (sub, nodes) = (sub.clone(), nodes.clone());
+            tasks.push(tokio::spawn(async move {
+                merge_sync(&sub, None, nodes, vec![], &SyncSource { cn: Some("m"), ..Default::default() }).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![], &SyncSource { cn: Some("x"), ..Default::default() }).await;
+        let honest = started.elapsed();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(honest < Duration::from_secs(1), "an honest merge waited {honest:?}");
+        assert!(sub.known_nodes.load().contains_key("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_syncs_with_something_to_check_wait_their_turn() {
+        let (dir, sub, x, _) = signed_nodes_setup();
+        merge_sync(&sub, None, vec![record("x", "", 10, &x)], vec![], &SyncSource::default()).await;
+        let beat = |n: u64| crate::signing::sign_beat("x", n, &x).unwrap();
+        assert!(!needs_checks(&sub, &[record("x", "", 10, &x)], &[]), "a record already held");
+        assert!(needs_checks(&sub, &[record("x", "", 11, &x)], &[]), "a newer one");
+        assert!(needs_checks(&sub, &[], &[beat(20)]), "a new beat from a node that beats");
+        assert!(!needs_checks(&sub, &[], &[beat(5)]), "an old one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -633,7 +633,10 @@ Limits, so one peer can't exhaust a node:
   its length comes from the peer, and a 4 GiB one used to abort the daemon.
 - Signatures in a sync are checked before the node list is locked, on
   blocking threads (as many syncs at once as there are CPUs), not the ones
-  serving tunnels and admin requests. Per sync, at most 256 records for nodes
+  serving tunnels and admin requests. A sync with nothing to check doesn't
+  wait for one, and one peer may have at most 2 syncs being checked at once
+  (more are dropped; the next round sends them again), so a peer sending
+  junk can't queue ahead of everyone else. Per sync, at most 256 records for nodes
   not yet known are checked (the rest wait for the next one), and only each
   node's newest beat, only for nodes with no address (the only ones that
   beat), at most 4096 of them. A peer sending junk can't stall gossip,
