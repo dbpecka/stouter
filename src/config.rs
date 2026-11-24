@@ -285,6 +285,12 @@ pub struct DynamicConfig {
     /// `crate::tls::Revocations`).
     #[serde(default, skip_serializing_if = "Revoked::is_empty")]
     pub revoked: Revoked,
+    /// When an admin signed this config (Unix seconds), as part of what was
+    /// signed: the signer's certificate is checked as of then (see
+    /// `crate::signing::verify`). Absent from configs signed by older
+    /// versions, and from unsigned ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_at: Option<u64>,
     /// An admin's signature over this config, when it has one. Nodes with
     /// `requireSignedConfig` accept a change only if it is signed (see
     /// `crate::signing`); everyone else keeps and relays it as is.
@@ -398,6 +404,7 @@ impl DynamicConfig {
         let bare = |dc: &DynamicConfig| DynamicConfig {
             version: 0,
             changed_by: String::new(),
+            signed_at: None,
             signature: None,
             ..dc.clone()
         };

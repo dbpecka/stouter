@@ -1741,6 +1741,31 @@ async fn fetch_history(
     }
 }
 
+/// Who signed `dc` and when, and when their certificate expires (as the
+/// signature says; checked by daemons when they took it).
+fn describe_signature(dc: &config::DynamicConfig) -> Option<String> {
+    let sig = dc.signature.as_ref()?;
+    let der: Vec<u8> = (0..sig.signer_cert.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(sig.signer_cert.get(i..i + 2)?, 16).ok())
+        .collect::<Option<_>>()?;
+    let signer = tls::cert_cn(&der.clone().into()).unwrap_or_else(|| "?".into());
+    let when = dc.signed_at.map(|at| format!(" at {}", history::format_time(at * 1000))).unwrap_or_default();
+    let cert = match pki::validity(&der) {
+        Some((_, until)) if until * 1000 < now_ms() as i64 => format!(
+            "; that certificate expired {} (what it signed while valid stays valid)",
+            history::format_time(until.max(0) as u64 * 1000)
+        ),
+        Some((_, until)) => format!("; that certificate is valid until {}", history::format_time(until.max(0) as u64 * 1000)),
+        None => String::new(),
+    };
+    Some(format!("{signer}{when}{cert}"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
 /// One line saying who may reach a service under `policy`.
 fn describe_policy(policy: &config::Policy) -> String {
     if policy.allow.is_empty() {
@@ -1875,6 +1900,9 @@ fn print_status(
     println!("Node ID: {node_id}");
     println!("Bind:    {bind}");
     println!("Config version: {}", dynamic_config.version);
+    if let Some(signed) = describe_signature(dynamic_config) {
+        println!("Signed by: {signed}");
+    }
 
     println!("\nServices:");
     let mut any = false;
@@ -1998,6 +2026,7 @@ fn save_local_change(
             if cfg.node_id.is_empty() { config::get_hostname() } else { cfg.node_id.clone() };
         // An edit invalidates any signature the config carried.
         cfg.dynamic_config.signature = None;
+        cfg.dynamic_config.signed_at = None;
     }
     cfg.save(path)?;
     history::record(path, &cfg.dynamic_config);

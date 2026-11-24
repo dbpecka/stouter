@@ -30,7 +30,7 @@ fn warn_message_size(message: std::fmt::Arguments<'_>) {
 
 /// Log `message` at warn level if `last` (one per kind of warning) is
 /// over a minute ago, else at debug: for conditions that repeat every round.
-fn warn_rarely(last: &std::sync::Mutex<Option<std::time::Instant>>, message: std::fmt::Arguments<'_>) {
+pub(crate) fn warn_rarely(last: &std::sync::Mutex<Option<std::time::Instant>>, message: std::fmt::Arguments<'_>) {
     let mut last = last.lock().unwrap();
     if last.is_none_or(|at| at.elapsed() >= SIZE_WARNING_EVERY) {
         *last = Some(std::time::Instant::now());
@@ -43,7 +43,7 @@ fn warn_rarely(last: &std::sync::Mutex<Option<std::time::Instant>>, message: std
 /// Most connections one peer may hold here waiting for their first
 /// message. Subscribers keep a few warm (8 per node), so this only stops a
 /// peer piling up idle connections until we run out of file descriptors.
-const MAX_IDLE_PER_PEER: usize = 64;
+pub(crate) const MAX_IDLE_PER_PEER: usize = 64;
 
 /// Most mux sessions one peer may hold here (subscribers keep one).
 const MAX_MUX_SESSIONS_PER_PEER: usize = 16;
@@ -94,6 +94,12 @@ pub(crate) fn encode_message(msg: &Message) -> Result<Vec<u8>> {
 ///
 /// Wire format: `[4-byte payload len][payload]`.
 pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Message> {
+    recv_message_limited(stream, MAX_MSG_BYTES).await
+}
+
+/// [`recv_message`] for a message of at most `limit` bytes: one longer is
+/// refused on its length prefix, before any of it is read.
+pub(crate) async fn recv_message_limited<R: AsyncReadExt + Unpin>(stream: &mut R, limit: u32) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -101,10 +107,8 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Mes
         .context("read length prefix")?;
     let len = u32::from_be_bytes(len_buf);
 
-    if len > MAX_MSG_BYTES {
-        warn_message_size(format_args!(
-            "refusing a {len}-byte message: over the {MAX_MSG_BYTES}-byte limit"
-        ));
+    if len > limit {
+        warn_message_size(format_args!("refusing a {len}-byte message: over the {limit}-byte limit"));
         bail!("message too large: {len} bytes");
     }
 
@@ -392,6 +396,7 @@ async fn handle_admin_request(
                     next.changed_by = state.config.node_id.clone();
                     // An edit invalidates any signature the config carried.
                     next.signature = None;
+                    next.signed_at = None;
                     next
                 })
             }
@@ -452,6 +457,9 @@ fn accept_push(
         .ok_or_else(|| MutateErr::Unauthorized("no TLS context to check signatures with".into()))?;
     let (verified, signer) = crate::signing::verify(&pushed, tls, &state.config.admin_cns)
         .map_err(|e| MutateErr::Unauthorized(format!("{e:#}")))?;
+    if let Some(why) = crate::signing::signed_too_early(&verified, current) {
+        return Err(MutateErr::Invalid(why));
+    }
     if current.version != base_version {
         return Err(MutateErr::Conflict { current: current.version });
     }
@@ -552,7 +560,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 // writes one, a hand edit can't. It is adopted exactly as
                 // signed (no version bump, no changedBy).
                 let content = |c: &crate::config::DynamicConfig| (c.service_groups.clone(), c.routes.clone());
-                match crate::signing::admit(&state, file_dc.clone()) {
+                match crate::signing::admit(&state, file_dc.clone(), &dc) {
                     Ok(signed) if signed.supersedes(&dc) => {
                         info!("config file has a newer signed config: version {} -> {}", current_version, signed.version);
                         taken(&state, &file_dc);
@@ -1232,7 +1240,7 @@ fn adopt_if_newer(
         return false;
     }
     let version = incoming.version;
-    match crate::signing::admit(state, incoming) {
+    match crate::signing::admit(state, incoming, dc) {
         // The signed text decides; the envelope around it may claim more.
         Ok(config) if config.supersedes(dc) => {
             log_adoption(dc, &config, what);
@@ -2303,6 +2311,39 @@ mod tests {
         assert!(dc.signature.is_some(), "kept, to relay");
         // Persisted with its signature, so it survives a restart.
         assert_eq!(Config::load(&c.path).unwrap().dynamic_config, dc);
+    }
+
+    /// A config keeps spreading after the certificate that signed it
+    /// expires: a node that hadn't taken it yet (new, restarted, cut off)
+    /// still does. (It used to be refused, splitting the cluster.)
+    #[tokio::test]
+    async fn a_signed_config_keeps_spreading_after_its_signers_certificate_expires() {
+        let c = signed_cluster();
+        let admin_short = crate::pki::load_or_create_with(c.dir.to_str().unwrap(), "admin", ::time::Duration::seconds(2)).unwrap();
+        let v2 = signed_by(&admin_short, &DynamicConfig { version: 2, changed_by: "admin".into(), ..named_services(&["api", "new"]) });
+        apply_message(&c.node, Message::ConfigUpdate { config: v2.clone() }, None).await;
+        assert_eq!(c.node.dynamic_config.read().await.version, 2);
+
+        // A second node of the cluster, still at version 1.
+        let path2 = c.dir.join("n2.json").to_str().unwrap().to_string();
+        let cfg2 = Config {
+            node_id: "n2".into(),
+            admin_cns: vec!["admin".into()],
+            require_signed_config: true,
+            dynamic_config: DynamicConfig { version: 1, ..named_services(&["api"]) },
+            ..Config::default()
+        };
+        cfg2.save(&path2).unwrap();
+        let n2 = crate::state::test_support::tls_state_with(&c.dir, cfg2, path2);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let relayed = c.node.dynamic_config.read().await.clone();
+        apply_message(&n2, Message::ConfigUpdate { config: relayed }, None).await;
+        assert_eq!(n2.dynamic_config.read().await.version, 2, "n2 takes the cluster's config");
+
+        // But the expired key signs nothing new that counts.
+        let v3 = signed_by(&admin_short, &DynamicConfig { version: 3, changed_by: "admin".into(), ..named_services(&["api"]) });
+        apply_message(&n2, Message::ConfigUpdate { config: v3 }, None).await;
+        assert_eq!(n2.dynamic_config.read().await.version, 2);
     }
 
     #[tokio::test]

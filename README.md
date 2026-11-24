@@ -561,9 +561,13 @@ Limits, so one peer can't exhaust a node:
   on both ends. A config change that would make the config larger than 2 MiB
   encoded (a signed config counts its signed copy too) is refused, since it
   could never reach the rest of the cluster.
-- One peer may hold at most 64 connections waiting for their first message
-  (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, and 1024
-  idle reverse connections, and 2 sync connections kept open between rounds.
+- One peer may hold at most 64 connections or mux streams waiting for their
+  first message (subscribers keep 8 warm per node they tunnel to), 16 mux
+  sessions, and 1024 idle reverse connections, and 2 sync connections kept
+  open between rounds. A mux stream's first message is a tunnel request: it
+  may be at most 16 KiB and must arrive within 10 seconds, and a stream
+  counts as work in flight only once it has. A mux session may buffer at
+  most 128 MiB unread across its streams (yamux's default is 1 GiB).
   Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
   so an idle one whose peer vanished is closed within about a minute. So is
   one with data waiting to be acknowledged, after 60s of retransmitting
@@ -790,6 +794,17 @@ any node can relay a signed config but none can alter it.
   current config).
 - Issue the admin certificate with `stouter cert issue --node <admin CN>` and
   list that CN in `adminCns` on every node.
+- A signed config records when it was signed (`signedAt`, part of what is
+  signed), and the signer's certificate is checked as of then: a config
+  stays valid after its signer's certificate expires (a short
+  `certLifetime` doesn't strand the cluster's config), while revocation is
+  checked as of now. An expired key can't sign anything new that counts:
+  dated now, its certificate isn't valid; dated back, the config is refused
+  by every node holding one signed more than an hour later. A config dated
+  over an hour ahead is refused. (The hour allows for the signing hosts'
+  clocks to differ.) `stouter status` shows who signed the current config
+  and when their certificate expires. Configs signed by older versions
+  carry no date and are checked as of now, until the next signed change.
 
 Turn it on everywhere at once, once every node runs a version that supports
 it. Older nodes don't relay the signature, and a node without the flag still

@@ -7,7 +7,7 @@ cluster" means one without `requireSignedConfig`.
 
 ## High
 
-- [ ] **1. Any cluster member can make a node buffer gigabytes (OOM) through mux streams.**
+- [x] **1. Any cluster member can make a node buffer gigabytes (OOM) through mux streams.**
   `src/mux.rs:195` uses `yamux::Config::default()`; `src/mux.rs:235` reads each
   stream's first message with only the 8 MiB message cap and no timeout. A peer
   opens up to 16 sessions × 256 streams, sends most of a large first message on
@@ -18,8 +18,9 @@ cluster" means one without `requireSignedConfig`.
   few KiB) and a timeout; count streams awaiting their first message against
   the peer's waiting-connection slots; bound streams and the receive window per
   session.
+  Fixed: a mux stream's first message is capped at 16 KiB and 10 s, waiting streams share the peer's 64 waiting slots, streams count as in flight only once their request arrives, and a session buffers at most 128 MiB. (yamux's stream limit stays at its default: reaching it closes the whole session.)
 
-- [ ] **2. A signed config stops being accepted once the certificate that signed it expires.**
+- [x] **2. A signed config stops being accepted once the certificate that signed it expires.**
   `src/signing.rs:101-105` checks the signer's certificate via
   `TlsContext::verify_cluster_cert` (`src/tls.rs:521-526`) at the current time.
   Admin certificates from `cert issue` (`src/main.rs:1211`) get `certLifetime`
@@ -31,6 +32,7 @@ cluster" means one without `requireSignedConfig`.
   Fix: check the signer's certificate as of the signing time, carried in the
   signed text, and refuse configs signed earlier than the one held; keep
   checking revocation as of now.
+  Fixed: signed configs carry `signedAt`; the signer's certificate is checked as of then (revocation as of now); configs dated over an hour ahead, or over an hour before the held one, are refused; `stouter status` shows the signer and their certificate's expiry.
 
 - [ ] **3. The CLI never loads the revocation list.**
   Every CLI `TlsContext` (`src/main.rs` 1087, 1172, 1333, 1652, 1780, 1986; via

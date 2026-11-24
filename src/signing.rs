@@ -99,9 +99,21 @@ impl Signer {
 /// of `cert` (hex DER), and that `cert` is valid for this cluster. Returns
 /// the signer's Common Name.
 fn verify_text(domain: &[u8], text: &str, cert: &str, signature: &str, tls: &TlsContext) -> Result<String> {
+    verify_text_at(domain, text, cert, signature, tls, rustls::pki_types::UnixTime::now())
+}
+
+/// [`verify_text`], with `cert` checked as of `at` (when it signed).
+fn verify_text_at(
+    domain: &[u8],
+    text: &str,
+    cert: &str,
+    signature: &str,
+    tls: &TlsContext,
+    at: rustls::pki_types::UnixTime,
+) -> Result<String> {
     let cert = CertificateDer::from(unhex(cert).context("signer certificate")?);
     let signer = tls
-        .verify_cluster_cert(&cert)?
+        .verify_cluster_cert_at(&cert, at)?
         .ok_or_else(|| anyhow!("the signer's certificate has no CN"))?;
     let end_entity = webpki::EndEntityCert::try_from(&cert).map_err(|e| anyhow!("signer certificate: {e:?}"))?;
     let signature = unhex(signature).context("signature")?;
@@ -146,10 +158,25 @@ pub fn verify_tunnel_request(
 // Configs
 // ---------------------------------------------------------------------------
 
-/// `dc`, signed by `signer`.
+/// How far apart the clocks of the hosts signing configs may be: a config
+/// may claim to be signed up to this far in the future, or this far before
+/// the config a node holds.
+const SIGNING_CLOCK_SLACK: u64 = 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// `dc`, signed by `signer` now.
 pub fn sign(dc: &DynamicConfig, signer: &Signer) -> Result<DynamicConfig> {
+    sign_at(dc, signer, now_secs())
+}
+
+/// `dc`, signed by `signer`, saying it was signed at `at` (Unix seconds).
+fn sign_at(dc: &DynamicConfig, signer: &Signer, at: u64) -> Result<DynamicConfig> {
     let mut signed = dc.clone();
     signed.signature = None;
+    signed.signed_at = Some(at);
     let config_json = serde_json::to_string(&signed)?;
     let key = signer.current();
     let signature = key.sign(CONFIG_DOMAIN, &config_json)?;
@@ -163,17 +190,32 @@ pub fn sign(dc: &DynamicConfig, signer: &Signer) -> Result<DynamicConfig> {
 /// in `admin_cns`, and the signature verifies. The config returned is decoded
 /// from the signed text (with the signature attached), so whatever happened
 /// to the rest of `dc` on its way here doesn't matter.
+///
+/// The certificate is checked as of when the config says it was signed
+/// (`signedAt`, part of what was signed), so a config outlives its signer's
+/// certificate; whether it is revoked, as of now. A config dated more than
+/// [`SIGNING_CLOCK_SLACK`] ahead is refused. One with no date (signed by an
+/// older version) is checked as of now.
 pub fn verify(dc: &DynamicConfig, tls: &TlsContext, admin_cns: &[String]) -> Result<(DynamicConfig, String)> {
     let sig = dc
         .signature
         .as_ref()
         .ok_or_else(|| anyhow!("config version {} is not signed", dc.version))?;
-    let signer = verify_text(CONFIG_DOMAIN, &sig.config_json, &sig.signer_cert, &sig.signature, tls)
+    let mut config: DynamicConfig = serde_json::from_str(&sig.config_json).context("decode signed config")?;
+    let at = match config.signed_at {
+        Some(at) if at > now_secs() + SIGNING_CLOCK_SLACK => bail!(
+            "config version {} says it was signed at {}, in the future (is the signing host's clock right?)",
+            dc.version,
+            crate::history::format_time(at * 1000)
+        ),
+        Some(at) => rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(at)),
+        None => rustls::pki_types::UnixTime::now(),
+    };
+    let signer = verify_text_at(CONFIG_DOMAIN, &sig.config_json, &sig.signer_cert, &sig.signature, tls, at)
         .map_err(|e| anyhow!("config version {}: {e:#}", dc.version))?;
     if !admin_cns.contains(&signer) {
         bail!("config version {} is signed by '{signer}', which is not in adminCns", dc.version);
     }
-    let mut config: DynamicConfig = serde_json::from_str(&sig.config_json).context("decode signed config")?;
     // A config revoking the certificate that signed it would leave nothing
     // vouching for it: refused, rather than adopted as signed by no one.
     let signer_fp = crate::tls::fingerprint_hex(&unhex(&sig.signer_cert).context("signer certificate")?);
@@ -184,15 +226,39 @@ pub fn verify(dc: &DynamicConfig, tls: &TlsContext, admin_cns: &[String]) -> Res
     Ok((config, signer))
 }
 
-/// The config this node may adopt for `incoming`: as is, or, with
-/// `requireSignedConfig`, only if an admin signed it (decoded from the
-/// signed text).
-pub fn admit(state: &SharedState, incoming: DynamicConfig) -> Result<DynamicConfig> {
+/// The config this node may adopt for `incoming`, holding `held`: as is,
+/// or, with `requireSignedConfig`, only if an admin signed it (decoded from
+/// the signed text), and not well before `held` was (see [`signed_too_early`]).
+pub fn admit(state: &SharedState, incoming: DynamicConfig, held: &DynamicConfig) -> Result<DynamicConfig> {
     if !state.config.require_signed_config {
         return Ok(incoming);
     }
     let tls = state.tls.as_deref().ok_or_else(|| anyhow!("no TLS context to check signatures with"))?;
-    Ok(verify(&incoming, tls, &state.config.admin_cns)?.0)
+    let config = verify(&incoming, tls, &state.config.admin_cns)?.0;
+    if let Some(why) = signed_too_early(&config, held) {
+        bail!("{why}");
+    }
+    Ok(config)
+}
+
+/// Why `incoming` mustn't replace `held`, if it says it was signed more than
+/// [`SIGNING_CLOCK_SLACK`] before `held` was. A certificate is checked as of
+/// when it signed, so an expired key (from an old backup, say) can still
+/// sign configs dated within its life: this is what keeps those from
+/// replacing anything signed after it expired. Configs with no date
+/// (signed by older versions) aren't compared.
+pub fn signed_too_early(incoming: &DynamicConfig, held: &DynamicConfig) -> Option<String> {
+    let (Some(new), Some(old)) = (incoming.signed_at, held.signed_at) else { return None };
+    (new + SIGNING_CLOCK_SLACK < old).then(|| {
+        format!(
+            "config version {} was signed at {}, well before the config held here (version {}, signed at {}): \
+             is the signing host's clock right?",
+            incoming.version,
+            crate::history::format_time(new * 1000),
+            held.version,
+            crate::history::format_time(old * 1000)
+        )
+    })
 }
 
 /// Report a config refused by [`admit`]: a warning the first time a given
@@ -317,7 +383,8 @@ mod tests {
         let signed = sign(&sample(), &Signer::from_material(&admin).unwrap()).unwrap();
         let (verified, signer) = verify(&signed, &node, &["admin".into()]).unwrap();
         assert_eq!(signer, "admin");
-        assert_eq!(DynamicConfig { signature: None, ..verified.clone() }, sample());
+        assert_eq!(DynamicConfig { signature: None, signed_at: None, ..verified.clone() }, sample());
+        assert!(verified.signed_at.is_some_and(|at| at.abs_diff(now_secs()) < 60), "dated when signed");
         assert_eq!(verified, signed);
 
         // A relay that altered the envelope changes nothing: the signed
@@ -355,5 +422,46 @@ mod tests {
         assert!(verify(&foreign, &node, &admins).unwrap_err().to_string().contains("not valid for this cluster"));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other);
+    }
+    #[test]
+    fn a_signed_config_outlives_its_signers_certificate_but_an_expired_key_signs_nothing_new() {
+        let dir = temp_dir("expiry");
+        let (_, node) = setup(&dir, "x");
+        let admins = ["admin".to_string()];
+        // An admin certificate that lasts two seconds.
+        let issuer = crate::pki::Issuer::load(dir.to_str().unwrap(), time::Duration::seconds(2)).unwrap().unwrap();
+        let (cert, key) = issuer.issue_new("admin").unwrap();
+        let admin = Signer::new(cert, &key).unwrap();
+        let issued = now_secs();
+        let signed = sign(&sample(), &admin).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // Expired since: what it signed while valid still verifies.
+        assert!(verify(&signed, &node, &admins).is_ok());
+        // Dated now, nothing it signs verifies.
+        let late = sign(&DynamicConfig { version: 8, ..sample() }, &admin).unwrap();
+        let err = verify(&late, &node, &admins).unwrap_err();
+        assert!(format!("{err:#}").contains("not valid"), "{err:#}");
+        // Dated back within its life it verifies, but it can't replace a
+        // config signed after the key expired (by more than the clock slack).
+        let backdated = sign_at(&DynamicConfig { version: 9, ..sample() }, &admin, issued).unwrap();
+        assert!(verify(&backdated, &node, &admins).is_ok());
+        let held = DynamicConfig { version: 8, signed_at: Some(issued + SIGNING_CLOCK_SLACK + 60), ..sample() };
+        let why = signed_too_early(&backdated, &held).expect("refused");
+        assert!(why.contains("well before the config held here"), "{why}");
+        // Within the slack, or with either undated (an older version's), it isn't refused.
+        assert!(signed_too_early(&backdated, &DynamicConfig { signed_at: Some(issued + 600), ..held.clone() }).is_none());
+        assert!(signed_too_early(&backdated, &DynamicConfig { signed_at: None, ..held.clone() }).is_none());
+
+        // Dated in the future (beyond the slack): refused.
+        let (fresh, _) = setup(&dir, "admin");
+        let ahead = sign_at(&sample(), &Signer::from_material(&fresh).unwrap(), now_secs() + 2 * SIGNING_CLOCK_SLACK).unwrap();
+        let err = verify(&ahead, &node, &admins).unwrap_err();
+        assert!(format!("{err:#}").contains("in the future"), "{err:#}");
+
+        // Revocation still counts as of now, whenever it signed.
+        node.revocations().set(&crate::config::Revoked { nodes: vec!["admin".into()], certs: vec![] });
+        assert!(verify(&signed, &node, &admins).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -463,7 +463,7 @@ pub struct SharedState {
     /// The record this node last gossiped about itself, reused while fresh.
     pub(crate) own_record: Mutex<Option<OwnRecord>>,
     /// Open connections per (kind, peer CN), for the per-peer limits.
-    peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
+    pub(crate) peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
     /// Peer addresses known to speak delta sync (their replies say so), so
     /// syncs to them can be compact, with the (version, hash) of the config
     /// each had as of its last reply: one that's behind gets ours.

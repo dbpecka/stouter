@@ -519,8 +519,14 @@ impl TlsContext {
     /// Check that `cert` (DER) was issued by the cluster CA and is currently
     /// valid; returns its Common Name.
     pub fn verify_cluster_cert(&self, cert: &CertificateDer<'_>) -> Result<Option<String>> {
+        self.verify_cluster_cert_at(cert, UnixTime::now())
+    }
+
+    /// [`Self::verify_cluster_cert`] as of `at`: whether `cert` was valid
+    /// then. Revocation is still checked as of now.
+    pub fn verify_cluster_cert_at(&self, cert: &CertificateDer<'_>, at: UnixTime) -> Result<Option<String>> {
         self.cert_verifier
-            .verify_client_cert(cert, &[], UnixTime::now())
+            .verify_client_cert(cert, &[], at)
             .map_err(|e| anyhow::anyhow!("certificate not valid for this cluster: {e}"))?;
         Ok(leaf_cn(Some(std::slice::from_ref(cert))))
     }

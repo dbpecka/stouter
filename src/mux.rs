@@ -31,6 +31,30 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(1);
 /// session rather than each wait out [`OPEN_STREAM_TIMEOUT`] too.
 const SATURATED_FOR: Duration = Duration::from_secs(2);
 
+/// Largest first message on a mux stream: a tunnel request, a few KiB even
+/// signed (the caller's certificate travels with it). Plain connections
+/// allow 8 MiB, as a sync can be that large; a stream never carries one.
+const MAX_TUNNEL_REQUEST_BYTES: u32 = 16 * 1024;
+
+/// How long a mux stream may take to send its tunnel request. The side
+/// opening it sends the request at once, so a stream still silent after
+/// this is stalled on purpose, or dead.
+const TUNNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most data one mux session may have buffered unread, across its streams:
+/// yamux's default is 1 GiB. This is the least yamux allows for its default
+/// of 512 streams (256 KiB each), and still far more than one stream needs.
+/// (The stream limit stays at yamux's default: reaching it closes the whole
+/// session, on either side, so a busy session must never meet it.)
+const SESSION_RECEIVE_WINDOW: usize = 512 * 256 * 1024;
+
+/// The yamux settings for both ends of a mux session.
+fn session_config() -> yamux::Config {
+    let mut config = yamux::Config::default();
+    config.set_max_connection_receive_window(Some(SESSION_RECEIVE_WINDOW));
+    config
+}
+
 // ---------------------------------------------------------------------------
 // MuxHandle: cloneable handle for opening outbound yamux streams
 // ---------------------------------------------------------------------------
@@ -189,11 +213,11 @@ impl MuxPool {
 /// Each incoming yamux stream carries one tunnel lifecycle:
 /// TunnelRequest → status byte → bidirectional proxy.
 pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
+    static LAST_LIMIT_WARNING: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     // Who opened the session: the caller of every tunnel on it.
     let peer: Arc<str> = Arc::from(stream.peer_cn().unwrap_or(""));
     let compat_stream = stream.compat();
-    let config = yamux::Config::default();
-    let mut connection = yamux::Connection::new(compat_stream, config, yamux::Mode::Server);
+    let mut connection = yamux::Connection::new(compat_stream, session_config(), yamux::Mode::Server);
 
     debug!("mux session started from {peer}");
 
@@ -201,15 +225,27 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
         let next = poll_fn(|cx| connection.poll_next_inbound(cx)).await;
         match next {
             Some(Ok(yamux_stream)) => {
+                // Until its tunnel request arrives, a stream counts against
+                // the same per-peer limit as a plain connection waiting for
+                // its first message: otherwise a peer could stall hundreds
+                // of streams per session, each holding a partial message.
+                let Some(waiting) = state.try_peer_slot("idle", &peer, gossip::MAX_IDLE_PER_PEER) else {
+                    gossip::warn_rarely(
+                        &LAST_LIMIT_WARNING,
+                        format_args!(
+                            "refusing a mux stream from '{peer}': it already has {} connections or streams waiting \
+                             for their first message",
+                            gossip::MAX_IDLE_PER_PEER
+                        ),
+                    );
+                    drop(yamux_stream);
+                    continue;
+                };
                 let state = state.clone();
                 let peer = peer.clone();
-                // Each stream is a tunnel; the session itself isn't tracked,
-                // so an idle session doesn't hold up a drain.
-                let in_flight = state.in_flight.track();
                 tokio::spawn(async move {
-                    let _in_flight = in_flight;
                     let compat = yamux_stream.compat();
-                    if let Err(e) = handle_mux_stream(compat, &peer, state).await {
+                    if let Err(e) = handle_mux_stream(compat, &peer, waiting, state).await {
                         debug!("mux stream error: {e}");
                     }
                 });
@@ -227,14 +263,26 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
 }
 
 /// Handle a single yamux stream carrying a tunnel request.
+///
+/// `waiting` is the stream's place among its peer's connections waiting for
+/// their first message, held until the tunnel request is read.
 async fn handle_mux_stream(
     mut stream: Compat<yamux::Stream>,
     peer: &str,
+    waiting: crate::state::PeerSlot,
     state: Arc<SharedState>,
 ) -> Result<()> {
-    let msg = gossip::recv_message(&mut stream)
-        .await
-        .context("recv tunnel request on mux stream")?;
+    let msg = tokio::time::timeout(
+        TUNNEL_REQUEST_TIMEOUT,
+        gossip::recv_message_limited(&mut stream, MAX_TUNNEL_REQUEST_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("no tunnel request within {}s", TUNNEL_REQUEST_TIMEOUT.as_secs()))?
+    .context("recv tunnel request on mux stream")?;
+    drop(waiting);
+    // Only now is there work in flight, for a drain to wait on: a stream
+    // that never sent its request is just closed at shutdown.
+    let _in_flight = state.in_flight.track();
 
     match msg {
         Message::TunnelRequest {
@@ -335,8 +383,7 @@ pub async fn establish_mux_session(
 
     // Upgrade to yamux client mode.
     let compat = stream.compat();
-    let config = yamux::Config::default();
-    let connection = yamux::Connection::new(compat, config, yamux::Mode::Client);
+    let connection = yamux::Connection::new(compat, session_config(), yamux::Mode::Client);
 
     // Create the channel for outbound stream requests.
     let (tx, rx) = mpsc::channel(64);
@@ -481,5 +528,83 @@ mod tests {
         revocations.set(&crate::config::Revoked { nodes: vec!["o".into()], certs: vec!["02".repeat(32)] });
         assert_eq!(pool.drop_revoked(&revocations), 2);
         assert!(pool.contains("m:1") && !pool.contains("n:1") && !pool.contains("o:1"));
+    }
+    /// A peer can't make a node hold more than a little for streams that
+    /// never finish their first message: one longer than a tunnel request is
+    /// refused on its length, at most 64 may wait (the same limit as plain
+    /// connections), and they aren't work in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streams_that_never_finish_their_request_hold_little() {
+        use crate::state::test_support::tls_state;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let dir = std::env::temp_dir().join(format!("stouter_mux_hold_{}_{}", std::process::id(), rand::random::<u64>()));
+        let node = tls_state(&dir, "node");
+        let peer = tls_state(&dir, "peer");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, from) = listener.accept().await.unwrap();
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mesh) = node.tls_accept(tcp).await {
+                            crate::gossip::dispatch_connection(mesh, from.to_string(), node).await;
+                        }
+                    });
+                }
+            });
+        }
+        let session = establish_mux_session(&addr, &peer).await.unwrap();
+        let waiting = || node.peer_slots.lock().unwrap().get(&("idle", "peer".to_string())).copied().unwrap_or(0);
+
+        // 128 streams each start an 8 MiB message (the plain-connection
+        // limit) and send 2 MiB of it: each is refused on its length, and
+        // let go at once (the node keeps none of it).
+        let chunk = vec![0x90u8; 64 * 1024];
+        let mut refused = 0;
+        for _ in 0..128 {
+            let mut stream = session.open_stream().await.unwrap().compat();
+            let sent = async {
+                stream.write_all(&(8u32 << 20).to_be_bytes()).await?;
+                for _ in 0..32 {
+                    stream.write_all(&chunk).await?;
+                }
+                stream.flush().await?;
+                let mut byte = [0u8; 1];
+                stream.read(&mut byte).await
+            };
+            if !matches!(tokio::time::timeout(Duration::from_secs(5), sent).await, Ok(Ok(n)) if n > 0) {
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 128, "every oversized request is refused");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(waiting(), 0, "and none is still held");
+
+        // Streams that send a few bytes of a small request and stall: at
+        // most 64 wait, and none counts as work in flight.
+        let mut stalled = Vec::new();
+        for _ in 0..80 {
+            let mut stream = session.open_stream().await.unwrap().compat();
+            stream.write_all(&100u32.to_be_bytes()).await.unwrap();
+            stream.write_all(&[0x80; 10]).await.unwrap();
+            stream.flush().await.unwrap();
+            stalled.push(stream);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(waiting(), crate::gossip::MAX_IDLE_PER_PEER, "at most 64 wait for their request");
+        assert_eq!(node.in_flight.current(), 0, "a stalled stream isn't work a drain waits for");
+
+        // Once they go, their places are free again.
+        drop(stalled);
+        let freed = async {
+            while waiting() > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), freed).await.expect("places freed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
