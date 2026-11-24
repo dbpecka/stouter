@@ -436,6 +436,14 @@ directory. It also takes only cluster names of letters, digits, `-` and `_`
 (they become remote paths), and uploads the repository it is in, wherever
 it's run from.
 
+Before replacing the running container, `deploy.sh` checks the host's
+config with the new image (`stouter check --local`: what would stop the
+daemon from starting) and stops there if it fails, leaving the running
+container as it is. After starting the new one it waits 5 seconds
+(`DEPLOY_SETTLE_SECONDS`) and fails, printing its last log lines, if the
+container isn't running or has been restarted: `docker ps` says "Up" even
+of a daemon that exits at once and is restarted over and over.
+
 ### Testing
 
 `cargo test` runs the unit and in-process tests. End-to-end scripts in
@@ -451,7 +459,7 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 | `revoke.sh BINARY` | `cert revoke --node` through one daemon reaches the others: every node forgets the node and refuses it; `cert unrevoke` lets it back | |
 | `multihost.sh BINARY` | Nodes on separate hosts (network namespaces), all bound to `0.0.0.0`, find each other's real addresses and tunnel | root, iproute2, python3, curl |
 | `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
-| `deploy-host.sh [user@host]` | `deploy.sh` against a real host: the container runs and answers, a redeploy keeps the CA | ssh with keys, sudo and Docker on the host |
+| `deploy-host.sh [user@host]` | `deploy.sh` against a real host: the container runs and answers, a redeploy keeps the CA, a config the daemon can't start with fails the deploy before the running container is touched, one it can't stay up with fails it after | ssh with keys, sudo and Docker on the host |
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, the
 tests on macOS and Windows, a build check with Rust 1.88 (the Docker

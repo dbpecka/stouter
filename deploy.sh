@@ -150,6 +150,24 @@ else
   debug "Restart-only mode, skipping build"
 fi
 
+# The daemon refuses to start with some mistakes in its own settings (no
+# tlsDir, a bind without a port, ...): look for them with the new image now,
+# while the running container is still up, rather than replace it with one
+# that can't start.
+CHECK_HELP=$(remote_sudo "docker run --rm $IMAGE_TAG check --help" 2>/dev/null || true)
+if [[ "$CHECK_HELP" == *--local* ]]; then
+  echo "==> Checking the config with the new image"
+  if ! remote_sudo "
+    D=$RD
+    docker run --rm --network none -v \"\$D/config:\$D/config:ro\" $IMAGE_TAG --config \"\$D/config/stouter.json\" check --local
+  "; then
+    echo "error: the new daemon would not start with $REMOTE_DIR/config/stouter.json (see above): the running container is left as it is" >&2
+    exit 1
+  fi
+else
+  echo "warning: $IMAGE_TAG predates \`stouter check --local\`; not checking the config before replacing the container" >&2
+fi
+
 echo "==> Restarting container"
 debug "Removing existing container if present: $CONTAINER_NAME"
 # Give in-flight connections stouter's full 30s drain (Docker's default is 10s).
@@ -184,7 +202,19 @@ remote_sudo "
     --config \"\$D/config/stouter.json\"
 "
 
-echo "==> Deployed. Checking status..."
+# `docker ps` says "Up" right after `docker run -d`, even of a daemon that
+# exits at once (and is restarted, over and over): give it a few seconds,
+# then make sure it is still running and hasn't been restarted.
+SETTLE=${DEPLOY_SETTLE_SECONDS:-5}
+echo "==> Started. Checking it stays up (${SETTLE}s)..."
+sleep "$SETTLE"
+STATE=$(remote_sudo "docker inspect -f '{{.State.Running}} {{.RestartCount}}' $CONTAINER_NAME" 2>/dev/null || true)
+debug "Container running, restarts: ${STATE:-<no container>}"
+if [[ "$STATE" != "true 0" ]]; then
+  echo "error: the new container isn't staying up (running, restarts: ${STATE:-no container}); its last log lines:" >&2
+  remote_sudo "docker logs --tail 30 $CONTAINER_NAME 2>&1" >&2 || true
+  exit 1
+fi
 CONTAINER_STATUS=$(remote_sudo "docker ps --filter name=^${CONTAINER_NAME}\$ --format '{{.Status}}'")
 echo "$CONTAINER_STATUS"
 debug "Container status: ${CONTAINER_STATUS:-<not running>}"

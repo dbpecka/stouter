@@ -2,8 +2,9 @@
 # deploy-host.sh [user@host]: run deploy.sh against a real host (default:
 # this one, over ssh to localhost), with a cluster name and a tlsDir outside
 # the config directory. Checks that the container runs and answers, that a
-# redeploy replaces the container but keeps the CA, and that it stops
-# cleanly.
+# redeploy replaces the container but keeps the CA, that a config the
+# daemon can't start or stay up with fails the deploy (the first leaving the
+# running container alone), and that it stops cleanly.
 #
 # Needs ssh to the host without a password prompt (keys), and sudo and
 # Docker there. deploy.sh builds the image on the host (minutes), unless
@@ -59,6 +60,31 @@ check "the container is replaced" test "$(container_id)" != "$id_before"
 check "and runs" running
 check "and answers" wait_for 30 answers
 check "the CA survives the new container" test "$(ca_hash)" = "$ca_before"
+
+# set_config SED: edit the deployed config on the host.
+set_config() { on_host "sed -i $(shq "$1") $REMOTE/config/stouter.json"; }
+
+# A config the daemon can't start with: refused before the running container
+# is touched.
+id_before=$(container_id)
+set_config 's/"nodeId": "deployed"/"nodeId": "not:a:name"/'
+if deploy -r; then fail "a config the daemon would refuse fails the deploy"; else pass "a config the daemon would refuse fails the deploy"; fi
+check "  saying why" grep -q "nodeId" "$WORK/deploy.log"
+check "  leaving the running container as it is" test "$(container_id)" = "$id_before"
+check "  still running" running
+
+# One that passes that check but can't run (its tlsDir is a file): the new
+# container keeps restarting, and the deploy fails instead of saying "Up".
+on_host "touch $REMOTE/config/not-a-dir"
+set_config "s/\"nodeId\": \"not:a:name\"/\"nodeId\": \"deployed\"/; s#\"tlsDir\": \"$TLS\"#\"tlsDir\": \"$REMOTE/config/not-a-dir\"#"
+if deploy -r; then fail "a daemon that can't stay up fails the deploy"; else pass "a daemon that can't stay up fails the deploy"; fi
+check "  saying so" grep -q "isn't staying up" "$WORK/deploy.log"
+
+# Put right, it deploys again.
+set_config "s#\"tlsDir\": \"$REMOTE/config/not-a-dir\"#\"tlsDir\": \"$TLS\"#"
+if deploy -r; then pass "put right, it deploys"; else fail "put right, it deploys"; cat "$WORK/deploy.log"; fi
+check "  and answers" wait_for 30 answers
+check "  with the same CA" test "$(ca_hash)" = "$ca_before"
 
 t0=$(date +%s)
 on_host "docker stop -t 25 $CONTAINER" > /dev/null

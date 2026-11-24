@@ -103,11 +103,12 @@ cluster" means one without `requireSignedConfig`.
   last history entry and bump/stamp a same-version edit like the poll does.
   Fixed: the poll compares the file with `same_settings` (a hand-added revocation or policy is taken and bumped); at startup, a file at the version the daemon last ran (its history's newest entry) but saying something else gets the next version and this node as author.
 
-- [ ] **9. `deploy.sh` reports success while the new daemon crash-loops.**
+- [x] **9. `deploy.sh` reports success while the new daemon crash-loops.**
   It stops and removes the running container (`deploy.sh:155-160`) before the
   new one has proven it starts, and `docker ps` right after `run -d` says "Up".
   Fix: run `stouter check` in the new image against the host's config before
   replacing the container; after starting, wait and fail on restarts.
+  Fixed: `deploy.sh` runs `stouter check --local` (new: only what stops the daemon from starting) with the new image before touching the running container, and stops if it fails; after starting, it waits 5 s (`DEPLOY_SETTLE_SECONDS`) and fails, with the container's last log lines, if it isn't running or has restarted. `deploy-host.sh` covers both.
 
 - [x] **10. `stouter check` passes configs the daemon refuses or misreads.**
   No `tlsDir` (what `init` writes), `bind` without a port, `knownNodes` entries

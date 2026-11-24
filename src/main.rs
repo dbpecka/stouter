@@ -54,7 +54,14 @@ enum Commands {
         remote: Option<String>,
     },
     /// Validate the configuration file
-    Check,
+    Check {
+        /// Only what would stop the daemon from starting: this node's own
+        /// settings, not the cluster's dynamic config (which the daemon
+        /// starts with, warning) or unknown settings. What `deploy.sh`
+        /// checks before replacing a running daemon.
+        #[arg(long)]
+        local: bool,
+    },
     /// Manage services
     Service {
         #[command(subcommand)]
@@ -549,9 +556,17 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         // check
         // -----------------------------------------------------------------
-        Some(Commands::Check) => {
-            match Config::check(&cli.config) {
-                Ok(_) => {
+        Some(Commands::Check { local }) => {
+            let result = if local {
+                Config::load(&cli.config).and_then(|cfg| cfg.validate_local())
+            } else {
+                Config::check(&cli.config).map(|_| ())
+            };
+            match result {
+                Ok(()) if local => {
+                    println!("{}: the daemon can start with it", cli.config);
+                }
+                Ok(()) => {
                     println!("{} is valid", cli.config);
                 }
                 Err(err) => {
