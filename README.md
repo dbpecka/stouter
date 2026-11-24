@@ -849,13 +849,28 @@ any node can relay a signed config but none can alter it.
   signed), and the signer's certificate is checked as of then: a config
   stays valid after its signer's certificate expires (a short
   `certLifetime` doesn't strand the cluster's config), while revocation is
-  checked as of now. An expired key can't sign anything new that counts:
-  dated now, its certificate isn't valid; dated back, the config is refused
-  by every node holding one signed more than an hour later. A config dated
-  over an hour ahead is refused. (The hour allows for the signing hosts'
-  clocks to differ.) `stouter status` shows who signed the current config
-  and when their certificate expires. Configs signed by older versions
-  carry no date and are checked as of now, until the next signed change.
+  checked as of now. A config dated over an hour ahead is refused. (The
+  hour allows for the signing hosts' clocks to differ.) Configs signed by
+  older versions carry no date and are checked as of now, until the next
+  signed change.
+- An expired key that wasn't revoked can still sign, dating the config back
+  into its certificate's life. So:
+  - Nodes refuse a config signed more than an hour before the one they
+    hold.
+  - A running node takes no config whose signer's certificate has expired;
+    only a node catching up in its first two minutes after starting does
+    (it can't tell one from the cluster's config, signed in time).
+  - A push must be signed by a certificate valid now.
+  - The CLI won't build a change on, or pull, a config that the signed one
+    in its own file says can't be the cluster's: older, another config at
+    the same version, or newer but from an expired signer (`config pull
+    --accept-expired-signer` takes one you know was signed in time).
+  - Every node warns while the config in force has an expired signer, and
+    `stouter status` says so: `stouter config push` signs it again (with
+    nothing changed), after which that key can sign nothing nodes take.
+  Revoke an admin certificate you retire: expiry alone leaves its key able
+  to sign configs that nodes starting up take until the config is signed
+  again.
 
 Turn it on everywhere at once, once every node runs a version that supports
 it. Older nodes don't relay the signature, and a node without the flag still

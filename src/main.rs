@@ -138,6 +138,11 @@ enum ConfigAction {
         /// host's daemon).
         #[arg(long)]
         remote: Option<String>,
+        /// Take a config newer than the one in this file even though the
+        /// certificate that signed it has expired (its key could have signed
+        /// it after the fact): only if you know it was signed in time.
+        #[arg(long)]
+        accept_expired_signer: bool,
     },
 }
 
@@ -1138,7 +1143,13 @@ async fn main() -> Result<()> {
                 } else {
                     Some(reported.clone())
                 };
-                if let Some(current) = known.as_ref().filter(|current| current.same_settings(&desired)) {
+                // Unless its signer's certificate has expired: then it is
+                // signed again, so that key can sign nothing more nodes take.
+                let resign = known.as_ref().and_then(signing::expired_signer);
+                if let Some((who, _)) = &resign {
+                    println!("{target}'s config was signed by '{who}', whose certificate has expired: signing it again");
+                }
+                if let Some(current) = known.as_ref().filter(|current| current.same_settings(&desired) && resign.is_none()) {
                     println!("{target} already has the config in {} (version {})", cli.config, current.version);
                     if let Some(aside) = config::kept_copies(&cli.config, "unapplied").first() {
                         println!(
@@ -1197,7 +1208,7 @@ async fn main() -> Result<()> {
         // config pull
         // -----------------------------------------------------------------
         Some(Commands::Config {
-            action: ConfigAction::Pull { remote },
+            action: ConfigAction::Pull { remote, accept_expired_signer },
         }) => {
             let mut cfg = Config::load(&cli.config)?;
             let target = remote.unwrap_or_else(|| cfg.local_target());
@@ -1217,7 +1228,7 @@ async fn main() -> Result<()> {
                 // signs next.
                 let verified = trusted_config(&daemon.dynamic_config, &cfg, &material, &tls_ctx)
                     .with_context(|| format!("won't write the config from {target} to {}", cli.config))?;
-                refuse_older_than_local(&verified, &target, &cfg, &material, &tls_ctx)?;
+                refuse_against_local(&verified, &target, &cfg, &material, &tls_ctx, accept_expired_signer)?;
                 verified
             };
             let version = current.version;
@@ -1733,26 +1744,68 @@ fn stale_push(current: &config::DynamicConfig, desired: &config::DynamicConfig, 
     })
 }
 
-/// Refuse `served` (a verified config from `target`) to make a change on, if
-/// it is older than the admin-signed config in the CLI's own file: a node
-/// behind the cluster, or lying about its config, would have the admin sign
-/// a change dropping whatever came since (a revocation, say), and at the
-/// cluster's version it could win the tie-break.
-fn refuse_older_than_local(
+/// Refuse `served` (a verified config from `target`) to make a change on,
+/// or to pull, where the admin-signed config in the CLI's own file says it
+/// can't be the cluster's: a node behind the cluster, or lying about its
+/// config, would otherwise have the admin sign over what came since (a
+/// revocation, say). Refused: an older version; another config at the same
+/// version; one nodes holding the local config would refuse (signed well
+/// before it, or too far ahead); and a newer one signed with a certificate
+/// that has expired since (its key may have signed it now, dated back),
+/// unless `accept_expired`. With no signed config in the file to compare
+/// with, only that last is said, as a warning.
+fn refuse_against_local(
     served: &config::DynamicConfig,
     target: &str,
     cfg: &Config,
     material: &pki::PkiMaterial,
     tls_ctx: &tls::TlsContext,
+    accept_expired: bool,
 ) -> Result<()> {
-    let Ok(local) = trusted_config(&cfg.dynamic_config, cfg, material, tls_ctx) else { return Ok(()) };
+    let expired = signing::expired_signer(served);
+    let Ok(local) = trusted_config(&cfg.dynamic_config, cfg, material, tls_ctx) else {
+        if let Some((who, until)) = &expired {
+            eprintln!(
+                "warning: the config on {target} (version {}) was signed by '{who}', whose certificate expired {}: \
+                 if that key may be in the wrong hands, check the config before changing it",
+                served.version,
+                history::format_time(until.saturating_mul(1000))
+            );
+        }
+        return Ok(());
+    };
+    let behind = "that node is behind the cluster (or not telling the truth); make the change through another node \
+                  (--remote)";
     if served.version < local.version {
         anyhow::bail!(
             "the config on {target} is version {}, older than the admin-signed version {} in this CLI's config file: \
-             that node is behind the cluster (or not telling the truth); make the change through another node \
-             (--remote)",
+             {behind}",
             served.version,
             local.version
+        );
+    }
+    if served.same_settings(&local) {
+        return Ok(());
+    }
+    if served.version == local.version {
+        anyhow::bail!(
+            "the config on {target} is another config at version {}, not the one in this CLI's config file: two \
+             changes were made at once, or {behind}",
+            served.version
+        );
+    }
+    if let Some(why) = signing::signed_too_early(served, &local).or_else(|| config::too_far_ahead(served, &local)) {
+        anyhow::bail!("the config on {target}: {why}");
+    }
+    if let Some((who, until)) = expired.filter(|_| !accept_expired) {
+        anyhow::bail!(
+            "the config on {target} (version {}) is newer than the one in this CLI's config file (version {}), and \
+             was signed by '{who}', whose certificate expired {}: that key may have signed it after the fact, dated \
+             back. If you know '{who}' signed it while the certificate was valid, take it with `stouter config pull \
+             --accept-expired-signer`",
+            served.version,
+            local.version,
+            history::format_time(until.saturating_mul(1000))
         );
     }
     Ok(())
@@ -1798,7 +1851,7 @@ async fn try_admin_rpc(
         }
         let current = trusted_config(&daemon.dynamic_config, cfg, &material, &tls_ctx)
             .with_context(|| format!("the config on {target}"))?;
-        refuse_older_than_local(&current, target, cfg, &material, &tls_ctx)?;
+        refuse_against_local(&current, target, cfg, &material, &tls_ctx, false)?;
         let mut next = current.clone();
         if let Err(e) = op.clone().apply(&mut next) {
             return Ok(Err(((&e).into(), e.to_string())));
@@ -1886,7 +1939,8 @@ fn describe_signature(dc: &config::DynamicConfig) -> Option<String> {
     let when = dc.signed_at.map(|at| format!(" at {}", history::format_time(at * 1000))).unwrap_or_default();
     let cert = match pki::validity(&der) {
         Some((_, until)) if until * 1000 < now_ms() as i64 => format!(
-            "; that certificate expired {} (what it signed while valid stays valid)",
+            "; that certificate expired {} (nodes holding this config keep it, but sign it again with \
+             `stouter config push` so that key can sign nothing more nodes take)",
             history::format_time(until.max(0) as u64 * 1000)
         ),
         Some((_, until)) => format!("; that certificate is valid until {}", history::format_time(until.max(0) as u64 * 1000)),
@@ -2598,6 +2652,44 @@ mod tests {
         // With no signed config of its own to compare with, as before.
         let laptop = Config { dynamic_config: config::DynamicConfig::default(), ..zoe.clone() };
         assert_eq!(try_admin_rpc(&behind, op(), &laptop, zoe_dir).await.unwrap(), Ok(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key whose certificate expired (and was never revoked) signs configs
+    /// dated back, inside its life; a node serves one to an admin. The admin's
+    /// CLI doesn't build on it (and so sign it over) where its own signed
+    /// config says it can't be the cluster's.
+    #[tokio::test]
+    async fn an_expired_admin_key_cant_get_the_cli_to_sign_its_config() {
+        let (dir, certs) = cluster_certs(&["alice", "m"]);
+        let issuer = pki::Issuer::load(dir.join("ca").to_str().unwrap(), ::time::Duration::seconds(2)).unwrap().unwrap();
+        let (bob_cert, bob_key) = issuer.issue_new("bob").unwrap();
+        let bob = signing::Signer::new(bob_cert, &bob_key).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let admins = vec!["alice".to_string(), "bob".to_string()];
+        let alice = signing::Signer::from_material(&certs["alice"]).unwrap();
+        let mut v10 = config::DynamicConfig { version: 10, ..api_on_port(3000) };
+        v10.revoked.nodes.push("x".into());
+        let v10 = signing::sign_at(&v10, &alice, now - 3 * 3600).unwrap();
+        let alice_cfg = Config { require_signed_config: true, admin_cns: admins, dynamic_config: v10, ..Config::default() };
+        let alice_dir = dir.join("alice");
+        let op = || AdminOp::PolicyAllow { service: "api".into(), nodes: vec!["n2".into()] };
+        let forge = |version: u64| {
+            let dc = config::DynamicConfig { version, changed_by: "bob".into(), ..api_on_port(6666) };
+            signing::sign_at(&dc, &bob, now - 2 * 3600).unwrap()
+        };
+
+        // Another config at alice's version: refused.
+        let (lying, pushed) = config_server(&certs["m"], forge(10)).await;
+        let err = try_admin_rpc(&lying, op(), &alice_cfg, alice_dir.to_str()).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("another config at version 10"), "{err:#}");
+        // A newer one, which every other check passes: refused for its
+        // expired signer.
+        let (lying_newer, pushed_newer) = config_server(&certs["m"], forge(11)).await;
+        let err = try_admin_rpc(&lying_newer, op(), &alice_cfg, alice_dir.to_str()).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("whose certificate expired"), "{err:#}");
+        assert!(pushed.lock().unwrap().is_empty() && pushed_newer.lock().unwrap().is_empty(), "nothing signed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

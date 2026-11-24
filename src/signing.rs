@@ -206,7 +206,7 @@ pub fn verify(dc: &DynamicConfig, tls: &TlsContext, admin_cns: &[String]) -> Res
         Some(at) if at > now_secs() + SIGNING_CLOCK_SLACK => bail!(
             "config version {} says it was signed at {}, in the future (is the signing host's clock right?)",
             dc.version,
-            crate::history::format_time(at * 1000)
+            crate::history::format_time(at.saturating_mul(1000))
         ),
         Some(at) => rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(at)),
         None => rustls::pki_types::UnixTime::now(),
@@ -243,7 +243,48 @@ pub fn admit(state: &SharedState, incoming: DynamicConfig, held: &DynamicConfig)
     if let Some(why) = signed_too_early(&config, held).or_else(|| crate::config::too_far_ahead(&config, held)) {
         bail!("{why}");
     }
+    // Checked as of when it says it was signed, the signer's certificate
+    // was valid; if it has expired since, its key may have signed this
+    // only now, dated back. A node catching up after it starts takes it
+    // (it is likely the cluster's config, signed while that certificate
+    // was valid); a running node is past that, and takes only configs
+    // whose signer is still valid.
+    if let Some((who, until)) = expired_signer(&config) {
+        if !state.catching_up() {
+            bail!("{}", expired_signer_refusal(&config, &who, until));
+        }
+        warn!(
+            "taking config version {} signed by '{who}', whose certificate expired {}, as this node is catching up \
+             after starting; have an admin with a current certificate sign the cluster's config again",
+            config.version,
+            crate::history::format_time(until.saturating_mul(1000))
+        );
+    }
     Ok(config)
+}
+
+/// Who signed `dc` (their certificate's CN) and when that certificate
+/// expired (Unix seconds), if it has expired by now. Taken from the
+/// signature as it stands: meant for a config already verified.
+pub fn expired_signer(dc: &DynamicConfig) -> Option<(String, u64)> {
+    let sig = dc.signature.as_ref()?;
+    let der = unhex(&sig.signer_cert).ok()?;
+    let (_, until) = crate::pki::validity(&der)?;
+    let until = u64::try_from(until).unwrap_or(0);
+    (until < now_secs()).then(|| (crate::tls::cert_cn(&der.into()).unwrap_or_else(|| "?".into()), until))
+}
+
+/// Why a running node won't take `config`, signed by `who` with a
+/// certificate that expired at `until`.
+pub fn expired_signer_refusal(config: &DynamicConfig, who: &str, until: u64) -> String {
+    format!(
+        "config version {} was signed by '{who}', whose certificate expired {}: once it has caught up after \
+         starting, a node takes no config signed with an expired certificate, as that key could still sign \
+         configs dated back; have an admin with a current certificate sign the cluster's config again \
+         (`stouter config push`)",
+        config.version,
+        crate::history::format_time(until.saturating_mul(1000))
+    )
 }
 
 /// Why `incoming` mustn't replace `held`, if it says it was signed more than

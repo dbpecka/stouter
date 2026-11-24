@@ -41,6 +41,10 @@ pub const RECONNECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// A relay counts as one this node uses while it holds a reverse
 /// connection there, or registered one this recently (connections are
 /// consumed by tunnels and replaced, so the count dips during bursts).
+/// How long after starting a node counts as catching up with the cluster:
+/// a dozen gossip rounds.
+pub const CATCH_UP: Duration = Duration::from_secs(120);
+
 /// How recently a NAT'd node must have registered a reverse connection here
 /// for a tunnel to it to wait for one (see `SharedState::relayed_here_lately`).
 /// Its workers register a new one each time one is used, and keep them
@@ -472,6 +476,12 @@ pub struct SharedState {
     pub(crate) peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
     /// When each NAT'd node last registered a reverse connection here.
     relayed_here: Mutex<HashMap<String, std::time::Instant>>,
+    /// Until when this node counts as catching up after starting (see
+    /// [`SharedState::catching_up`]).
+    pub(crate) catch_up_until: Mutex<std::time::Instant>,
+    /// The config version last warned about for a signer whose certificate
+    /// expired (see `renew::warn_if_config_signer_expired`).
+    pub(crate) warned_expired_signer: Mutex<Option<u64>>,
     /// Peer addresses known to speak delta sync (their replies say so), so
     /// syncs to them can be compact, with the (version, hash) of the config
     /// each had as of its last reply: one that's behind gets ours.
@@ -566,6 +576,8 @@ impl SharedState {
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
             relayed_here: Mutex::new(HashMap::new()),
+            catch_up_until: Mutex::new(std::time::Instant::now() + CATCH_UP),
+            warned_expired_signer: Mutex::new(None),
             delta_peers: Mutex::new(HashMap::new()),
             own_beat: Mutex::new(None),
             leaving: std::sync::atomic::AtomicBool::new(false),
@@ -880,6 +892,13 @@ impl SharedState {
         }
         *count += 1;
         Some(PeerSlot { state: Arc::clone(self), key })
+    }
+
+    /// Whether this node is still catching up after starting: in its first
+    /// [`CATCH_UP`]. Only then does it take a config signed by a
+    /// certificate that has since expired (see `signing::admit`).
+    pub fn catching_up(&self) -> bool {
+        std::time::Instant::now() < *self.catch_up_until.lock().unwrap()
     }
 
     /// Note that NAT'd node `node` (as its certificate says) just registered

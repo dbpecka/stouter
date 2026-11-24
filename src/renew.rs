@@ -87,6 +87,7 @@ pub async fn run_renewal_loop(state: Arc<SharedState>) {
         if let Err(e) = take_up_copied_cert(&state) {
             warn!("not using the certificate in tlsDir: {e:#}");
         }
+        warn_if_config_signer_expired(&state).await;
         let Some(tls) = state.tls.as_ref() else { return };
         let cert = tls.own_cert();
         if !renewal_due(&cert, now_secs()) {
@@ -116,6 +117,28 @@ pub async fn run_renewal_loop(state: Arc<SharedState>) {
 
 /// How often to check: a tenth of the certificate's lifetime, between 5
 /// seconds and an hour.
+/// Warn (once per config version) when the admin certificate that signed
+/// the config in force has expired: until an admin with a current one signs
+/// the config again, nodes starting up would take a config that expired key
+/// signed dated back.
+async fn warn_if_config_signer_expired(state: &SharedState) {
+    if !state.config.require_signed_config {
+        return;
+    }
+    let dc = state.dynamic_config.read().await.clone();
+    let Some((who, until)) = crate::signing::expired_signer(&dc) else { return };
+    if state.warned_expired_signer.lock().unwrap().replace(dc.version) == Some(dc.version) {
+        return;
+    }
+    warn!(
+        "the config in force (version {}) was signed by '{who}', whose certificate expired {}: have an admin with a \
+         current certificate sign it again (`stouter config push`), and revoke '{who}' if that key may be in the \
+         wrong hands. Until then, nodes starting up would take a config that key signed dated back.",
+        dc.version,
+        crate::history::format_time(until.saturating_mul(1000))
+    );
+}
+
 fn check_interval(cert: &CertificateDer<'_>) -> Duration {
     let lifetime = nominal_lifetime(cert).unwrap_or(3600);
     Duration::from_secs((lifetime / 10).clamp(5, 3600) as u64)

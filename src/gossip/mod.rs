@@ -457,6 +457,11 @@ fn accept_push(
         .ok_or_else(|| MutateErr::Unauthorized("no TLS context to check signatures with".into()))?;
     let (verified, signer) = crate::signing::verify(&pushed, tls, &state.config.admin_cns)
         .map_err(|e| MutateErr::Unauthorized(format!("{e:#}")))?;
+    // A push is a change made now: its signer's certificate must be valid
+    // now, not just as of the date the config claims.
+    if let Some((who, until)) = crate::signing::expired_signer(&verified) {
+        return Err(MutateErr::Unauthorized(crate::signing::expired_signer_refusal(&verified, &who, until)));
+    }
     if let Some(why) =
         crate::signing::signed_too_early(&verified, current).or_else(|| crate::config::too_far_ahead(&verified, current))
     {
@@ -2469,10 +2474,23 @@ mod tests {
         apply_message(&n2, Message::ConfigUpdate { config: relayed }, None).await;
         assert_eq!(n2.dynamic_config.read().await.version, 2, "n2 takes the cluster's config");
 
-        // But the expired key signs nothing new that counts.
+        // But the expired key signs nothing new that counts: dated now, its
+        // certificate isn't valid...
         let v3 = signed_by(&admin_short, &DynamicConfig { version: 3, changed_by: "admin".into(), ..named_services(&["api"]) });
         apply_message(&n2, Message::ConfigUpdate { config: v3 }, None).await;
         assert_eq!(n2.dynamic_config.read().await.version, 2);
+        // ...and dated back into its life, a node that has caught up after
+        // starting refuses it, as does a push.
+        let signer = crate::signing::Signer::from_material(&admin_short).unwrap();
+        let signed_v2_at = n2.dynamic_config.read().await.signed_at.unwrap();
+        let back = DynamicConfig { version: 3, changed_by: "admin".into(), ..named_services(&["api", "backdoor"]) };
+        let back = crate::signing::sign_at(&back, &signer, signed_v2_at).unwrap();
+        *n2.catch_up_until.lock().unwrap() = std::time::Instant::now();
+        apply_message(&n2, Message::ConfigUpdate { config: back.clone() }, None).await;
+        assert_eq!(n2.dynamic_config.read().await.version, 2, "a running node refuses it");
+        let current = n2.dynamic_config.read().await.clone();
+        let pushed = accept_push(&n2, &current, back.clone(), 2).expect_err("refused");
+        assert!(matches!(pushed, crate::config::MutateErr::Unauthorized(ref why) if why.contains("expired")), "{pushed:?}");
     }
 
     #[tokio::test]
