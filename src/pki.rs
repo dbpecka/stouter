@@ -37,13 +37,18 @@ pub fn parse_lifetime(text: &str) -> std::result::Result<time::Duration, String>
     let text = text.trim();
     let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len()));
     let n: i64 = number.parse().map_err(|_| format!("certLifetime '{text}' is not a number and a unit (30d, 12h, 45m, 90s)"))?;
-    let lifetime = match unit {
-        "d" => time::Duration::days(n),
-        "h" => time::Duration::hours(n),
-        "m" => time::Duration::minutes(n),
-        "s" => time::Duration::seconds(n),
+    let unit_secs: i64 = match unit {
+        "d" => 86_400,
+        "h" => 3_600,
+        "m" => 60,
+        "s" => 1,
         _ => return Err(format!("certLifetime '{text}' needs a unit: d, h, m or s (as in 30d)")),
     };
+    // Multiplied with a check: `time::Duration::days(n)` panics on overflow.
+    let lifetime = n
+        .checked_mul(unit_secs)
+        .map(time::Duration::seconds)
+        .ok_or_else(|| format!("certLifetime '{text}' is longer than the CA lasts (20 years)"))?;
     if lifetime < MIN_CERT_LIFETIME {
         return Err(format!("certLifetime '{text}' is shorter than a minute"));
     }
@@ -505,6 +510,14 @@ fn pem_to_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_huge_cert_lifetime_is_refused_not_a_crash() {
+        for huge in ["999999999999999d", "9223372036854775807h", "9223372036854775807s"] {
+            assert!(parse_lifetime(huge).is_err(), "{huge}");
+        }
+        assert_eq!(parse_lifetime("30d").unwrap(), time::Duration::days(30));
+    }
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
