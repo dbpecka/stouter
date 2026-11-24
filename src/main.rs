@@ -1705,7 +1705,15 @@ fn build_cli_tls(cfg: &Config, cert_dir: Option<&str>) -> Result<tls::TlsContext
 /// lying daemon, would pass, and the admin's change on top of it be signed.
 fn cli_tls_context(cfg: &Config, material: &pki::PkiMaterial) -> Result<tls::TlsContext> {
     let tls_ctx = tls::TlsContext::new(material)?;
-    tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
+    // The local config's revocations are its own cluster's: with
+    // certificates from another cluster's CA (`service move`, or --remote
+    // with another cluster's --cert-dir), its names would wrongly refuse
+    // that cluster's nodes and admins. Applied unless the local tlsDir's
+    // CA is known to be another one.
+    let local_ca = cfg.tls_dir.as_deref().and_then(|dir| pki::read_cert(&format!("{dir}/ca.crt")).ok());
+    if local_ca.is_none_or(|ca| ca == material.ca_cert_der) {
+        tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
+    }
     Ok(tls_ctx)
 }
 
@@ -2607,6 +2615,23 @@ mod tests {
         // --node says which, and nothing is asked.
         assert_eq!(owner_node(Some("n1".into()), Some(&lying), &cfg, admin_dir).await.unwrap(), "n1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config's revocations are its own cluster's: a CLI using another
+    /// cluster's certificates (another CA) doesn't apply them there.
+    #[test]
+    fn revocations_stay_with_their_own_cluster() {
+        let (here, certs) = cluster_certs(&["alice"]);
+        let (there, other) = cluster_certs(&["carol"]);
+        let mut cfg = Config { tls_dir: Some(here.join("ca").to_str().unwrap().into()), ..Config::default() };
+        cfg.dynamic_config.revoked.nodes.push("bob".into());
+        let revoked = |ctx: &tls::TlsContext| ctx.revocations().is_revoked(Some("bob"), &[0; 32]);
+        assert!(revoked(&cli_tls_context(&cfg, &certs["alice"]).unwrap()), "this cluster");
+        assert!(!revoked(&cli_tls_context(&cfg, &other["carol"]).unwrap()), "another cluster");
+        // Not knowing this cluster's CA, they apply (refusing is the safe side).
+        let unknown = Config { tls_dir: None, ..cfg.clone() };
+        assert!(revoked(&cli_tls_context(&unknown, &other["carol"]).unwrap()));
+        let _ = (std::fs::remove_dir_all(&here), std::fs::remove_dir_all(&there));
     }
 
     /// An admin's CLI knows what its config revokes: a config signed with a
