@@ -1273,6 +1273,21 @@ fn log_adoption(current: &crate::config::DynamicConfig, incoming: &crate::config
             "{what}: two different configs at version {}; keeping the one from '{}' over '{}' (the same choice on every node)",
             incoming.version, incoming.changed_by, current.changed_by
         );
+        // A tie drops what the other config said: worth saying loudly when
+        // that is a revocation, which nobody meant to undo.
+        let dropped: Vec<&str> = (current.revoked.nodes.iter().filter(|n| !incoming.revoked.nodes.contains(n)))
+            .chain(current.revoked.certs.iter().filter(|c| !incoming.revoked.certs.contains(c)))
+            .map(String::as_str)
+            .collect();
+        if !dropped.is_empty() {
+            warn!(
+                "{what}: the config dropped at version {} revoked {} too, which the one kept doesn't: revoke {} again \
+                 if that should stand",
+                incoming.version,
+                dropped.join(", "),
+                if dropped.len() == 1 { "it" } else { "them" }
+            );
+        }
     } else {
         info!("{what}: version {} -> {}", current.version, incoming.version);
     }
@@ -2494,6 +2509,40 @@ mod tests {
         let last = DynamicConfig { version: u64::MAX, changed_by: "admin".into(), ..named_services(&[]) };
         assert_eq!(rpc(push(signed_by(&c.admin, &last), 2)).await, Err(AdminErrCode::Validation));
         assert_eq!(c.node.dynamic_config.read().await.version, 2);
+    }
+
+    /// Two admins sign different configs at one version, hours apart (say,
+    /// on either side of a partition). Every node ends up with the same one,
+    /// whichever it had first: the later, as a node holding it refuses the
+    /// earlier as signed too early.
+    #[tokio::test]
+    async fn a_tie_between_configs_signed_hours_apart_converges() {
+        let c = signed_cluster();
+        let path2 = c.dir.join("n2.json").to_str().unwrap().to_string();
+        let cfg2 = Config {
+            node_id: "n2".into(),
+            admin_cns: vec!["admin".into()],
+            require_signed_config: true,
+            dynamic_config: DynamicConfig { version: 1, ..named_services(&["api"]) },
+            ..Config::default()
+        };
+        cfg2.save(&path2).unwrap();
+        let n2 = crate::state::test_support::tls_state_with(&c.dir, cfg2, path2);
+        let signer = crate::signing::Signer::from_material(&c.admin).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut x = DynamicConfig { version: 2, changed_by: "admin".into(), ..named_services(&["api"]) };
+        x.revoked.nodes.push("mallory".into());
+        let x = crate::signing::sign_at(&x, &signer, now - 7200).unwrap();
+        let y = DynamicConfig { version: 2, changed_by: "admin".into(), ..named_services(&["api", "web"]) };
+        let y = crate::signing::sign_at(&y, &signer, now).unwrap();
+        // n1 got y first, n2 got x first; then each hears the other.
+        apply_message(&c.node, Message::ConfigUpdate { config: y.clone() }, None).await;
+        apply_message(&n2, Message::ConfigUpdate { config: x.clone() }, None).await;
+        apply_message(&c.node, Message::ConfigUpdate { config: x.clone() }, None).await;
+        apply_message(&n2, Message::ConfigUpdate { config: y.clone() }, None).await;
+        let (a, b) = (c.node.dynamic_config.read().await.clone(), n2.dynamic_config.read().await.clone());
+        assert_eq!(a, b, "one config at version 2 everywhere");
+        assert_eq!(service_names(&a), ["api", "web"], "the later-signed one");
     }
 
     #[tokio::test(start_paused = true)]

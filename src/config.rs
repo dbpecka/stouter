@@ -452,6 +452,13 @@ impl DynamicConfig {
     /// config to an admin) can't settle the tie by dropping it, whoever made
     /// it: of two configs, the one revoking more wins, on every node.
     ///
+    /// Before all that, two configs signed more than
+    /// [`crate::signing::SIGNING_CLOCK_SLACK`] apart are settled by when:
+    /// the later wins. Nodes refuse a config signed that long before the one
+    /// they hold (see [`crate::signing::signed_too_early`]), so if the
+    /// earlier one won, the nodes holding the later would never take it and
+    /// the cluster would stay split.
+    ///
     /// Without the tie-break, two nodes changing the config at once both
     /// make version N+1, each node keeps whichever arrived first, and the
     /// cluster stays split until the next change. Comparing `changedBy`
@@ -467,6 +474,11 @@ impl DynamicConfig {
         }
         if self == current {
             return false;
+        }
+        if let (Some(ours), Some(theirs)) = (self.signed_at, current.signed_at) {
+            if ours.abs_diff(theirs) > crate::signing::SIGNING_CLOCK_SLACK {
+                return ours > theirs;
+            }
         }
         let key = |dc: &DynamicConfig| {
             let bytes = serde_json::to_vec(dc).unwrap_or_default();
@@ -2160,6 +2172,26 @@ mod tests {
         // Equal revocations: changedBy, as before.
         other.revoked.certs.push("ab".into());
         assert!(other.supersedes(&revoking) && !revoking.supersedes(&other));
+    }
+
+    /// Signed more than the clock slack apart, the later-signed config wins
+    /// a tie, whatever else: nodes holding it would refuse the earlier one
+    /// as signed too early, so it winning would leave the cluster split.
+    #[test]
+    fn a_tie_between_configs_signed_hours_apart_goes_to_the_later() {
+        let at = |signed_at: u64, revoke: bool| {
+            let mut dc = DynamicConfig { version: 10, signed_at: Some(signed_at), changed_by: "a".into(), ..DynamicConfig::default() };
+            if revoke {
+                dc.revoked.nodes.push("x".into());
+            }
+            dc
+        };
+        let slack = crate::signing::SIGNING_CLOCK_SLACK;
+        let (earlier, later) = (at(1_000_000, true), at(1_000_000 + slack + 1, false));
+        assert!(later.supersedes(&earlier) && !earlier.supersedes(&later));
+        // Within the slack, revocations first, as before.
+        let (earlier, later) = (at(1_000_000, true), at(1_000_000 + slack, false));
+        assert!(earlier.supersedes(&later) && !later.supersedes(&earlier));
     }
 
     #[test]

@@ -161,7 +161,7 @@ pub fn verify_tunnel_request(
 /// How far apart the clocks of the hosts signing configs may be: a config
 /// may claim to be signed up to this far in the future, or this far before
 /// the config a node holds.
-const SIGNING_CLOCK_SLACK: u64 = 3600;
+pub const SIGNING_CLOCK_SLACK: u64 = 3600;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -173,7 +173,7 @@ pub fn sign(dc: &DynamicConfig, signer: &Signer) -> Result<DynamicConfig> {
 }
 
 /// `dc`, signed by `signer`, saying it was signed at `at` (Unix seconds).
-fn sign_at(dc: &DynamicConfig, signer: &Signer, at: u64) -> Result<DynamicConfig> {
+pub(crate) fn sign_at(dc: &DynamicConfig, signer: &Signer, at: u64) -> Result<DynamicConfig> {
     let mut signed = dc.clone();
     signed.signature = None;
     signed.signed_at = Some(at);

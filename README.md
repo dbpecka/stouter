@@ -522,9 +522,13 @@ On receiving a config:
   nodes) are settled the same way everywhere, so the cluster can't stay
   split: the one revoking more certificates wins (so a change made without
   having seen a revocation can't undo it), then by the `changedBy` node that
-  made each, then by content. Nodes running an earlier version settle it
-  without counting revocations, so in a mixed cluster such a tie can stay
-  split until the next change. Between one
+  made each, then by content. Two signed configs signed more than an hour
+  apart (on either side of a partition, say) are settled by when instead:
+  the later wins, as nodes refuse a config signed that long before the one
+  they hold. Every node that drops a revocation this way logs a warning
+  naming it. Nodes running an earlier version settle ties without either
+  rule, so in a mixed cluster such a tie can stay split until the next
+  change. Between one
   change and a copy of it relayed by an older node that dropped fields it
   doesn't know (a signature, a newer setting), the fuller copy wins, so a
   rolling upgrade doesn't erase them.
