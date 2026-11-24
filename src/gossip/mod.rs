@@ -666,6 +666,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             // The change entered the cluster here, unsigned.
             new_dc.changed_by = state.config.node_id.clone();
             new_dc.signature = None;
+            new_dc.signed_at = None;
             taken(&state, &file_text);
             *dc = new_dc.clone();
             persist_state_with(&state, &dc);

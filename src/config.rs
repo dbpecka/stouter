@@ -475,7 +475,8 @@ impl DynamicConfig {
         if self == current {
             return false;
         }
-        if let (Some(ours), Some(theirs)) = (self.signed_at, current.signed_at) {
+        let signed_at = |dc: &DynamicConfig| dc.signature.as_ref().and(dc.signed_at);
+        if let (Some(ours), Some(theirs)) = (signed_at(self), signed_at(current)) {
             if ours.abs_diff(theirs) > crate::signing::SIGNING_CLOCK_SLACK {
                 return ours > theirs;
             }
@@ -2179,8 +2180,15 @@ mod tests {
     /// as signed too early, so it winning would leave the cluster split.
     #[test]
     fn a_tie_between_configs_signed_hours_apart_goes_to_the_later() {
+        let signature = ConfigSignature { config_json: String::new(), signer_cert: String::new(), signature: String::new() };
         let at = |signed_at: u64, revoke: bool| {
-            let mut dc = DynamicConfig { version: 10, signed_at: Some(signed_at), changed_by: "a".into(), ..DynamicConfig::default() };
+            let mut dc = DynamicConfig {
+                version: 10,
+                signed_at: Some(signed_at),
+                signature: Some(signature.clone()),
+                changed_by: "a".into(),
+                ..DynamicConfig::default()
+            };
             if revoke {
                 dc.revoked.nodes.push("x".into());
             }
@@ -2191,6 +2199,10 @@ mod tests {
         assert!(later.supersedes(&earlier) && !earlier.supersedes(&later));
         // Within the slack, revocations first, as before.
         let (earlier, later) = (at(1_000_000, true), at(1_000_000 + slack, false));
+        assert!(earlier.supersedes(&later) && !later.supersedes(&earlier));
+        // Only signed configs: an unsigned one's signedAt is a leftover.
+        let unsigned = |dc: DynamicConfig| DynamicConfig { signature: None, ..dc };
+        let (earlier, later) = (unsigned(at(1_000_000, true)), unsigned(at(1_000_000 + slack + 1, false)));
         assert!(earlier.supersedes(&later) && !later.supersedes(&earlier));
     }
 
