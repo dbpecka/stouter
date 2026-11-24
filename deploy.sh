@@ -23,7 +23,7 @@ for arg in "$@"; do
     *)         ARGS+=("$arg") ;;
   esac
 done
-set -- "${ARGS[@]}"
+set -- ${ARGS[@]+"${ARGS[@]}"}  # (bash 3.2 calls an empty "${ARGS[@]}" unbound)
 
 CONFIG_FILE=""
 RESTART_ONLY=false
@@ -39,7 +39,8 @@ while getopts "c:n:rvh" opt; do
 done
 shift $((OPTIND - 1))
 
-REMOTE_HOST="${1:?$(usage)}"
+[[ $# -ge 1 ]] || usage
+REMOTE_HOST="$1"
 
 # The cluster name becomes part of remote paths (and of `rm -rf`) and the
 # container's name: letters, digits, '-' and '_' only. "eu west" would
