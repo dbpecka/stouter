@@ -555,6 +555,9 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             // waiting there.
             let taken = |state: &SharedState, file_dc: &crate::config::DynamicConfig| {
                 *state.file_config.lock().unwrap() = Some(config_text(file_dc));
+                for unknown in crate::config::Config::unknown_nested_settings_in(&state.config_path) {
+                    warn!("{}: {unknown}", state.config_path);
+                }
             };
 
             if state.config.require_signed_config {

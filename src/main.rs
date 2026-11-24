@@ -430,7 +430,7 @@ async fn main() -> Result<()> {
             // version may fix them, and a node that won't start over one
             // can't receive it.
             cfg.validate_local().map_err(|e| anyhow::anyhow!("{}: {e:#}", cli.config))?;
-            for unknown in cfg.unknown_settings() {
+            for unknown in cfg.unknown_settings().into_iter().chain(Config::unknown_nested_settings_in(&cli.config)) {
                 tracing::warn!("{}: {unknown}", cli.config);
             }
             for problem in cfg.config_problems() {
@@ -515,12 +515,20 @@ async fn main() -> Result<()> {
             if cfg.node_id.is_empty() {
                 cfg.node_id = config::get_hostname();
             }
+            // Certificates beside the config, wherever the daemon runs from.
+            if cfg.tls_dir.is_none() {
+                let config_path = std::path::absolute(&cli.config).unwrap_or_else(|_| cli.config.clone().into());
+                let dir = config_path.parent().unwrap_or(std::path::Path::new(".")).join("tls");
+                cfg.tls_dir = Some(dir.to_string_lossy().into_owned());
+            }
 
             cfg.save(&cli.config)?;
 
             println!(
-                "Node initialized. node_id={}, config saved to {}",
-                cfg.node_id, cli.config
+                "Node initialized. node_id={}, tlsDir={}, config saved to {}",
+                cfg.node_id,
+                cfg.tls_dir.as_deref().unwrap_or_default(),
+                cli.config
             );
 
             // Announce our presence to any already-known peers.

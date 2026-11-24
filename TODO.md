@@ -107,7 +107,7 @@ cluster" means one without `requireSignedConfig`.
   Fix: run `stouter check` in the new image against the host's config before
   replacing the container; after starting, wait and fail on restarts.
 
-- [ ] **10. `stouter check` passes configs the daemon refuses or misreads.**
+- [x] **10. `stouter check` passes configs the daemon refuses or misreads.**
   No `tlsDir` (what `init` writes), `bind` without a port, `knownNodes` entries
   without a port (`src/config.rs:1181-1250`, `src/main.rs:452-454`). Unknown
   keys are only caught at the top level (`src/config.rs:1080`): a misspelled
@@ -116,6 +116,7 @@ cluster" means one without `requireSignedConfig`.
   and dropped when the file is rewritten, contrary to README:76-81.
   Fix: move those checks into `validate_local`; have `init` write a `tlsDir`;
   catch and keep unknown keys in the nested structs too (or correct the README).
+  Fixed: `validate_local` (daemon startup and `check`) requires `tlsDir`, and a port on `bind` (unless `outboundOnly`), `advertiseAddr` and each `knownNodes` entry; `init` writes a `tlsDir` (`tls` beside the config). Unknown keys inside sections are found (against each type's derived field names) and fail `check`, and are warned about at startup and when a hand edit is taken; they are still dropped on rewrite, as the README now says.
 
 - [x] **11. The CLI's log lines go to stdout, with colour codes.**
   `src/main.rs:420-425`. Breaks machine-readable output (e.g. the JSON from

@@ -1292,7 +1292,37 @@ impl Config {
             ));
         }
 
+        if self.tls_dir.is_none() {
+            return Err(anyhow!(
+                "`tlsDir` is not set: nodes talk only over mutual TLS, with the certificates there (`stouter init` sets it)"
+            ));
+        }
+        // Each is dialled or bound as is: without a port, every attempt
+        // fails, and only at run time.
+        if !self.outbound_only && !is_host_port(&self.bind) {
+            return Err(anyhow!("`bind` '{}' needs a port, like 0.0.0.0:8080", self.bind));
+        }
+        if let Some(addr) = self.advertise_addr.as_ref().filter(|addr| !is_host_port(addr)) {
+            return Err(anyhow!("`advertiseAddr` '{addr}' needs a port, like 203.0.113.7:8080"));
+        }
+        if let Some(addr) = self.known_nodes.iter().find(|addr| !is_host_port(addr)) {
+            return Err(anyhow!("`knownNodes` entry '{addr}' needs a port, like 10.0.0.2:8080"));
+        }
+
         Ok(())
+    }
+
+    /// Settings this version doesn't know inside the sections of the config
+    /// file at `path` (`dynamicConfig` and its services, routes and
+    /// policies, `subscribeFilter`, `tracing`), as messages. Unlike those at
+    /// the top level (see [`Config::unknown`]), these are dropped when the
+    /// file is rewritten. Empty if the file can't be read.
+    pub fn unknown_nested_settings_in(path: &str) -> Vec<String> {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map(|raw| unknown_nested_settings(&raw))
+            .unwrap_or_default()
     }
 
     /// Settings in the file this version doesn't know (see [`Config::unknown`]),
@@ -1342,6 +1372,10 @@ impl Config {
         let config: Self = serde_json::from_str(&data)
             .with_context(|| format!("invalid JSON in '{path}'"))?;
         config.validate()?;
+        let raw: serde_json::Value = serde_json::from_str(&data)?;
+        if let Some(problem) = unknown_nested_settings(&raw).into_iter().next() {
+            return Err(anyhow!(problem));
+        }
         Ok(config)
     }
 
@@ -1518,6 +1552,111 @@ pub fn get_hostname() -> String {
         .unwrap_or_else(|| String::from("unknown"))
 }
 
+/// Whether `addr` is `host:port` (a name or an IPv4 address, or an IPv6
+/// address in brackets), as binding and dialling it need.
+fn is_host_port(addr: &str) -> bool {
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    addr.rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok())
+}
+
+/// Settings `raw` (a config file's JSON) holds inside its sections that this
+/// version doesn't know, as messages naming where they are. A misspelled
+/// one (a service's `maxConection`, `tracing.sampleRation`) would otherwise
+/// be ignored without a word, and dropped when the file is rewritten.
+pub fn unknown_nested_settings(raw: &serde_json::Value) -> Vec<String> {
+    let mut found = Vec::new();
+    if let Some(dc) = raw.get("dynamicConfig") {
+        unknown_in_dynamic_config(dc, "dynamicConfig", &mut found);
+    }
+    if let Some(filter) = raw.get("subscribeFilter") {
+        unknown_keys::<SubscribeFilter>(filter, "subscribeFilter", &mut found);
+    }
+    if let Some(tracing) = raw.get("tracing") {
+        unknown_keys::<TracingConfig>(tracing, "tracing", &mut found);
+    }
+    found
+        .into_iter()
+        .map(|at| format!("unknown setting '{at}' (a typo? it is ignored, and dropped when the file is rewritten)"))
+        .collect()
+}
+
+fn unknown_in_dynamic_config(dc: &serde_json::Value, at: &str, found: &mut Vec<String>) {
+    let Some(dc) = unknown_keys::<DynamicConfig>(dc, at, found) else { return };
+    let each = |key: &str| dc.get(key).and_then(|v| v.as_array()).into_iter().flatten().enumerate();
+    for (i, group) in each("serviceGroups") {
+        let at = format!("{at}.serviceGroups[{i}]");
+        if let Some(group) = unknown_keys::<ServiceGroup>(group, &at, found) {
+            for (j, service) in group.get("services").and_then(|v| v.as_array()).into_iter().flatten().enumerate() {
+                unknown_keys::<Service>(service, &format!("{at}.services[{j}]"), found);
+            }
+        }
+    }
+    for (i, route) in each("routes") {
+        let at = format!("{at}.routes[{i}]");
+        if let Some(route) = unknown_keys::<Route>(route, &at, found) {
+            if let Some(matches) = route.get("match") {
+                unknown_keys::<RouteMatch>(matches, &format!("{at}.match"), found);
+            }
+            for (j, backend) in route.get("backends").and_then(|v| v.as_array()).into_iter().flatten().enumerate() {
+                unknown_keys::<RouteBackend>(backend, &format!("{at}.backends[{j}]"), found);
+            }
+        }
+    }
+    for (i, policy) in each("policies") {
+        unknown_keys::<Policy>(policy, &format!("{at}.policies[{i}]"), found);
+    }
+    if let Some(revoked) = dc.get("revoked") {
+        unknown_keys::<Revoked>(revoked, &format!("{at}.revoked"), found);
+    }
+    if let Some(signature) = dc.get("signature") {
+        unknown_keys::<ConfigSignature>(signature, &format!("{at}.signature"), found);
+    }
+}
+
+/// Note in `found` each key of the object `value` (at `at`) that `T` doesn't
+/// read. Returns the object, to look inside.
+fn unknown_keys<'v, T: serde::de::DeserializeOwned>(
+    value: &'v serde_json::Value,
+    at: &str,
+    found: &mut Vec<String>,
+) -> Option<&'v serde_json::Map<String, serde_json::Value>> {
+    let object = value.as_object()?;
+    let known = field_names::<T>();
+    found.extend(object.keys().filter(|key| !known.contains(&key.as_str())).map(|key| format!("{at}.{key}")));
+    Some(object)
+}
+
+/// The names a struct's derived `Deserialize` reads, as they appear in the
+/// file (renamed). Taken from the derive itself, so they never fall behind.
+fn field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    struct Fields<'a>(&'a mut &'static [&'static str]);
+    impl<'de> serde::Deserializer<'de> for Fields<'_> {
+        type Error = serde::de::value::Error;
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(serde::de::Error::custom("only the field names were wanted"))
+        }
+        fn deserialize_any<V: serde::de::Visitor<'de>>(self, _visitor: V) -> std::result::Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("not a struct"))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option unit
+            unit_struct newtype_struct seq tuple tuple_struct map enum identifier ignored_any
+        }
+    }
+    let mut fields: &'static [&'static str] = &[];
+    let _ = T::deserialize(Fields(&mut fields));
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,7 +1682,7 @@ mod tests {
 
     /// The default config, for a node with a name (as every node has).
     fn named() -> Config {
-        Config { node_id: "n1".into(), ..Config::default() }
+        Config { node_id: "n1".into(), tls_dir: Some("tls".into()), ..Config::default() }
     }
 
     #[test]
@@ -1927,7 +2066,7 @@ mod tests {
 
     #[test]
     fn unknown_settings_are_reported_and_kept() {
-        let text = r#"{"mode": "node", "bind": "127.0.0.1:1", "nodeId": "n1", "knownNodes": [],
+        let text = r#"{"mode": "node", "bind": "127.0.0.1:1", "nodeId": "n1", "knownNodes": [], "tlsDir": "tls",
             "requireSignedConfg": true, "dynamicConfig": {"version": 1, "serviceGroups": []}}"#;
         let cfg: Config = serde_json::from_str(text).unwrap();
         // The typo leaves signing off: say so, and fail `stouter check`.
@@ -1939,6 +2078,68 @@ mod tests {
         // And a rewrite of the file keeps it (it may be a newer version's).
         let saved = serde_json::to_value(&cfg).unwrap();
         assert_eq!(saved["requireSignedConfg"], serde_json::json!(true));
+    }
+
+    /// What the daemon would refuse, or misread, `check` refuses too: no
+    /// tlsDir, addresses without a port, a misspelled setting anywhere.
+    #[test]
+    fn check_refuses_what_the_daemon_cant_use() {
+        let without = |f: fn(&mut Config)| {
+            let mut cfg = named();
+            f(&mut cfg);
+            cfg.validate_local()
+        };
+        assert!(without(|_| {}).is_ok());
+        assert!(without(|c| c.tls_dir = None).unwrap_err().to_string().contains("tlsDir"));
+        assert!(without(|c| c.bind = "0.0.0.0".into()).unwrap_err().to_string().contains("bind"));
+        assert!(without(|c| c.known_nodes = vec!["10.0.0.2:8080".into(), "10.0.0.3".into()]).is_err());
+        assert!(without(|c| c.advertise_addr = Some("203.0.113.7".into())).is_err());
+        assert!(without(|c| c.known_nodes = vec!["peer.example.com:8080".into(), "[::1]:8080".into()]).is_ok());
+        assert!(without(|c| c.known_nodes = vec!["::1".into()]).is_err());
+        // An outboundOnly node binds nothing.
+        assert!(without(|c| {
+            c.outbound_only = true;
+            c.bind = String::new();
+        })
+        .is_ok());
+
+        let raw = serde_json::json!({
+            "nodeId": "n1",
+            "dynamicConfig": {
+                "version": 1,
+                "polices": [],
+                "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "n1", "nodePort": 1, "maxConection": 5}]}],
+                "routes": [{"service": "api", "match": {"pathPrefx": "/"}, "backends": [{"weight": 1, "labls": {}}]}],
+                "revoked": {"nodes": [], "cert": []},
+            },
+            "subscribeFilter": {"serviceGroup": ["g"]},
+            "tracing": {"otlpEndpoint": "http://x:4318", "sampleRation": 0.5},
+        });
+        let found = unknown_nested_settings(&raw);
+        for at in [
+            "dynamicConfig.polices",
+            "dynamicConfig.serviceGroups[0].services[0].maxConection",
+            "dynamicConfig.routes[0].match.pathPrefx",
+            "dynamicConfig.routes[0].backends[0].labls",
+            "dynamicConfig.revoked.cert",
+            "subscribeFilter.serviceGroup",
+            "tracing.sampleRation",
+        ] {
+            assert!(found.iter().any(|f| f.contains(&format!("'{at}'"))), "{at} not in {found:?}");
+        }
+        assert_eq!(found.len(), 7, "{found:?}");
+        // A real config, every setting spelled right: nothing.
+        let good = serde_json::to_value(Config {
+            dynamic_config: serde_json::from_value(raw["dynamicConfig"].clone()).unwrap(),
+            subscribe_filter: Some(SubscribeFilter { service_groups: vec!["g".into()], services: vec![] }),
+            ..named()
+        })
+        .unwrap();
+        assert!(unknown_nested_settings(&good).is_empty(), "{:?}", unknown_nested_settings(&good));
+        // Labels and metadata are free-form.
+        let free = serde_json::json!({"dynamicConfig": {"version": 1, "serviceGroups": [{"name": "g", "services": [
+            {"name": "api", "nodeId": "n1", "nodePort": 1, "labels": {"anything": "x"}, "meta": {"goes": "y"}}]}]}});
+        assert!(unknown_nested_settings(&free).is_empty());
     }
 
     #[test]

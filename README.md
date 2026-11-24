@@ -75,8 +75,13 @@ never receive the fix. `stouter check` reports both kinds.
 
 A setting stouter doesn't know (a typo such as `requireSignedConfg`, which
 would otherwise leave signing off without a word, or one from a newer
-version) is logged as a warning at startup and fails `stouter check`; it is
-kept when the file is rewritten. A hand edit to `dynamicConfig` gets the
+version) is logged as a warning at startup and fails `stouter check`. At the
+top level it is kept when the file is rewritten; inside a section
+(`dynamicConfig`, a service, a route, a policy, `subscribeFilter`,
+`tracing`: a service's `maxConection`, say) it is dropped then, so fix it
+before the daemon rewrites the file. `check` also refuses what the daemon
+can't start with or use: no `tlsDir`, or a `bind` (unless `outboundOnly`),
+`advertiseAddr` or `knownNodes` entry without a port. A hand edit to `dynamicConfig` gets the
 same checks as a change made with the CLI: one that would break the config
 is refused, with a warning. An edit to any of it (a service, a policy, a
 revocation) is taken without raising its version by hand: the daemon gives
@@ -88,7 +93,8 @@ hand edit isn't taken at all.
 CLI commands that change the local file (`init`, `service add` without
 `--remote`, and so on) refuse a file they can't parse instead of starting
 over from defaults and saving those over it. `init` sets `nodeId` to the
-hostname only if it is empty.
+hostname only if it is empty, and `tlsDir` to a `tls` directory beside the
+config file only if it is unset.
 
 ### Modes
 
