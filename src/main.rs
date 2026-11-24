@@ -611,14 +611,28 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         Some(Commands::Status { remote }) => {
             let cfg = Config::load_or_default(&cli.config)?;
+            // An outboundOnly daemon listens nowhere: there is nothing here
+            // to ask, whether it runs or not.
+            if remote.is_none() && cfg.outbound_only {
+                eprintln!(
+                    "{} is outboundOnly: its daemon has no listener to ask. Ask a node it syncs with instead \
+                     (`stouter status --remote host:port`)",
+                    cli.config
+                );
+                std::process::exit(1);
+            }
             let target = remote.clone().unwrap_or_else(|| cfg.local_target());
 
+            // No daemon (or no answer) is a failure, for scripts and health
+            // checks alike.
             match tokio::time::timeout(state::CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&target)).await {
                 Err(_) => {
                     println!("No daemon answering on {target} (connect timed out)");
+                    std::process::exit(1);
                 }
                 Ok(Err(_)) => {
                     println!("No daemon running on {target}");
+                    std::process::exit(1);
                 }
                 Ok(Ok(tcp)) => {
                     let tls_ctx = build_cli_tls(&cfg, cli.cert_dir.as_deref())?;
@@ -647,7 +661,10 @@ async fn main() -> Result<()> {
                                 println!("\nConfig changes must be signed by an admin (requireSignedConfig).");
                             }
                         }
-                        _ => println!("Unexpected response from daemon"),
+                        _ => {
+                            println!("Unexpected response from daemon");
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -711,7 +728,7 @@ async fn main() -> Result<()> {
                     name, group_name, owner_node_id, target, version
                 );
             } else {
-                let mut cfg = Config::load_or_default(&cli.config)?;
+                let mut cfg = Config::load(&cli.config)?;
                 let node_id = owner_node(node, None, &cfg, cli.cert_dir.as_deref()).await?;
                 let service = Service {
                     name: name.clone(),
