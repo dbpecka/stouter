@@ -75,6 +75,7 @@ pub struct PkiMaterial {
 ///
 /// Anything else (some of the files, not a usable set) is an error, never a
 /// new CA.
+#[cfg(test)]
 pub fn load_or_create(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
     load_or_create_with(tls_dir, node_id, DEFAULT_CERT_LIFETIME)
 }
@@ -86,6 +87,13 @@ pub fn load_or_create_with(tls_dir: &str, node_id: &str, lifetime: time::Duratio
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create TLS directory {tls_dir}"))?;
     finish_renewal(dir)?;
+    load_dir(tls_dir, node_id, lifetime)
+}
+
+/// The certificates in `tls_dir` (see [`load_or_create`]), changing nothing
+/// there but a new CA in an empty directory.
+fn load_dir(tls_dir: &str, node_id: &str, lifetime: time::Duration) -> Result<PkiMaterial> {
+    let dir = Path::new(tls_dir);
 
     let ca_cert_path  = dir.join("ca.crt");
     let ca_key_path   = dir.join("ca.key");
@@ -124,14 +132,16 @@ pub fn load_or_create_with(tls_dir: &str, node_id: &str, lifetime: time::Duratio
 /// directory with no certificates there is a mistyped `--cert-dir` (or a
 /// node's `tlsDir` before its daemon first ran), not a new cluster, and a
 /// CA made up on the spot would only fail the handshake later, obscurely.
+///
+/// Nor does it finish a renewal a crash cut short (see [`finish_renewal`]):
+/// only the daemon does, at startup. A CLI command doing it could catch the
+/// daemon's own save between its two renames, discard the staged key as
+/// left over, and leave the new certificate beside the old key.
 pub fn load_existing(tls_dir: &str, node_id: &str) -> Result<PkiMaterial> {
     let dir = Path::new(tls_dir);
-    if dir.is_dir() {
-        finish_renewal(dir)?;
-    }
     let has = |name: &str| dir.join(name).is_file();
     if has("ca.crt") && (has("ca.key") || (has("node.crt") && has("node.key"))) {
-        return load_or_create(tls_dir, node_id);
+        return load_dir(tls_dir, node_id, DEFAULT_CERT_LIFETIME);
     }
     if !dir.is_dir() {
         bail!("certificate directory {tls_dir} does not exist");
@@ -697,7 +707,12 @@ mod renewal_tests {
         std::fs::write(node_dir.join("node.crt.next"), to_pem("CERTIFICATE", cert3.as_ref())).unwrap();
         let PrivateKeyDer::Pkcs8(der) = &key3 else { unreachable!() };
         std::fs::write(node_dir.join("node.key"), to_pem("PRIVATE KEY", der.secret_pkcs8_der())).unwrap();
-        let loaded = load_existing(node, "n1").unwrap();
+        // A CLI command leaves it to the daemon (it could be catching the
+        // daemon's own save half way)...
+        let _ = load_existing(node, "n1");
+        assert!(node_dir.join("node.crt.next").exists(), "the CLI touches nothing");
+        // ...which finishes it at startup.
+        let loaded = load_or_create(node, "n1").unwrap();
         assert_eq!(loaded.node_cert_der, cert3);
         crate::tls::TlsContext::new(&loaded).expect("key and cert match");
         assert!(!node_dir.join("node.crt.next").exists());
@@ -708,7 +723,12 @@ mod renewal_tests {
         let (_, key4) = issuer.issue_new("n1").unwrap();
         let PrivateKeyDer::Pkcs8(der) = &key4 else { unreachable!() };
         std::fs::write(node_dir.join("node.key.next"), to_pem("PRIVATE KEY", der.secret_pkcs8_der())).unwrap();
+        // The CLI, catching a save between its two renames, mustn't take
+        // the staged key for a leftover.
         let loaded = load_existing(node, "n1").unwrap();
+        assert!(node_dir.join("node.key.next").exists(), "the CLI discards nothing");
+        assert_eq!(loaded.node_cert_der, cert3);
+        let loaded = load_or_create(node, "n1").unwrap();
         assert_eq!(loaded.node_cert_der, cert3);
         crate::tls::TlsContext::new(&loaded).expect("still a matching pair");
         assert!(!node_dir.join("node.key.next").exists());
