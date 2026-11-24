@@ -653,7 +653,7 @@ async fn main() -> Result<()> {
                             if let Some(until) = cert_expires {
                                 println!(
                                     "\nCertificate valid until {} (renewed when a third of its life is left){}",
-                                    history::format_time(until.max(0) as u64 * 1000),
+                                    history::format_secs(until.max(0) as u64),
                                     if issues_certs { "; this node holds the CA's key and renews others'" } else { "" }
                                 );
                             }
@@ -1803,7 +1803,7 @@ fn refuse_against_local(
                 "warning: the config on {target} (version {}) was signed by '{who}', whose certificate expired {}: \
                  if that key may be in the wrong hands, check the config before changing it",
                 served.version,
-                history::format_time(until.saturating_mul(1000))
+                history::format_secs(*until)
             );
         }
         return Ok(());
@@ -1839,7 +1839,7 @@ fn refuse_against_local(
              --accept-expired-signer`",
             served.version,
             local.version,
-            history::format_time(until.saturating_mul(1000))
+            history::format_secs(until)
         );
     }
     Ok(())
@@ -1991,14 +1991,14 @@ fn describe_signature(dc: &config::DynamicConfig) -> Option<String> {
         .map(|i| u8::from_str_radix(sig.signer_cert.get(i..i + 2)?, 16).ok())
         .collect::<Option<_>>()?;
     let signer = tls::cert_cn(&der.clone().into()).unwrap_or_else(|| "?".into());
-    let when = dc.signed_at.map(|at| format!(" at {}", history::format_time(at * 1000))).unwrap_or_default();
+    let when = dc.signed_at.map(|at| format!(" at {}", history::format_secs(at))).unwrap_or_default();
     let cert = match pki::validity(&der) {
         Some((_, until)) if until * 1000 < now_ms() as i64 => format!(
             "; that certificate expired {} (nodes holding this config keep it, but sign it again with \
              `stouter config push` so that key can sign nothing more nodes take)",
-            history::format_time(until.max(0) as u64 * 1000)
+            history::format_secs(until.max(0) as u64)
         ),
-        Some((_, until)) => format!("; that certificate is valid until {}", history::format_time(until.max(0) as u64 * 1000)),
+        Some((_, until)) => format!("; that certificate is valid until {}", history::format_secs(until.max(0) as u64)),
         None => String::new(),
     };
     Some(format!("{signer}{when}{cert}"))

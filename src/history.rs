@@ -202,7 +202,13 @@ fn list(nodes: &[String]) -> String {
 
 /// `ms` (Unix milliseconds) as `YYYY-MM-DD HH:MM:SS UTC`.
 pub fn format_time(ms: u64) -> String {
-    let secs = ms / 1000;
+    format_secs(ms / 1000)
+}
+
+/// [`format_time`] for Unix seconds: a time from a certificate or a signature
+/// (`signedAt`), which may come from anyone, is formatted with no multiplying
+/// that could overflow.
+pub fn format_secs(secs: u64) -> String {
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
@@ -297,5 +303,9 @@ mod tests {
         assert_eq!(format_time(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_time(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
         assert_eq!(format_time(951_782_400_000), "2000-02-29 00:00:00 UTC");
+        assert_eq!(format_secs(1_700_000_000), "2023-11-14 22:13:20 UTC");
+        // Whatever a peer claims: no overflow.
+        assert!(!format_secs(u64::MAX).is_empty());
+        assert!(!format_time(u64::MAX).is_empty());
     }
 }

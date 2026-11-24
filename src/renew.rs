@@ -68,7 +68,7 @@ fn issue(stream: &MeshStream, csr: &str, state: &SharedState) -> Result<String> 
     let csr = unhex(csr).ok_or_else(|| anyhow!("the certificate request isn't hex"))?;
     let cert = issuer.issue_for_csr(&node, &csr)?;
     let until = crate::pki::validity(cert.as_ref()).map_or_else(String::new, |(_, until)| {
-        format!(" (valid until {})", crate::history::format_time(until.max(0) as u64 * 1000))
+        format!(" (valid until {})", crate::history::format_secs(until.max(0) as u64))
     });
     info!("issued a renewed certificate for '{node}'{until}");
     Ok(hex(cert.as_ref()))
@@ -97,7 +97,7 @@ pub async fn run_renewal_loop(state: Arc<SharedState>) {
         match renew(&state).await {
             Ok(until) => {
                 failures = 0;
-                info!("renewed this node's certificate: valid until {}", crate::history::format_time(until.max(0) as u64 * 1000));
+                info!("renewed this node's certificate: valid until {}", crate::history::format_secs(until.max(0) as u64));
             }
             Err(e) => {
                 failures += 1;
@@ -135,7 +135,7 @@ async fn warn_if_config_signer_expired(state: &SharedState) {
          current certificate sign it again (`stouter config push`), and revoke '{who}' if that key may be in the \
          wrong hands. Until then, nodes starting up would take a config that key signed dated back.",
         dc.version,
-        crate::history::format_time(until.saturating_mul(1000))
+        crate::history::format_secs(until)
     );
 }
 
