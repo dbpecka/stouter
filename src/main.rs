@@ -695,6 +695,10 @@ async fn main() -> Result<()> {
             if let Some(path) = &health_path {
                 config::validate_health_path(path).map_err(anyhow::Error::msg)?;
             }
+            // `--domains ""` is no domains, and `a,,b` is a and b: never an
+            // empty one, which every other empty one would clash with.
+            let domains: Vec<String> =
+                domains.into_iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect();
             let labels: std::collections::BTreeMap<String, String> = labels.into_iter().collect();
             let meta: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
             if let Some(target) = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await? {

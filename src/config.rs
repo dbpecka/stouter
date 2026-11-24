@@ -551,6 +551,10 @@ impl DynamicConfig {
                     }
                 }
                 for domain in &svc.domains {
+                    if domain.trim().is_empty() {
+                        report(format!("service '{}/{}' on node '{}' has an empty domain", group.name, svc.name, svc.node_id));
+                        continue;
+                    }
                     match domain_owner.insert(domain.as_str(), svc.name.as_str()) {
                         Some(owner) if owner != svc.name => report(format!(
                             "domain '{}' is claimed by both '{}' and '{}/{}'",
@@ -840,6 +844,11 @@ impl DynamicConfig {
     /// Bumps `version` and returns the new version.
     pub fn set_routes(&mut self, service: &str, routes: Vec<Route>) -> Result<u64, MutateErr> {
         let version = self.next_version()?;
+        // Clearing what isn't there changes nothing: say so, rather than
+        // make a new version (likely a misspelled service).
+        if routes.is_empty() && !self.routes.iter().any(|r| r.service == service) {
+            return Err(MutateErr::Invalid(format!("service '{service}' has no routes to clear")));
+        }
         if !routes.is_empty() {
             self.validate_route_target(service).map_err(MutateErr::Invalid)?;
         }
@@ -1995,14 +2004,26 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_domain_is_a_problem() {
+        let dc = group_of(vec![instance("api", "n1", &["", "a.example"]), instance("web", "n1", &[" "])]).dynamic_config;
+        let problems = dc.problems();
+        assert_eq!(problems.iter().filter(|p| p.contains("empty domain")).count(), 2, "{problems:?}");
+        assert!(!problems.iter().any(|p| p.contains("claimed by both")), "empties don't clash: {problems:?}");
+    }
+
+    #[test]
     fn routes_require_existing_http_service() {
         let mut dc = DynamicConfig::default();
         dc.upsert_service("g", instance("tcp-svc", "n1", &[])).unwrap();
         let r = |svc: &str| route(serde_json::json!({"service": svc, "backends": [{}]}));
         assert!(matches!(dc.set_routes("missing", vec![r("missing")]), Err(MutateErr::Invalid(_))));
         assert!(matches!(dc.set_routes("tcp-svc", vec![r("tcp-svc")]), Err(MutateErr::Invalid(_))));
-        // Clearing never needs the service to exist.
-        assert!(dc.set_routes("missing", vec![]).is_ok());
+        // Clearing never needs the service to exist (its routes may be left
+        // over), but there must be routes to clear.
+        assert!(matches!(dc.set_routes("missing", vec![]), Err(MutateErr::Invalid(_))));
+        dc.routes.push(r("gone"));
+        assert!(dc.set_routes("gone", vec![]).is_ok());
+        assert!(dc.routes.is_empty());
 
         let mut cfg = group_of(vec![http_instance("api", "n1", &[]), instance("api", "n2", &[])]);
         cfg.dynamic_config.routes = vec![r("api")];
