@@ -843,7 +843,8 @@ any node can relay a signed config but none can alter it.
   older than the admin-signed one in its own config file: the node is behind
   the cluster, or lying, and the admin's change would drop what came since.
   `config rollback --to N` puts back only a config that is, as signed,
-  version N.
+  version N. Nor does `config pull` write an unsigned config over a file
+  that holds a signed one.
 - A node starts from the text an admin signed, not from edits made around
   the signature in its config file; it logs that it ignores them.
 - Editing a config file by hand no longer changes anything: the node logs a

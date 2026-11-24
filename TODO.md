@@ -240,9 +240,10 @@ against the code. Numbered on from the list above.
 
 ## Low
 
-- [ ] **35. `config pull` writes an unsigned served config over an admin-signed local file**,
+- [x] **35. `config pull` writes an unsigned served config over an admin-signed local file**,
   replacing the revocation list the CLI trusts. Fix: refuse an unsigned
   config when the file holds a verified signed one.
+  Fixed: `config pull` refuses an unsigned served config when the file holds a verified signed one.
 - [x] **36. `"tlsDir": ""` passes `check` and `check --local`;** the daemon then makes a new
   CA in the container's working directory on every redeploy. Fix: treat a
   blank tlsDir as unset; warn in deploy.sh and docker-create.sh.

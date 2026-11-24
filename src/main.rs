@@ -1224,6 +1224,7 @@ async fn main() -> Result<()> {
             let current = if !signed_cluster(&cfg, daemon.require_signed_config) {
                 daemon.dynamic_config
             } else if daemon.dynamic_config.signature.is_none() {
+                refuse_unsigned_over_signed(&target, &cfg, &cli.config, &material, &tls_ctx)?;
                 eprintln!(
                     "warning: the config on {target} isn't admin-signed yet; review it before you sign it with \
                      `stouter config push`"
@@ -1797,6 +1798,27 @@ fn refuse_against_local(
             served.version,
             local.version,
             history::format_time(until.saturating_mul(1000))
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to pull `target`'s unsigned config over a file holding an
+/// admin-signed one. Fine before the first signed change; but over a signed
+/// file, the file's config (and its revocations, which the CLI trusts)
+/// would be replaced by whatever an unverified node says, ready for
+/// `config push` to sign.
+fn refuse_unsigned_over_signed(
+    target: &str,
+    cfg: &Config,
+    path: &str,
+    material: &pki::PkiMaterial,
+    tls_ctx: &tls::TlsContext,
+) -> Result<()> {
+    if trusted_config(&cfg.dynamic_config, cfg, material, tls_ctx).is_ok() {
+        anyhow::bail!(
+            "the config on {target} isn't admin-signed, but the one in {path} is: not writing it over that (that \
+             node is behind the cluster's signed configs, or not telling the truth)"
         );
     }
     Ok(())
@@ -2467,6 +2489,20 @@ mod tests {
         assert!(nothing.resolve().is_err());
         let bad = RevokeTargets { nodes: vec![], cert_files: vec![], fingerprints: vec!["abc".into()] };
         assert!(bad.resolve().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsigned_config_is_not_pulled_over_a_signed_one() {
+        let (dir, certs) = cluster_certs(&["admin"]);
+        let me = &certs["admin"];
+        let tls_ctx = tls::TlsContext::new(me).unwrap();
+        let unsigned_file = Config { require_signed_config: true, admin_cns: vec!["admin".into()], ..Config::default() };
+        assert!(refuse_unsigned_over_signed("m:1", &unsigned_file, "f.json", me, &tls_ctx).is_ok(), "before the first signed change");
+        let signed = signing::sign(&api_on_port(3000), &signing::Signer::from_material(me).unwrap()).unwrap();
+        let signed_file = Config { dynamic_config: signed, ..unsigned_file };
+        let err = refuse_unsigned_over_signed("m:1", &signed_file, "f.json", me, &tls_ctx).expect_err("refused");
+        assert!(err.to_string().contains("isn't admin-signed"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
