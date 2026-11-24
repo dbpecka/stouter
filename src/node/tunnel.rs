@@ -160,14 +160,25 @@ pub(crate) async fn connect_local_service(
     };
 
     let local_addr = format!("127.0.0.1:{}", service.node_port);
-    match TcpStream::connect(&local_addr).await {
-        Ok(s) => {
+    // Bounded: a service whose accept queue is full would otherwise hold
+    // the tunnel for as long as TCP retries (about two minutes), and a
+    // drain with it. Well under the subscriber's own setup timeout (15 s),
+    // so it hears why.
+    match tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(&local_addr)).await {
+        Ok(Ok(s)) => {
             s.set_nodelay(true).ok();
             Ok(s)
         }
-        Err(e) => Err(format!("failed to connect to local service at {local_addr}: {e}")),
+        Ok(Err(e)) => Err(format!("failed to connect to local service at {local_addr}: {e}")),
+        Err(_) => Err(format!(
+            "the local service at {local_addr} didn't accept a connection within {}s",
+            LOCAL_CONNECT_TIMEOUT.as_secs()
+        )),
     }
 }
+
+/// How long connecting to a service on this node may take.
+const LOCAL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -199,5 +210,34 @@ mod tests {
         let err = read_tunnel_error(&mut ours).await.expect_err("timed out");
         assert!(err.to_string().contains("in time"), "{err}");
         drop(theirs);
+    }
+
+    /// A service whose accept queue is full: the connection doesn't wait for
+    /// TCP to give up (about two minutes), but fails after a few seconds.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connecting_to_a_service_that_isnt_accepting_times_out() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Fill its accept queue (never accepted); further connects hang.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            if let Ok(Ok(c)) = tokio::time::timeout(std::time::Duration::from_millis(200), TcpStream::connect(("127.0.0.1", port))).await {
+                held.push(c);
+            }
+        }
+        let dc: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "n1", "nodePort": port}]}],
+        }))
+        .unwrap();
+        let cfg = crate::config::Config { node_id: "n1".into(), dynamic_config: dc, ..Default::default() };
+        let state = SharedState::new(cfg, String::new(), tokio_util::sync::CancellationToken::new(), None);
+        let started = std::time::Instant::now();
+        let err = connect_local_service("api", &state).await.expect_err("timed out");
+        assert!(err.contains("didn't accept"), "{err}");
+        assert!(started.elapsed() < LOCAL_CONNECT_TIMEOUT + std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        drop((listener, held));
     }
 }
