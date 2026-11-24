@@ -48,6 +48,14 @@ if [[ ! "$CLUSTER" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
   echo "error: cluster name '$CLUSTER' may contain only letters, digits, '-' and '_'" >&2
   exit 1
 fi
+# A named cluster lives in /srv/stouter/<name>, beside the default cluster's
+# own build and config directories: a cluster named after one of them would
+# share it, and the next default deploy would wipe its config and CA.
+case "$CLUSTER" in
+  build|config)
+    echo "error: cluster name '$CLUSTER' is taken by the default cluster's $CLUSTER directory; choose another" >&2
+    exit 1 ;;
+esac
 
 # The config file is named relative to where we were run from; everything
 # else (the source to upload) is the repository this script is in, wherever
@@ -187,7 +195,7 @@ remote_sudo "
   set -- -v \"\$D/config:\$D/config\"
   TLS_DIR=\$(sed -n 's/.*\"tlsDir\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"\$D/config/stouter.json\" | head -n 1)
   case \"\$TLS_DIR\" in
-    '') ;;
+    '') echo \"warning: the config sets no tlsDir: the daemon will not start\" >&2 ;;
     \"\$D/config\"/*) ;;
     /*) mkdir -p \"\$TLS_DIR\" && set -- \"\$@\" -v \"\$TLS_DIR:\$TLS_DIR\" ;;
     *) echo \"warning: tlsDir '\$TLS_DIR' is relative, so it is inside the container and lost when it is replaced\" >&2 ;;

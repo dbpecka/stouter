@@ -243,12 +243,14 @@ against the code. Numbered on from the list above.
 - [ ] **35. `config pull` writes an unsigned served config over an admin-signed local file**,
   replacing the revocation list the CLI trusts. Fix: refuse an unsigned
   config when the file holds a verified signed one.
-- [ ] **36. `"tlsDir": ""` passes `check` and `check --local`;** the daemon then makes a new
+- [x] **36. `"tlsDir": ""` passes `check` and `check --local`;** the daemon then makes a new
   CA in the container's working directory on every redeploy. Fix: treat a
   blank tlsDir as unset; warn in deploy.sh and docker-create.sh.
-- [ ] **37. In `deploy.sh`, a cluster named `build` (or `config`) lives inside the default
+  Fixed: a blank tlsDir counts as unset (refused by `check`, `check --local` and the daemon); deploy.sh and docker-create.sh warn.
+- [x] **37. In `deploy.sh`, a cluster named `build` (or `config`) lives inside the default
   cluster's directories;** deploying the default cluster wipes its config
   and CA. Fix: reserve the names, or put named clusters under `clusters/`.
+  Fixed: deploy.sh refuses the cluster names `build` and `config`.
 - [ ] **38. The relative version bound strands a new node** (version 0) if the cluster's
   version is above 2^28 (say, a Unix timestamp set by hand). Fix: exempt
   the empty version-0 config, or bound versions absolutely.

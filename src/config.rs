@@ -1310,7 +1310,10 @@ impl Config {
             ));
         }
 
-        if self.tls_dir.is_none() {
+        // Blank counts as unset: certificates in whatever directory the
+        // daemon runs from (in a container, one replaced on every deploy,
+        // so a new CA each time) are worse than no start.
+        if self.tls_dir.as_deref().is_none_or(|dir| dir.trim().is_empty()) {
             return Err(anyhow!(
                 "`tlsDir` is not set: nodes talk only over mutual TLS, with the certificates there (`stouter init` sets it)"
             ));
@@ -2109,6 +2112,8 @@ mod tests {
         };
         assert!(without(|_| {}).is_ok());
         assert!(without(|c| c.tls_dir = None).unwrap_err().to_string().contains("tlsDir"));
+        assert!(without(|c| c.tls_dir = Some(String::new())).unwrap_err().to_string().contains("tlsDir"));
+        assert!(without(|c| c.tls_dir = Some("  ".into())).is_err());
         assert!(without(|c| c.bind = "0.0.0.0".into()).unwrap_err().to_string().contains("bind"));
         assert!(without(|c| c.known_nodes = vec!["10.0.0.2:8080".into(), "10.0.0.3".into()]).is_err());
         assert!(without(|c| c.advertise_addr = Some("203.0.113.7".into())).is_err());

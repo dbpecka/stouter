@@ -80,7 +80,7 @@ top level it is kept when the file is rewritten; inside a section
 (`dynamicConfig`, a service, a route, a policy, `subscribeFilter`,
 `tracing`: a service's `maxConection`, say) it is dropped then, so fix it
 before the daemon rewrites the file. `check` also refuses what the daemon
-can't start with or use: no `tlsDir`, or a `bind` (unless `outboundOnly`),
+can't start with or use: no `tlsDir` (or a blank one), or a `bind` (unless `outboundOnly`),
 `advertiseAddr` or `knownNodes` entry without a port. A hand edit to `dynamicConfig` gets the
 same checks as a change made with the CLI: one that would break the config
 is refused, with a warning. An edit to any of it (a service, a policy, a
@@ -436,7 +436,8 @@ replaced with the container, and no other node would trust the new one.
 `deploy.sh` and `docker-create.sh [config dir]` mount the config's `tlsDir`
 when it lies outside the config
 directory. It also takes only cluster names of letters, digits, `-` and `_`
-(they become remote paths), and uploads the repository it is in, wherever
+(they become remote paths), but not `build` or `config` (the default
+cluster's own directories), and uploads the repository it is in, wherever
 it's run from.
 
 Before replacing the running container, `deploy.sh` checks the host's

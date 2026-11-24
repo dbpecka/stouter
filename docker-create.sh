@@ -18,7 +18,7 @@ CONFIG="$CONFIG_DIR/stouter.json"
 mounts=(-v "$CONFIG_DIR:$CONFIG_DIR")
 tls_dir=$(sed -n 's/.*"tlsDir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1)
 case "$tls_dir" in
-  '') ;;
+  '') echo "warning: $CONFIG sets no tlsDir: the daemon won't start (\`stouter check --local\` says why)" >&2 ;;
   "$CONFIG_DIR"/*) ;;
   /*) mkdir -p "$tls_dir" && mounts+=(-v "$tls_dir:$tls_dir") ;;
   *) echo "warning: tlsDir '$tls_dir' is relative, so it is inside the container and lost with it" >&2 ;;
