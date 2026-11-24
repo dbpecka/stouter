@@ -320,6 +320,11 @@ good within weeks even if nobody revokes it.
   renew its own, and a revoked certificate can't connect to ask. The new
   `node.crt` and `node.key` are written to its `tlsDir` for the next start
   (so the directory must be writable).
+- A certificate's expiry is checked when a connection is made: a
+  connection opened before it expired keeps going (a node renews long
+  before then), while a revoked certificate's connections are closed at
+  once. A NAT'd node's beats signed with an expired certificate's key keep
+  it alive no longer.
 - A certificate copied into a node's `tlsDir` by hand (after `stouter cert
   issue`) is taken up the same way, without a restart, if it lasts longer
   than the one in use.

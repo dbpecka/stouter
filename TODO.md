@@ -188,14 +188,15 @@ cluster" means one without `requireSignedConfig`.
   `deploy.sh:143-147`: fixed container name `stouter-extract`, no error checks.
   Fix: a unique name, `docker rm -f` it first, `set -e` in the remote script.
   Fixed: a container name of its own, removed on exit, `set -e`, and the binary moved into place only once fully copied.
-- [ ] **25. `deploy.sh` with no arguments under macOS bash 3.2** dies with
+- [x] **25. `deploy.sh` with no arguments under macOS bash 3.2** dies with
   "ARGS[@]: unbound variable" instead of printing usage (`deploy.sh:26`).
   Fix: `set -- ${ARGS[@]+"${ARGS[@]}"}`.
+  Fixed: the expansion is guarded, and a missing host prints the usage (checked under bash 3.2).
 - [x] **26. No-op and empty input accepted.** `route clear` on an unknown service
   succeeds and bumps the version (`src/config.rs:762-776`); `--domains ""` or
   `a,,b` stores an empty domain, which then clashes (`src/main.rs:269`).
   Fixed: `route clear` with no routes to clear is refused; the CLI drops empty domains, and an empty domain in a config is a problem.
-- [ ] **27. `tests/e2e/renew.sh` never checks that the CA node still answers after
+- [x] **27. `tests/e2e/renew.sh` never checks that the CA node still answers after
   its first certificate expires** (lines 35-37). Add `check "A answers past its
   first certificate's expiry" status A`.
 
@@ -206,6 +207,7 @@ history; data plane; CLI, operations and docs), each finding checked
 against the code. Numbered on from the list above.
 
 ## High
+  Fixed: `renew.sh` checks that A answers past its first certificate's expiry.
 
 - [x] **28. One peer could still make a node hold 1–2 GiB through mux streams.**
   The fix for #1 capped each session at 128 MiB, but a peer may open 16
@@ -270,8 +272,9 @@ against the code. Numbered on from the list above.
   version is above 2^28 (say, a Unix timestamp set by hand). Fix: exempt
   the empty version-0 config, or bound versions absolutely.
   Fixed: a node holding version 0 takes any version up to 2^62 (the step bound applies once it holds one).
-- [ ] **39. Certificate expiry is checked only at the handshake:** long-lived connections
+- [x] **39. Certificate expiry is checked only at the handshake:** long-lived connections
   and beats from an expired certificate keep working.
+  Fixed (beats): a beat checked against a certificate that has expired counts for nothing. Connections opened before an expiry keep going, by design (nodes renew long before; revocation closes them): now documented.
 - [ ] **40. `requestTimeoutMs` can be exceeded up to twice over** when a request ends up
   on a pooled connection that came free while its own tunnel was being set
   up (the background setup keeps extending its deadline).
@@ -291,8 +294,10 @@ against the code. Numbered on from the list above.
   Fixed: a probe that fails to run aborts the deploy; only an image that runs and lacks `--local` is warned about and skipped.
 - [x] **46. The CLI panics (exit 101) on a closed pipe** (`stouter config history | head`).
   Fixed: CLI commands restore SIGPIPE's default, so they stop quietly (status 141) as Unix tools do; the daemon keeps ignoring it.
-- [ ] **47. A huge `signedAt` overflows** formatting a refusal before any signature is
+- [x] **47. A huge `signedAt` overflows** formatting a refusal before any signature is
   checked (panic in debug builds). Partly fixed with #30 (`saturating_mul`
   in `verify`); check the other call sites.
-- [ ] **48. `service move` and `--remote` with another cluster's `--cert-dir`** apply this
+  Fixed: times from certificates and signatures are formatted as seconds (`history::format_secs`), with no multiply.
+- [x] **48. `service move` and `--remote` with another cluster's `--cert-dir`** apply this
   cluster's revocations to the other one (fails safe, confusing error).
+  Fixed: the local config's revocations are applied only with certificates from the local tlsDir's CA (or when that can't be told).
