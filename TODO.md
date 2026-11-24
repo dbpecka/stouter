@@ -144,34 +144,40 @@ cluster" means one without `requireSignedConfig`.
   routes (`src/state.rs:918` indexes them unchecked). Fix: skip routes with no
   backends when indexing, or answer 503.
   Fixed: routes with no backend to send to are left out of the route index (with a warning), and route selection can't index an empty list.
-- [ ] **15. A dead reverse connection at a subscriber that is the NAT'd node's relay fails the tunnel.**
+- [x] **15. A dead reverse connection at a subscriber that is the NAT'd node's relay fails the tunnel.**
   `src/subscribe/proxy.rs:466-467`: no per-attempt timeout or fallback; waits 15 s
   without trying the node's other relays. Fix: ~5 s per attempt, try another
   reverse connection, then fall through to `tunnel_routes`.
+  Fixed: up to two reverse connections get at most 3 s each (with a request signed afresh), then the node's relays.
 - [x] **16. Connecting to the local service has no timeout.** `src/node/tunnel.rs:163`:
   a backend with a full accept queue holds the tunnel task ~2 min (and delays a
   drain). Fix: time out after a few seconds, under the subscriber's 15 s.
   Fixed: the connection to the local service times out after 5 s.
-- [ ] **17. A CLI command can race the daemon's renewal save.** `load_existing`
+- [x] **17. A CLI command can race the daemon's renewal save.** `load_existing`
   runs `finish_renewal` (`src/pki.rs:122-126`) on the daemon's `tlsDir` for every
   local CLI command; between `save_renewed`'s two renames it deletes the staged
   key, leaving the new certificate beside the old key (the node fails at its
   next start). Fix: only the daemon finishes a cut-short renewal (at startup),
   or take a lock file.
-- [ ] **18. History keeps both configs at one version; rollback picks the loser.**
+  Fixed: CLI loads only read tlsDir; only the daemon (at startup) finishes a cut-short renewal.
+- [x] **18. History keeps both configs at one version; rollback picks the loser.**
   `src/history.rs:73` dedups only against the last entry; `config rollback --to N`
   (`src/main.rs:1312`) and `history --version N` (`:1278`) take the first entry at N.
   Fix: replace the entry when recording a version already there.
-- [ ] **19. `service add` with a missing or mistyped `--config` creates a new config.**
+  Fixed: recording a version already in the history replaces its entry; lookups by version take the latest.
+- [x] **19. `service add` with a missing or mistyped `--config` creates a new config.**
   `src/main.rs:654` uses `load_or_default`. Fix: `Config::load`, as rename/remove do.
-- [ ] **20. `status` exits 0 with no daemon, and says "no daemon" on `outboundOnly` hosts.**
+  Fixed: `service add` without --remote uses `Config::load`.
+- [x] **20. `status` exits 0 with no daemon, and says "no daemon" on `outboundOnly` hosts.**
   `src/main.rs:556-561`, `590`. Fix: non-zero exit; for `outboundOnly`, say there
   is no listener to ask and suggest `--remote`.
-- [ ] **21. `config push` always fails against a daemon with empty `adminCns`.**
+  Fixed: exits 1 when no daemon answers (or answers oddly); on an outboundOnly host says there's no listener to ask and points to --remote.
+- [x] **21. `config push` always fails against a daemon with empty `adminCns`.**
   `src/main.rs:1137` always signs; `accept_push` (`src/gossip/mod.rs:453`) wants the
   signer in `adminCns`, though other admin ops accept the node's own name
   (`:343`). Fix: accept the daemon's own name when signing isn't required, or
   document that push needs `adminCns`.
+  Fixed: without requireSignedConfig a push is also taken from the node's own certificate, as other admin requests are.
 - [x] **22. A second SIGTERM/SIGINT during the drain is ignored.** `src/main.rs:491-497`,
   `1477-1505`. Fix: exit at once on a second signal.
   Fixed: a second signal during the drain exits at once (status 1).
@@ -185,9 +191,10 @@ cluster" means one without `requireSignedConfig`.
 - [ ] **25. `deploy.sh` with no arguments under macOS bash 3.2** dies with
   "ARGS[@]: unbound variable" instead of printing usage (`deploy.sh:26`).
   Fix: `set -- ${ARGS[@]+"${ARGS[@]}"}`.
-- [ ] **26. No-op and empty input accepted.** `route clear` on an unknown service
+- [x] **26. No-op and empty input accepted.** `route clear` on an unknown service
   succeeds and bumps the version (`src/config.rs:762-776`); `--domains ""` or
   `a,,b` stores an empty domain, which then clashes (`src/main.rs:269`).
+  Fixed: `route clear` with no routes to clear is refused; the CLI drops empty domains, and an empty domain in a config is a problem.
 - [ ] **27. `tests/e2e/renew.sh` never checks that the CA node still answers after
   its first certificate expires** (lines 35-37). Add `check "A answers past its
   first certificate's expiry" status A`.
@@ -259,9 +266,10 @@ against the code. Numbered on from the list above.
   cluster's directories;** deploying the default cluster wipes its config
   and CA. Fix: reserve the names, or put named clusters under `clusters/`.
   Fixed: deploy.sh refuses the cluster names `build` and `config`.
-- [ ] **38. The relative version bound strands a new node** (version 0) if the cluster's
+- [x] **38. The relative version bound strands a new node** (version 0) if the cluster's
   version is above 2^28 (say, a Unix timestamp set by hand). Fix: exempt
   the empty version-0 config, or bound versions absolutely.
+  Fixed: a node holding version 0 takes any version up to 2^62 (the step bound applies once it holds one).
 - [ ] **39. Certificate expiry is checked only at the handshake:** long-lived connections
   and beats from an expired certificate keep working.
 - [ ] **40. `requestTimeoutMs` can be exceeded up to twice over** when a request ends up

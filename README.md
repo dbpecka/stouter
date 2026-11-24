@@ -116,7 +116,8 @@ stouter --config /etc/stouter/stouter.json
 # Validate config syntax
 stouter check --config /etc/stouter/stouter.json
 
-# Query daemon status
+# Query daemon status (exits 1 if no daemon answers; an outboundOnly host's
+# daemon listens nowhere: ask a node it syncs with, with --remote)
 stouter status
 
 # Register a service
@@ -152,7 +153,10 @@ stouter config history
 stouter config rollback --to 12
 ```
 
-`config push` replaces the cluster's dynamic config with the file's, so it
+`config push` is signed with the CLI's certificate and taken from an admin
+(`adminCns`), or, without `requireSignedConfig`, also from the daemon's own
+certificate (the CLI on its host). It replaces the cluster's dynamic config
+with the file's, so it
 refuses a file older than the cluster's config: pushing it would undo the
 changes made since. Run `config pull` (if the file's services or routes
 differ, it first keeps a copy as `.bak`, or `.bak.2` and so on, never over an
