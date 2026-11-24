@@ -455,8 +455,14 @@ fn accept_push(
         .tls
         .as_deref()
         .ok_or_else(|| MutateErr::Unauthorized("no TLS context to check signatures with".into()))?;
-    let (verified, signer) = crate::signing::verify(&pushed, tls, &state.config.admin_cns)
-        .map_err(|e| MutateErr::Unauthorized(format!("{e:#}")))?;
+    // Signed by an admin; or, where changes needn't be signed, also by this
+    // node itself (the CLI on this host, as for any other admin request).
+    let mut signers = state.config.admin_cns.clone();
+    if !state.config.require_signed_config {
+        signers.push(state.config.node_id.clone());
+    }
+    let (verified, signer) =
+        crate::signing::verify(&pushed, tls, &signers).map_err(|e| MutateErr::Unauthorized(format!("{e:#}")))?;
     // A push is a change made now: its signer's certificate must be valid
     // now, not just as of the date the config claims.
     if let Some((who, until)) = crate::signing::expired_signer(&verified) {
@@ -2627,6 +2633,37 @@ mod tests {
         let current = n2.dynamic_config.read().await.clone();
         let pushed = accept_push(&n2, &current, back.clone(), 2).expect_err("refused");
         assert!(matches!(pushed, crate::config::MutateErr::Unauthorized(ref why) if why.contains("expired")), "{pushed:?}");
+    }
+
+    /// Without requireSignedConfig or any admins, `config push` from this
+    /// host (signed with the node's own certificate) is taken, as any other
+    /// change from the CLI here is; another member's isn't. With
+    /// requireSignedConfig, only an admin's.
+    #[test]
+    fn a_push_from_the_nodes_own_cli_is_taken_where_changes_neednt_be_signed() {
+        let dir = std::env::temp_dir().join(format!("stouter_ownpush_{}_{}", std::process::id(), rand::random::<u64>()));
+        let open = crate::state::test_support::tls_state_with(
+            &dir,
+            Config { node_id: "n1".into(), dynamic_config: DynamicConfig { version: 1, ..named_services(&["api"]) }, ..Config::default() },
+            String::new(),
+        );
+        let material = |id: &str| crate::pki::load_or_create(dir.to_str().unwrap(), id).unwrap();
+        let v2 = DynamicConfig { version: 2, ..named_services(&["api", "web"]) };
+        let current = DynamicConfig { version: 1, ..named_services(&["api"]) };
+        assert!(accept_push(&open, &current, signed_by(&material("n1"), &v2), 1).is_ok());
+        assert!(matches!(
+            accept_push(&open, &current, signed_by(&material("mallory"), &v2), 1),
+            Err(crate::config::MutateErr::Unauthorized(_))
+        ));
+
+        let c = signed_cluster();
+        let current = c.node.dynamic_config.try_read().unwrap().clone();
+        let own = crate::pki::load_or_create(c.dir.to_str().unwrap(), "n1").unwrap();
+        assert!(matches!(
+            accept_push(&c.node, &current, signed_by(&own, &v2), 1),
+            Err(crate::config::MutateErr::Unauthorized(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
