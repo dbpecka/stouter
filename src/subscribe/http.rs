@@ -364,10 +364,17 @@ impl HttpProxy {
 
             let sent = self.client.load().request(upstream);
             let result = match backend.request_timeout {
-                Some(limit) => match tokio::time::timeout(limit, sent).await {
-                    Ok(r) => r,
-                    Err(_) => break Outcome::Error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
-                },
+                // From when the tunnel is up: setting one up that takes
+                // longer fails as a connect error (below), which charges
+                // the node and moves on to another, where a timeout here
+                // would answer 504 and leave the node to be picked again.
+                Some(limit) => {
+                    let setup = Arc::new(TunnelSetup::new(limit));
+                    match answer_within(limit, &setup, TUNNEL_SETUP.scope(setup.clone(), sent)).await {
+                        Some(r) => r,
+                        None => break Outcome::Error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
+                    }
+                }
                 None => sent.await,
             };
 
@@ -430,6 +437,62 @@ impl HttpProxy {
         match (outcome, fallback) {
             (Outcome::Error(..), Some(fallback)) => fallback,
             (outcome, _) => outcome,
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The tunnel setup for the request being sent (see [`TunnelSetup`]):
+    /// the client calls its connector from within the request's future.
+    static TUNNEL_SETUP: Arc<TunnelSetup>;
+}
+
+/// A request's `requestTimeoutMs`, as its connector sees it: setting up a
+/// tunnel for the request may take that long, and the time to answer is
+/// counted from when it is up.
+struct TunnelSetup {
+    limit: Duration,
+    /// A tunnel is being set up for the request.
+    setting_up: std::sync::atomic::AtomicBool,
+    /// Signalled when that ends, up or failed.
+    done: tokio::sync::Notify,
+}
+
+impl TunnelSetup {
+    fn new(limit: Duration) -> Self {
+        Self { limit, setting_up: false.into(), done: tokio::sync::Notify::new() }
+    }
+
+    fn setting_up(&self) -> bool {
+        self.setting_up.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_setting_up(&self, now: bool) {
+        self.setting_up.store(now, std::sync::atomic::Ordering::Release);
+        if !now {
+            self.done.notify_one();
+        }
+    }
+}
+
+/// `sent`'s result, or `None` if the answer takes longer than `limit`
+/// counted from when the request's tunnel is up (or from the start, on a
+/// pooled connection). While a tunnel is being set up the connector's own
+/// limit applies, so a setup that hangs fails as a connect error.
+async fn answer_within<F: Future>(limit: Duration, setup: &TunnelSetup, sent: F) -> Option<F::Output> {
+    tokio::pin!(sent);
+    let mut deadline = tokio::time::Instant::now() + limit;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut sent => return Some(result),
+            () = setup.done.notified() => deadline = tokio::time::Instant::now() + limit,
+            () = tokio::time::sleep_until(deadline) => {
+                if !setup.setting_up() {
+                    return None;
+                }
+                deadline = tokio::time::Instant::now() + limit;
+            }
         }
     }
 }
@@ -852,6 +915,12 @@ impl tower_service::Service<Uri> for TunnelConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let service_name = self.service_name.clone();
         let state = self.state.clone();
+        // The request this connection is made for, with its limit (none:
+        // no requestTimeoutMs, or a connection made for the pool).
+        let setup = TUNNEL_SETUP.try_with(Arc::clone).ok();
+        if let Some(setup) = &setup {
+            setup.set_setting_up(true);
+        }
         Box::pin(async move {
             let node_id = node_id_from_uri(&uri).ok_or("invalid upstream node address")?;
             let node = state
@@ -861,7 +930,19 @@ impl tower_service::Service<Uri> for TunnelConnector {
                 .cloned()
                 .or_else(|| own_node(&state).filter(|own| own.id == node_id))
                 .ok_or_else(|| format!("unknown node {node_id}"))?;
-            let tunnel = establish_tunnel(&node, service_name, &state).await?;
+            let tunnel = match &setup {
+                Some(setup) => {
+                    let result = tokio::time::timeout(setup.limit, establish_tunnel(&node, service_name, &state)).await;
+                    setup.set_setting_up(false);
+                    result.map_err(|_| {
+                        format!(
+                            "setting up a tunnel to node {node_id} took over the request timeout ({} ms)",
+                            setup.limit.as_millis()
+                        )
+                    })??
+                }
+                None => establish_tunnel(&node, service_name, &state).await?,
+            };
             Ok(TunnelIo(TokioIo::new(tunnel)))
         })
     }
@@ -1124,6 +1205,122 @@ mod tests {
         proxies.reset_pools(|name| name == "api");
         assert!(!Arc::ptr_eq(&api_client, &api.client.load_full()));
         assert!(Arc::ptr_eq(&web_client, &web.client.load_full()));
+    }
+
+    /// A node stand-in for tunnels: it waits `setup` before its TLS
+    /// handshake, takes the tunnel request, then answers each HTTP request
+    /// `answer` after it arrives. Returns its address.
+    async fn fake_node(dir: &std::path::Path, id: &str, setup: Duration, answer: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let node = crate::state::test_support::tls_state(dir, id);
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let node = node.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(setup).await;
+                    let Ok(mut stream) = node.tls_accept(tcp).await else { return };
+                    let Ok(crate::gossip::messages::Message::TunnelRequest { .. }) =
+                        crate::gossip::recv_message(&mut stream).await
+                    else {
+                        return;
+                    };
+                    stream.write_all(&[0]).await.unwrap();
+                    let mut buf = vec![0; 8192];
+                    let mut got = 0;
+                    loop {
+                        match stream.read(&mut buf[got..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got += n,
+                        }
+                        if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                            got = 0;
+                            tokio::time::sleep(answer).await;
+                            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// One GET through `proxy`: the response's status.
+    async fn get_through(proxy: Arc<HttpProxy>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            proxy.serve_connection(tcp).await;
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nhost: api\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        response.get(9..12).and_then(|code| code.parse().ok()).unwrap_or(0)
+    }
+
+    /// requestTimeoutMs counts from when the tunnel is up. A tunnel whose
+    /// setup takes longer is a failed connection: the node is charged and
+    /// the request goes to another, rather than answering 504.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_request_timeout_starts_once_the_tunnel_is_up() {
+        let dir = std::env::temp_dir().join(format!("stouter_reqtimeout_{}_{}", std::process::id(), rand::random::<u64>()));
+        let ms = Duration::from_millis;
+        let nodes = [
+            ("hung", fake_node(&dir, "hung", Duration::from_secs(30), ms(0)).await),
+            ("slow-setup", fake_node(&dir, "slow-setup", ms(200), ms(200)).await),
+            ("slow-answer", fake_node(&dir, "slow-answer", ms(0), ms(600)).await),
+            ("prompt", fake_node(&dir, "prompt", ms(0), ms(0)).await),
+        ];
+        // Each case is its own service (own pool, own balancer).
+        let cases = [("a", vec!["hung"]), ("b", vec!["hung", "prompt"]), ("c", vec!["slow-setup"]), ("d", vec!["slow-answer"])];
+        let services: Vec<_> = cases
+            .iter()
+            .flat_map(|(service, on)| on.iter().map(move |node| serde_json::json!({
+                "name": service, "nodeId": node, "nodePort": 80, "protocol": "http", "requestTimeoutMs": 300,
+            })))
+            .collect();
+        let cfg = crate::config::Config {
+            node_id: "sub".into(),
+            mode: crate::config::Mode::Subscribe,
+            dynamic_config: serde_json::from_value(serde_json::json!({
+                "version": 1, "serviceGroups": [{"name": "g", "services": services}],
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        let sub = crate::state::test_support::tls_state_with(&dir, cfg, String::new());
+        sub.update_known_nodes(|kn| {
+            for (id, addr) in &nodes {
+                kn.insert(
+                    id.to_string(),
+                    crate::config::NodeInfo { id: id.to_string(), addr: addr.clone(), last_seen: Some(Instant::now()), ..Default::default() },
+                );
+            }
+        })
+        .await;
+        sub.rebuild_service_index().await;
+        let proxy = |service: &str| HttpProxy::new(service.into(), sub.clone(), Arc::new(Balancer::new()));
+
+        // Setup never finishes: a connect failure (502 once no node is
+        // left), not a 504, and within about the timeout.
+        let started = Instant::now();
+        assert_eq!(get_through(proxy("a")).await, 502);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // With another node to go to, every request gets through.
+        let b = proxy("b");
+        for _ in 0..4 {
+            assert_eq!(get_through(b.clone()).await, 200);
+        }
+        // 200 ms to set up and 200 ms to answer: within a 300 ms timeout.
+        assert_eq!(get_through(proxy("c")).await, 200);
+        // But an answer slower than the timeout still times out.
+        assert_eq!(get_through(proxy("d")).await, 504);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

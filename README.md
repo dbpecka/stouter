@@ -671,8 +671,11 @@ to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
 - **Per-request load balancing** over pooled keep-alive connections to each
   node, so one long-lived client connection is still spread across instances,
   and tunnels are reused instead of opened per request.
-- **Timeouts:** optional `requestTimeoutMs` per instance (time allowed for
-  response headers); expiry returns `504`.
+- **Timeouts:** optional `requestTimeoutMs` per instance: the time allowed
+  for response headers, counted from when the tunnel to the node is up;
+  expiry returns `504`. Setting up a new tunnel may take as long again: one
+  that takes longer counts as a failed connection, so the node is charged
+  (towards ejection) and the request goes to another node.
 - **Retries** go to a different node (up to 3 nodes in total):
   - when a connection to the chosen node can't be established (the request
     was never sent), for any method;

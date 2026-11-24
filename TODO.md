@@ -83,13 +83,14 @@ cluster" means one without `requireSignedConfig`.
   revocations.
   Fixed: (a) the CLI refuses to build on, or pull, a verified config older than the admin-signed one in its own config file; (b) `config rollback --to N` refuses a config that isn't, as signed, version N; (c) the same-version tie-break compares the number of revocations first, so the config revoking more wins on every node. (Two configs each revoking something different still settle by `changedBy`.)
 
-- [ ] **7. `requestTimeoutMs` firing during tunnel setup returns 504, with no retry and no ejection.**
+- [x] **7. `requestTimeoutMs` firing during tunnel setup returns 504, with no retry and no ejection.**
   `src/subscribe/http.rs:366-371` wraps the whole request, connector included;
   only connector errors reach the retry / `note_tunnel_failure` path (`:402`). A
   node whose tunnel setup hangs gets every request picked for it 504'd, and is
   never ejected: setting a timeout makes failover worse.
   Fix: start the request timeout once the tunnel is up; a timeout before that is
   a connect failure (charge the node, retry elsewhere).
+  Fixed: `requestTimeoutMs` counts from when the tunnel is up. Setting one up may take as long again; a setup taking longer fails as a connect error, so the node is charged and the request retried on another (502 if none is left), not answered 504.
 
 - [x] **8. Same-version hand edits are lost or ignored.**
   (a) The config poll (`src/gossip/mod.rs:595-596`) compares only services and
