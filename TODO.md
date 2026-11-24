@@ -184,3 +184,92 @@ cluster" means one without `requireSignedConfig`.
 - [ ] **27. `tests/e2e/renew.sh` never checks that the CA node still answers after
   its first certificate expires** (lines 35-37). Add `check "A answers past its
   first certificate's expiry" status A`.
+
+# Second review, of main at 8568087
+
+Four independent reviews again (identity and security; gossip, config and
+history; data plane; CLI, operations and docs), each finding checked
+against the code. Numbered on from the list above.
+
+## High
+
+- [x] **28. One peer could still make a node hold 1–2 GiB through mux streams.**
+  The fix for #1 capped each session at 128 MiB, but a peer may open 16
+  sessions, and a stream let go of its waiting place once its request was
+  read: a request for a made-up NAT'd node then waited 10 s at the relay,
+  its window filling unread (measured: +1023 MiB with 16 sessions).
+  Fixed: a peer's mux streams count against a budget of 512 across all its sessions until their tunnel is connected (128 MiB; measured +139 MiB with 16 sessions), and a relay refuses at once a tunnel to a node that keeps no reverse connections there.
+
+- [x] **29. Two configs at one version signed over an hour apart split the cluster for good.**
+  The tie-break picked one (more revocations, then changedBy), but nodes
+  holding the other refused it as signed too early.
+  Fixed: such ties go to the later-signed config (the one every node accepts); closer ones as before; a node dropping a revocation in a tie warns.
+
+## Medium
+
+- [x] **30. An expired, unrevoked admin key could still change the config.**
+  Dating a config back into its certificate's life: nodes took it in a
+  quiet cluster (nothing signed since the expiry) and new nodes always; an
+  honest admin's CLI, served one, built a change on it and signed it over.
+  Fixed: running nodes take no config from an expired signer (only a node catching up in its first two minutes does); pushes need a signer valid now; the CLI refuses served configs its own signed config contradicts (older, another at the same version, signed too early, or newer from an expired signer, unless `config pull --accept-expired-signer`); nodes warn while the config in force has an expired signer, and `config push` re-signs it. Left: a node starting up can still take one (it can't tell it from the cluster's genuine config); revoke retired admin certificates.
+
+- [x] **31. Stamping an edit made while the daemon was stopped went wrong three ways.**
+  It could take the version of a change the cluster made meanwhile (the
+  tie-break then dropped one silently); on a node behind the cluster the
+  first sync overwrote it with no `.unapplied` copy; and it skipped the
+  checks, so an edit the running daemon refused spread at its next restart.
+  Fixed: the daemon starts on the config it last ran, and its poll takes the file's edit once caught up (first sync, no peers, or two minutes), checked, as a new version; if the cluster moved on, the edit is kept as `.unapplied`.
+
+- [x] **32. A `requestTimeoutMs` of 5 s or less stopped relay failover.**
+  Tunnel setup was bounded by it, but the first relay got 5 s before the
+  next was tried, so a dead relay failed every request and got the NAT'd
+  node ejected.
+  Fixed: a NAT'd node's relays share the setup's budget (min(5 s, an equal share of what's left) each), and a relay that didn't answer in time is tried last for 20 s.
+
+- [x] **33. One member could slow every node's gossip merges.**
+  All syncs waited on one signature-check semaphore, with no limit per
+  peer (an honest merge took 3.8 s behind 200 junk syncs, debug build).
+  Fixed: a sync with nothing to check skips the queue, and a peer may have at most 2 syncs being checked at once.
+
+- [ ] **34. A burst of tunnels to a 1-CPU node may reset healthy streams (unconfirmed).**
+  `src/mux.rs`: the session accept loop doesn't yield; on a single tokio
+  worker a burst could exceed the stream budget before any stream runs,
+  and each reset is charged to the node by the subscriber. A reviewer saw
+  13–34 resets per 100 tunnels; not reproduced on a 4-CPU host. (#28 made
+  the budget 512 and separate from warm connections, which should help.)
+
+## Low
+
+- [ ] **35. `config pull` writes an unsigned served config over an admin-signed local file**,
+  replacing the revocation list the CLI trusts. Fix: refuse an unsigned
+  config when the file holds a verified signed one.
+- [ ] **36. `"tlsDir": ""` passes `check` and `check --local`;** the daemon then makes a new
+  CA in the container's working directory on every redeploy. Fix: treat a
+  blank tlsDir as unset; warn in deploy.sh and docker-create.sh.
+- [ ] **37. In `deploy.sh`, a cluster named `build` (or `config`) lives inside the default
+  cluster's directories;** deploying the default cluster wipes its config
+  and CA. Fix: reserve the names, or put named clusters under `clusters/`.
+- [ ] **38. The relative version bound strands a new node** (version 0) if the cluster's
+  version is above 2^28 (say, a Unix timestamp set by hand). Fix: exempt
+  the empty version-0 config, or bound versions absolutely.
+- [ ] **39. Certificate expiry is checked only at the handshake:** long-lived connections
+  and beats from an expired certificate keep working.
+- [ ] **40. `requestTimeoutMs` can be exceeded up to twice over** when a request ends up
+  on a pooled connection that came free while its own tunnel was being set
+  up (the background setup keeps extending its deadline).
+- [ ] **41. The HTTP pool's 60 s idle timeout is never enforced** (no `pool_timer`), so
+  idle tunnels linger until the node's 300 s timeout.
+- [x] **42. At startup, an edit with its version raised by hand keeps the old signature**
+  (`status` and history name an admin who never signed it).
+  Fixed: #31 routes offline edits through the config poll, which now clears the signature and `signedAt` of any edit it takes and makes this node its author (the time tie-break of #29 applies only to configs that are signed).
+- [ ] **43. A hand edit that doesn't parse is ignored at runtime with only a debug log.**
+- [ ] **44. `deploy.sh` installs the new host binary before the config check** that may
+  abort the deploy.
+- [ ] **45. If `deploy.sh`'s image probe fails for any reason, it skips the config check**
+  instead of aborting.
+- [ ] **46. The CLI panics (exit 101) on a closed pipe** (`stouter config history | head`).
+- [ ] **47. A huge `signedAt` overflows** formatting a refusal before any signature is
+  checked (panic in debug builds). Partly fixed with #30 (`saturating_mul`
+  in `verify`); check the other call sites.
+- [ ] **48. `service move` and `--remote` with another cluster's `--cert-dir`** apply this
+  cluster's revocations to the other one (fails safe, confusing error).
