@@ -479,6 +479,11 @@ pub struct SharedState {
     /// Until when this node counts as catching up after starting (see
     /// [`SharedState::catching_up`]).
     pub(crate) catch_up_until: Mutex<std::time::Instant>,
+    /// The config file was edited while the daemon was stopped: its config
+    /// poll takes the edit once caught up (see `gossip::run_config_poll_loop`).
+    pub edited_offline: std::sync::atomic::AtomicBool,
+    /// Whether a sync with a peer has been merged since this node started.
+    pub(crate) synced: std::sync::atomic::AtomicBool,
     /// The config version last warned about for a signer whose certificate
     /// expired (see `renew::warn_if_config_signer_expired`).
     pub(crate) warned_expired_signer: Mutex<Option<u64>>,
@@ -578,6 +583,8 @@ impl SharedState {
             relayed_here: Mutex::new(HashMap::new()),
             catch_up_until: Mutex::new(std::time::Instant::now() + CATCH_UP),
             warned_expired_signer: Mutex::new(None),
+            edited_offline: std::sync::atomic::AtomicBool::new(false),
+            synced: std::sync::atomic::AtomicBool::new(false),
             delta_peers: Mutex::new(HashMap::new()),
             own_beat: Mutex::new(None),
             leaving: std::sync::atomic::AtomicBool::new(false),
@@ -899,6 +906,15 @@ impl SharedState {
     /// certificate that has since expired (see `signing::admit`).
     pub fn catching_up(&self) -> bool {
         std::time::Instant::now() < *self.catch_up_until.lock().unwrap()
+    }
+
+    /// Whether this node has caught up with the cluster since it started:
+    /// it merged a sync with a peer, has no peers to sync with, or is past
+    /// [`CATCH_UP`].
+    pub fn caught_up(&self) -> bool {
+        self.synced.load(std::sync::atomic::Ordering::Relaxed)
+            || !self.catching_up()
+            || (self.bootstrap_peers.is_empty() && self.known_nodes.load().is_empty())
     }
 
     /// Note that NAT'd node `node` (as its certificate says) just registered

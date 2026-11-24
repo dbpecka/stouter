@@ -85,10 +85,13 @@ can't start with or use: no `tlsDir`, or a `bind` (unless `outboundOnly`),
 same checks as a change made with the CLI: one that would break the config
 is refused, with a warning. An edit to any of it (a service, a policy, a
 revocation) is taken without raising its version by hand: the daemon gives
-it the next version, whether it was running (it checks the file every few
-seconds) or stopped (at startup, comparing the file with the last version
-in its config history). Without `requireSignedConfig`, that is; with it, a
-hand edit isn't taken at all.
+it the next version (it checks the file every 10 seconds). One made while
+the daemon was stopped (the file says something else than the last version
+in its config history) waits until the daemon has caught up with the
+cluster after starting (a first sync, or two minutes): if the cluster moved
+on meanwhile, the newer config comes first and the edit is kept as
+`<config>.unapplied`, to make again on top of it. Without
+`requireSignedConfig`, that is; with it, a hand edit isn't taken at all.
 
 CLI commands that change the local file (`init`, `service add` without
 `--remote`, and so on) refuse a file they can't parse instead of starting

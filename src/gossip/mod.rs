@@ -539,6 +539,16 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             _ = interval.tick() => {}
             _ = state.shutdown.cancelled() => break,
         }
+        // An edit made while the daemon was stopped waits until it has
+        // caught up: if the cluster moved on meanwhile, the newer config
+        // arrives first and the edit is kept aside (see persist_state_with)
+        // instead of meeting the cluster's change at the same version.
+        if state.edited_offline.load(std::sync::atomic::Ordering::Relaxed) {
+            if !state.caught_up() {
+                continue;
+            }
+            state.edited_offline.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Read the file under the lock every persist also holds, so the file
         // and memory are compared as one consistent snapshot.
@@ -1240,6 +1250,7 @@ async fn merge_sync(
         }
         changed
     }).await;
+    state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Replace `dc` with `incoming` if it supersedes it and this node may adopt
@@ -2183,6 +2194,72 @@ mod tests {
         file.policies.push(crate::config::Policy { service: "api".into(), allow: vec!["n2".into()] });
         let (taken, _) = poll_once(file, memory).await;
         assert_eq!((taken.version, taken.policies.len()), (6, 1));
+    }
+
+    /// The daemon ran version 5; while it was stopped, its file was edited.
+    /// It starts on version 5 (see `edited_while_stopped` in main.rs), and
+    /// its poll takes the edit only once caught up with the cluster.
+    async fn started_after_an_offline_edit(edit: DynamicConfig) -> (Arc<SharedState>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("stouter_offline_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path_s = path.to_str().unwrap().to_string();
+        let ran = DynamicConfig { version: 5, ..named_services(&["api"]) };
+        crate::history::record(&path_s, &ran);
+        let cfg = Config { node_id: "me".into(), known_nodes: vec!["10.9.9.9:1".into()], dynamic_config: edit, ..Config::default() };
+        cfg.save(&path_s).unwrap();
+        let state = SharedState::new(Config { dynamic_config: ran, ..cfg }, path_s, CancellationToken::new(), None);
+        state.edited_offline.store(true, std::sync::atomic::Ordering::Relaxed);
+        (state, dir)
+    }
+
+    async fn poll_for_a_while(state: &Arc<SharedState>) {
+        let poll = tokio::spawn(run_config_poll_loop(state.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        poll.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offline_edit_is_taken_once_caught_up_or_kept_aside() {
+        let edit = DynamicConfig { version: 5, ..named_services(&["api", "edited"]) };
+        let file_of = |state: &SharedState| Config::load(&state.config_path).unwrap().dynamic_config;
+
+        // In step with the cluster: nothing until the first sync, then the
+        // edit as version 6, by this node.
+        let (state, dir) = started_after_an_offline_edit(edit.clone()).await;
+        poll_for_a_while(&state).await;
+        assert_eq!(state.dynamic_config.read().await.version, 5, "not before catching up");
+        assert_eq!(service_names(&file_of(&state)), ["api", "edited"], "the edit stays in the file");
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_for_a_while(&state).await;
+        let dc = state.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, service_names(&dc), dc.changed_by.as_str()), (6, vec!["api".into(), "edited".into()], "me"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The cluster moved on while it was stopped: its config arrives
+        // first, and the edit is kept aside, not dropped or sent out.
+        let (state, dir) = started_after_an_offline_edit(edit.clone()).await;
+        let v9 = DynamicConfig { version: 9, changed_by: "a".into(), ..named_services(&["api", "from-a"]) };
+        {
+            let mut dc = state.dynamic_config.write().await;
+            assert!(adopt_if_newer(&state, &mut dc, v9, "test"));
+        }
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_for_a_while(&state).await;
+        let dc = state.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, service_names(&dc)), (9, vec!["api".into(), "from-a".into()]));
+        let aside = Config::load(&format!("{}.unapplied", state.config_path)).unwrap().dynamic_config;
+        assert_eq!(service_names(&aside), ["api", "edited"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An edit that breaks the config gets the checks any edit gets.
+        let mut broken = DynamicConfig { version: 5, ..named_services(&["api"]) };
+        broken.routes.push(serde_json::from_value(serde_json::json!({"service": "nope", "backends": [{}]})).unwrap());
+        let (state, dir) = started_after_an_offline_edit(broken).await;
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_for_a_while(&state).await;
+        assert_eq!(state.dynamic_config.read().await.version, 5, "refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]
