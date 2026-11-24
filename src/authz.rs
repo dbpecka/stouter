@@ -74,10 +74,18 @@ pub fn authorize(
                     return Err(format!("tunnel request to '{service}' signed by '{signer}' but sent by '{peer}'"));
                 }
             }
-            if !state.tunnel_nonces.lock().unwrap().note(&signer, signed.nonce) {
-                return Err(format!("tunnel request to '{service}' from '{signer}' was already used"));
-            }
-            signer
+            // Its nonce is noted (against replays) only once the caller is
+            // known to be allowed, below: a refused caller would otherwise
+            // fill the cache, locking allowed ones out.
+            return if signer == own || may_reach(state, service, &signer) {
+                if state.tunnel_nonces.lock().unwrap().note(&signer, signed.nonce) {
+                    Ok(())
+                } else {
+                    Err(format!("tunnel request to '{service}' from '{signer}' was already used (or it sent too many)"))
+                }
+            } else {
+                refuse(service, &signer)
+            };
         }
         (None, Via::Direct(Some(peer))) => peer.to_string(),
         (None, Via::Direct(None)) => return Err("the caller's certificate names no node".into()),
@@ -91,6 +99,11 @@ pub fn authorize(
     if who == own || may_reach(state, service, &who) {
         return Ok(());
     }
+    refuse(service, &who)
+}
+
+/// Refuse `who` a tunnel to `service` (policy), counted.
+fn refuse(service: &str, who: &str) -> Result<(), String> {
     metrics::counter!("stouter_tunnel_denied_total", "service" => service.to_string()).increment(1);
     tracing::debug!("refusing a tunnel to '{service}' from '{who}' (policy)");
     Err(format!("node '{who}' may not reach service '{service}' (policy)"))
@@ -105,31 +118,49 @@ const NONCE_TTL: Duration = Duration::from_secs(70);
 /// signed requests are refused until older nonces expire.
 const MAX_NONCES: usize = 100_000;
 
+/// Most nonces remembered for one signer: a tenth of the cache, so one
+/// allowed caller flooding its own requests can't crowd out the others.
+const MAX_NONCES_PER_SIGNER: usize = MAX_NONCES / 10;
+
 /// Recently seen nonces of signed tunnel requests, by signer.
 pub struct NonceCache {
     seen: HashMap<(String, u64), Instant>,
+    /// How many of `seen` each signer has.
+    per_signer: HashMap<String, usize>,
     pruned: Instant,
 }
 
 impl Default for NonceCache {
     fn default() -> Self {
-        Self { seen: HashMap::new(), pruned: Instant::now() }
+        Self { seen: HashMap::new(), per_signer: HashMap::new(), pruned: Instant::now() }
     }
 }
 
 impl NonceCache {
     /// Remember `signer`'s `nonce`; false if it was already seen (a replay)
-    /// or there is no room.
+    /// or there is no room (for anyone, or for this signer).
     fn note(&mut self, signer: &str, nonce: u64) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.pruned) >= Duration::from_secs(1) || self.seen.len() >= MAX_NONCES {
+        let mine = self.per_signer.get(signer).copied().unwrap_or(0);
+        if now.duration_since(self.pruned) >= Duration::from_secs(1)
+            || self.seen.len() >= MAX_NONCES
+            || mine >= MAX_NONCES_PER_SIGNER
+        {
             self.seen.retain(|_, at| now.duration_since(*at) < NONCE_TTL);
+            self.per_signer.clear();
+            for (who, _) in self.seen.keys() {
+                *self.per_signer.entry(who.clone()).or_insert(0) += 1;
+            }
             self.pruned = now;
         }
-        if self.seen.len() >= MAX_NONCES {
+        if self.seen.len() >= MAX_NONCES || self.per_signer.get(signer).copied().unwrap_or(0) >= MAX_NONCES_PER_SIGNER {
             return false;
         }
-        self.seen.insert((signer.to_string(), nonce), now).is_none()
+        if self.seen.insert((signer.to_string(), nonce), now).is_some() {
+            return false;
+        }
+        *self.per_signer.entry(signer.to_string()).or_insert(0) += 1;
+        true
     }
 }
 
@@ -226,5 +257,33 @@ mod tests {
             cache.seen.insert(("f".into(), i), Instant::now());
         }
         assert!(!cache.note("a", 2));
+
+        // One signer gets at most its share, and others still have room.
+        let mut cache = NonceCache::default();
+        for i in 0..MAX_NONCES_PER_SIGNER as u64 {
+            assert!(cache.note("flood", i));
+        }
+        assert!(!cache.note("flood", u64::MAX), "its share is used up");
+        assert!(cache.note("other", 1));
+    }
+
+    /// A caller the policy refuses leaves no nonce behind: otherwise it could
+    /// fill the cache and lock allowed callers out (through relays, where
+    /// requests must be signed).
+    #[test]
+    fn refused_callers_use_up_no_room() {
+        let (dir, x, signer) = setup();
+        let b = signer("b");
+        for _ in 0..1000 {
+            let ts = now_ms();
+            let req = sign_tunnel_request(&b, "x", "db", ts).unwrap();
+            assert!(authorize(&x, "db", ts, Some(&req), Via::Relay).is_err());
+        }
+        assert!(x.tunnel_nonces.lock().unwrap().seen.is_empty());
+        let ts = now_ms();
+        let req = sign_tunnel_request(&signer("a"), "x", "db", ts).unwrap();
+        assert!(authorize(&x, "db", ts, Some(&req), Via::Relay).is_ok());
+        assert!(authorize(&x, "db", ts, Some(&req), Via::Relay).is_err(), "a replay");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

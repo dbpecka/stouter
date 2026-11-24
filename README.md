@@ -404,7 +404,10 @@ the daemon (`--remote`) or the local file like `service` commands. With
   requests to NAT'd nodes, and those nodes take a request through a relay
   for a service with a policy only if it is signed by a node the policy
   lists. A relay can pass a request on but not make one up for another node,
-  and a request passed on twice is refused. (A relay still carries the
+  and a request passed on twice is refused (a caller signs its request
+  afresh for each relay it tries; only allowed callers' requests are
+  remembered for that, each caller with a share of the room). (A relay
+  still carries the
   tunnel's bytes, as it always has: it can tamper with or cut off the
   tunnels that go through it.)
 - A subscriber doesn't proxy a service its policy keeps it from, so local

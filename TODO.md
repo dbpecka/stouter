@@ -129,14 +129,16 @@ cluster" means one without `requireSignedConfig`.
 
 ## Low
 
-- [ ] **12. Refused callers fill the replay cache.** `src/authz.rs:77` records a
+- [x] **12. Refused callers fill the replay cache.** `src/authz.rs:77` records a
   signed request's nonce before the policy check (`:91`); a refused member can
   fill the 100,000-entry cache and lock out allowed callers through relays.
   Fix: record the nonce only once the caller is allowed; cap entries per signer.
-- [ ] **13. One signed nonce is reused across relay failover.** `src/subscribe/proxy.rs:448-457`
+  Fixed: a signed request's nonce is noted only once the caller is allowed, and one signer may hold at most a tenth of the cache.
+- [x] **13. One signed nonce is reused across relay failover.** `src/subscribe/proxy.rs:448-457`
   signs once and reuses the request on every route (`:487-505`); if relay 1
   delivered it but answered slowly, relay 2's attempt is refused as a replay.
   Fix: sign a fresh request per route.
+  Fixed: the request is signed afresh for each route tried.
 - [ ] **14. A route with no backends crashes every request it matches.**
   `src/subscribe/http.rs:530` indexes `route.backends[0]`; gossip adopts such
   routes (`src/state.rs:918` indexes them unchecked). Fix: skip routes with no

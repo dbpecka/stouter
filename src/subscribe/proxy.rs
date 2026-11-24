@@ -465,21 +465,24 @@ async fn establish_tunnel_untimed(
     // A NAT'd node is reached through a relay or a reverse connection,
     // where the certificate it sees is the relay's: sign the request, so it
     // knows who asks (see `crate::authz`). Directly, our certificate says.
-    let caller = if node.addr.is_empty() {
-        state.signer.get().and_then(|signer| {
-            crate::signing::sign_tunnel_request(signer, &node.id, &service_name, timestamp_ms)
-                .map_err(|e| tracing::warn!("can't sign the tunnel request to {}: {e:#}", node.id))
-                .ok()
-        })
-    } else {
-        None
-    };
-    let msg = Message::TunnelRequest {
+    // Signed afresh for each route tried: a request one relay delivered, but
+    // answered too slowly, would otherwise be refused through the next as a
+    // replay of its nonce.
+    let request = || Message::TunnelRequest {
         node_id: node.id.clone(),
-        service_name,
+        service_name: service_name.clone(),
         timestamp_ms,
-        caller,
+        caller: if node.addr.is_empty() {
+            state.signer.get().and_then(|signer| {
+                crate::signing::sign_tunnel_request(signer, &node.id, &service_name, timestamp_ms)
+                    .map_err(|e| tracing::warn!("can't sign the tunnel request to {}: {e:#}", node.id))
+                    .ok()
+            })
+        } else {
+            None
+        },
     };
+    let msg = request();
     let connect_start = Instant::now();
 
     // A reverse connection the node holds to us: it registered it with its
@@ -507,7 +510,14 @@ async fn establish_tunnel_untimed(
     }
     let mut last_err = None;
     for (i, (addr, expect)) in routes.iter().enumerate() {
-        let attempt = tunnel_via(addr, expect.as_deref(), &msg, state, connect_start);
+        let fresh;
+        let msg = if i == 0 {
+            &msg
+        } else {
+            fresh = request();
+            &fresh
+        };
+        let attempt = tunnel_via(addr, expect.as_deref(), msg, state, connect_start);
         let result = if i + 1 < routes.len() {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             let slice = RELAY_ROUTE_TIMEOUT.min(left / (routes.len() - i) as u32);
@@ -856,13 +866,20 @@ mod tests {
             [a, b] => (a.1.clone().unwrap(), b.1.clone().unwrap()),
             other => panic!("{other:?}"),
         };
-        // The first takes connections and says nothing.
+        // The first takes the tunnel request and says nothing more.
+        let (nonces_tx, mut nonces) = tokio::sync::mpsc::unbounded_channel();
         let hung = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hung_addr = hung.local_addr().unwrap().to_string();
+        let first_state = tls_state(&dir, &first);
+        let first_nonces = nonces_tx.clone();
         tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((tcp, _)) = hung.accept().await {
-                held.push(tcp);
+                let Ok(mut stream) = first_state.tls_accept(tcp).await else { continue };
+                if let Ok(Message::TunnelRequest { caller, .. }) = gossip::recv_message(&mut stream).await {
+                    let _ = first_nonces.send(caller.map(|c| c.nonce));
+                }
+                held.push(stream);
             }
         });
         let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -871,7 +888,8 @@ mod tests {
         tokio::spawn(async move {
             let (tcp, _) = up.accept().await.unwrap();
             let mut stream = second_state.tls_accept(tcp).await.unwrap();
-            let Ok(Message::TunnelRequest { .. }) = gossip::recv_message(&mut stream).await else { return };
+            let Ok(Message::TunnelRequest { caller, .. }) = gossip::recv_message(&mut stream).await else { return };
+            let _ = nonces_tx.send(caller.map(|c| c.nonce));
             use tokio::io::AsyncWriteExt;
             stream.write_all(&[0]).await.unwrap();
             stream.write_all(b"via the second relay").await.unwrap();
@@ -893,6 +911,10 @@ mod tests {
         tunnel.read_to_string(&mut got).await.unwrap();
         assert_eq!(got, "via the second relay");
         assert_eq!(tunnel_routes(&natd, &sub)[0].1.as_deref(), Some(second.as_str()), "the hung relay goes last");
+        // Each relay got a request signed afresh: had the first passed its
+        // request on, the node would refuse the second's as a replay.
+        let (a, b) = (nonces.recv().await.unwrap(), nonces.recv().await.unwrap());
+        assert!(a.is_some() && b.is_some() && a != b, "{a:?} {b:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
