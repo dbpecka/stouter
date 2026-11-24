@@ -416,15 +416,8 @@ enum RouteAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging from RUST_LOG, defaulting to "info".
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+    init_logging(cli.command.is_none());
 
     match cli.command {
         // -----------------------------------------------------------------
@@ -1517,6 +1510,27 @@ fn stamp_offline_edit(cfg: &Config, history: &[history::HistoryEntry]) -> Option
         signature: None,
         ..dc.clone()
     })
+}
+
+/// Structured logging, filtered by `RUST_LOG` if set. The daemon logs to
+/// stdout, from `info` up. A CLI command logs to stderr, only warnings and
+/// errors by default, so what it prints on stdout (the JSON of `config
+/// history --version N`, say) is all there is. Colour only on a terminal.
+fn init_logging(daemon: bool) {
+    use std::io::IsTerminal;
+    let filter = |default: &str| {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default))
+    };
+    let logs = tracing_subscriber::fmt();
+    if daemon {
+        logs.with_env_filter(filter("info")).with_ansi(std::io::stdout().is_terminal()).init();
+    } else {
+        logs.with_env_filter(filter("warn"))
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
+    }
 }
 
 /// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,

@@ -197,6 +197,8 @@ Services are organized into groups. Each service entry maps a name to a local po
 
 Without `--remote`, these commands make the change through this host's daemon when it is running (`outboundOnly` ones have no listener to ask), as if `--remote` named it: editing the file behind a running daemon's back could undo a change the daemon took in at the same moment. Otherwise they edit the file, refusing if it changed while they ran. The daemon accepts these changes from its own certificate; with `requireSignedConfig` they must still be signed by an admin. `--node` defaults to this host's node, or with `--remote`, to the node at that address.
 
+CLI commands print their results on stdout, and only those: their log lines (warnings and errors; more with `RUST_LOG=info`) go to stderr. The daemon logs to stdout from `info` up (`RUST_LOG` sets the level), in colour only on a terminal.
+
 `stouter service move` copies a service from one cluster to another and then removes it from the source. It refuses to move onto an instance the destination already has (it would replace it, and a rollback would then delete it). If the source doesn't answer the remove, it checks whether the service is still there before rolling the add back, so the service isn't left in neither cluster.
 
 ```json

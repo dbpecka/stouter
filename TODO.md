@@ -117,10 +117,11 @@ cluster" means one without `requireSignedConfig`.
   Fix: move those checks into `validate_local`; have `init` write a `tlsDir`;
   catch and keep unknown keys in the nested structs too (or correct the README).
 
-- [ ] **11. The CLI's log lines go to stdout, with colour codes.**
+- [x] **11. The CLI's log lines go to stdout, with colour codes.**
   `src/main.rs:420-425`. Breaks machine-readable output (e.g. the JSON from
   `config history --version N`), and pollutes `status` and `cert issue`.
   Fix: log to stderr; default CLI subcommands to `warn`; no colour off a terminal.
+  Fixed: CLI commands log to stderr, warnings and errors only by default (`RUST_LOG` for more); the daemon logs to stdout as before; colour only on a terminal.
 
 ## Low
 
