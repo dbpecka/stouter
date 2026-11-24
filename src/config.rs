@@ -428,8 +428,9 @@ impl DynamicConfig {
         })
     }
 
-    /// Whether `self` and `other` configure the same services and routes,
-    /// whatever their version, author and signature.
+    /// Whether `self` and `other` say the same (services, routes, policies,
+    /// revocations, every setting), whatever their version, author, signing
+    /// time and signature.
     pub fn same_settings(&self, other: &DynamicConfig) -> bool {
         let bare = |dc: &DynamicConfig| DynamicConfig {
             version: 0,

@@ -561,7 +561,6 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                 // Only an admin-signed config counts: the CLI's local path
                 // writes one, a hand edit can't. It is adopted exactly as
                 // signed (no version bump, no changedBy).
-                let content = |c: &crate::config::DynamicConfig| (c.service_groups.clone(), c.routes.clone());
                 match crate::signing::admit(&state, file_dc.clone(), &dc) {
                     Ok(signed) if signed.supersedes(&dc) => {
                         info!("config file has a newer signed config: version {} -> {}", current_version, signed.version);
@@ -578,10 +577,10 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                         // Edited by hand: unsigned, or a signature that
                         // covers something else than the file now says.
                         let edited = match &verdict {
-                            Ok(signed) => content(signed) != content(&file_dc),
-                            Err(_) => content(&file_dc) != content(&dc),
+                            Ok(signed) => !signed.same_settings(&file_dc),
+                            Err(_) => !file_dc.same_settings(&dc),
                         };
-                        let key = serde_json::to_string(&content(&file_dc)).unwrap_or_default();
+                        let key = config_text(&file_dc);
                         if edited && warned_unsigned.as_ref() != Some(&key) {
                             warn!(
                                 "ignoring the edit to {}: this node accepts only signed config changes \
@@ -602,9 +601,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
                     current_version, file_dc.version
                 );
                 file_dc
-            } else if file_dc.version == current_version
-                && (file_dc.service_groups != dc.service_groups || file_dc.routes != dc.routes)
-            {
+            } else if file_dc.version == current_version && !file_dc.same_settings(&dc) {
                 info!(
                     "manual config edit detected; auto-bumping version {} -> {}",
                     current_version,
@@ -2147,6 +2144,22 @@ mod tests {
         let last = DynamicConfig { version: u64::MAX, ..named_services(&["old"]) };
         let (taken, _) = poll_once(DynamicConfig { version: u64::MAX, ..named_services(&["edited"]) }, last.clone()).await;
         assert_eq!(taken, last);
+    }
+
+    /// A hand edit at the same version is taken whatever it changes, not
+    /// only services and routes: a revocation, a policy.
+    #[tokio::test(start_paused = true)]
+    async fn poll_takes_a_hand_edit_to_any_setting() {
+        let memory = DynamicConfig { version: 5, ..named_services(&["api"]) };
+        let mut file = memory.clone();
+        file.revoked.nodes.push("x".into());
+        let (taken, _) = poll_once(file, memory.clone()).await;
+        assert_eq!((taken.version, taken.revoked.nodes.clone()), (6, vec!["x".to_string()]));
+
+        let mut file = memory.clone();
+        file.policies.push(crate::config::Policy { service: "api".into(), allow: vec!["n2".into()] });
+        let (taken, _) = poll_once(file, memory).await;
+        assert_eq!((taken.version, taken.policies.len()), (6, 1));
     }
 
     #[tokio::test(start_paused = true)]

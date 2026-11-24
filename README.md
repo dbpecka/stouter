@@ -78,7 +78,12 @@ would otherwise leave signing off without a word, or one from a newer
 version) is logged as a warning at startup and fails `stouter check`; it is
 kept when the file is rewritten. A hand edit to `dynamicConfig` gets the
 same checks as a change made with the CLI: one that would break the config
-is refused, with a warning.
+is refused, with a warning. An edit to any of it (a service, a policy, a
+revocation) is taken without raising its version by hand: the daemon gives
+it the next version, whether it was running (it checks the file every few
+seconds) or stopped (at startup, comparing the file with the last version
+in its config history). Without `requireSignedConfig`, that is; with it, a
+hand edit isn't taken at all.
 
 CLI commands that change the local file (`init`, `service add` without
 `--remote`, and so on) refuse a file they can't parse instead of starting

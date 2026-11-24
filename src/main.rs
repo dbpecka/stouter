@@ -457,6 +457,19 @@ async fn main() -> Result<()> {
             tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
 
             cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
+            if let Some(stamped) = stamp_offline_edit(&cfg, &history::load(&cli.config)) {
+                tracing::info!(
+                    "{}: edited while the daemon was stopped (version {} as it last ran, with other settings); \
+                     taking it as version {}",
+                    cli.config,
+                    cfg.dynamic_config.version,
+                    stamped.version
+                );
+                cfg.dynamic_config = stamped;
+                if let Err(e) = cfg.save(&cli.config) {
+                    tracing::warn!("can't write version {} to {}: {e:#}", cfg.dynamic_config.version, cli.config);
+                }
+            }
 
             let state = SharedState::new(cfg.clone(), cli.config.clone(), shutdown.clone(), Some(tls_ctx));
             // The version this node starts on begins (or continues) its history.
@@ -1471,6 +1484,41 @@ fn startup_config(cfg: &Config, tls_ctx: &tls::TlsContext, path: &str) -> config
     }
 }
 
+/// The config file's config as a new version, if it was edited by hand
+/// while the daemon was stopped: at the version the daemon last ran
+/// (`history`'s newest entry) but saying something else. It gets the next
+/// version and this node as its author, as the config poll gives an edit
+/// made while the daemon runs. Taken as it was, it would meet the cluster's
+/// config at the same version and be settled by the tie-break: reverted
+/// with no trace, or spread with no new version.
+///
+/// Not with `requireSignedConfig`, where an edit isn't taken at all (see
+/// [`startup_config`]); nor without a history to compare with.
+fn stamp_offline_edit(cfg: &Config, history: &[history::HistoryEntry]) -> Option<config::DynamicConfig> {
+    if cfg.require_signed_config {
+        return None;
+    }
+    let ran = history.last()?.config.as_ref()?;
+    let dc = &cfg.dynamic_config;
+    if dc.version != ran.version || dc.same_settings(ran) {
+        return None;
+    }
+    let version = match dc.next_version() {
+        Ok(version) => version,
+        Err(e) => {
+            tracing::warn!("the config file was edited while the daemon was stopped, but {e}");
+            return None;
+        }
+    };
+    Some(config::DynamicConfig {
+        version,
+        changed_by: cfg.node_id.clone(),
+        signed_at: None,
+        signature: None,
+        ..dc.clone()
+    })
+}
+
 /// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or, on Unix,
 /// SIGTERM, which is what `docker stop`, systemd and Kubernetes send. Returns
 /// the signal's name.
@@ -2167,6 +2215,36 @@ mod tests {
         // Up to date, or ahead (a daemon behind the rest): fine.
         assert!(stale_push(&at(5), &at(5), "stouter.json", false).is_none());
         assert!(stale_push(&at(5), &at(6), "stouter.json", false).is_none());
+    }
+
+    #[test]
+    fn an_edit_made_while_the_daemon_was_stopped_gets_a_new_version() {
+        let ran = api_on_port(3000); // version 3
+        let entry = |dc: &config::DynamicConfig| history::HistoryEntry {
+            version: dc.version,
+            changed_by: String::new(),
+            at_ms: 0,
+            signed_by: None,
+            changes: vec![],
+            config: Some(dc.clone()),
+        };
+        let history = vec![entry(&ran)];
+        let with = |dc: config::DynamicConfig| Config { node_id: "n1".into(), dynamic_config: dc, ..Config::default() };
+
+        // Edited at the same version (a port, or a policy): the next version, by this node.
+        let stamped = stamp_offline_edit(&with(api_on_port(4000)), &history).unwrap();
+        assert_eq!((stamped.version, stamped.changed_by.as_str(), port_of(&stamped)), (4, "n1", 4000));
+        let mut revoked = ran.clone();
+        revoked.revoked.nodes.push("x".into());
+        assert_eq!(stamp_offline_edit(&with(revoked), &history).unwrap().version, 4);
+
+        // Unchanged, edited with its version raised, or no history: as is.
+        assert!(stamp_offline_edit(&with(ran.clone()), &history).is_none());
+        assert!(stamp_offline_edit(&with(config::DynamicConfig { version: 9, ..api_on_port(4000) }), &history).is_none());
+        assert!(stamp_offline_edit(&with(api_on_port(4000)), &[]).is_none());
+        // With requireSignedConfig, an edit isn't taken (startup_config).
+        let signed = Config { require_signed_config: true, ..with(api_on_port(4000)) };
+        assert!(stamp_offline_edit(&signed, &history).is_none());
     }
 
     #[test]

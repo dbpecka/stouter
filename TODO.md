@@ -90,7 +90,7 @@ cluster" means one without `requireSignedConfig`.
   Fix: start the request timeout once the tunnel is up; a timeout before that is
   a connect failure (charge the node, retry elsewhere).
 
-- [ ] **8. Same-version hand edits are lost or ignored.**
+- [x] **8. Same-version hand edits are lost or ignored.**
   (a) The config poll (`src/gossip/mod.rs:595-596`) compares only services and
   routes, so a hand-added revocation or policy change at the same version is
   silently not applied. (b) An edit made while the daemon is stopped is taken
@@ -99,6 +99,7 @@ cluster" means one without `requireSignedConfig`.
   `.unapplied` copy, or spread cluster-wide without a version bump.
   Fix: use `same_settings` in the poll; at startup, compare the file with the
   last history entry and bump/stamp a same-version edit like the poll does.
+  Fixed: the poll compares the file with `same_settings` (a hand-added revocation or policy is taken and bumped); at startup, a file at the version the daemon last ran (its history's newest entry) but saying something else gets the next version and this node as author.
 
 - [ ] **9. `deploy.sh` reports success while the new daemon crash-loops.**
   It stops and removes the running container (`deploy.sh:155-160`) before the
