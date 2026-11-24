@@ -603,9 +603,11 @@ mod tests {
         let mut stalled = Vec::new();
         for i in 0..MAX_PENDING_STREAMS_PER_PEER + 88 {
             let mut stream = sessions[i % 3].open_stream().await.unwrap().compat();
-            stream.write_all(&100u32.to_be_bytes()).await.unwrap();
-            stream.write_all(&[0x80; 10]).await.unwrap();
-            stream.flush().await.unwrap();
+            // Past the budget the node resets the stream, which can reach
+            // us before these writes do: they may fail.
+            let _ = stream.write_all(&100u32.to_be_bytes()).await;
+            let _ = stream.write_all(&[0x80; 10]).await;
+            let _ = stream.flush().await;
             stalled.push(stream);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
