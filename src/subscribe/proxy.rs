@@ -442,6 +442,11 @@ pub(crate) fn tunnel_routes(node: &NodeInfo, state: &SharedState) -> Vec<(String
 /// `SharedState::relay_lagging`).
 const RELAY_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Reverse connections a NAT'd node holds to us tried for one tunnel, and
+/// how long each may take to answer, before its relays are tried.
+const REVERSE_ATTEMPTS: usize = 2;
+const REVERSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
 async fn establish_tunnel_untimed(
     node: &NodeInfo,
     service_name: String,
@@ -486,12 +491,28 @@ async fn establish_tunnel_untimed(
     let connect_start = Instant::now();
 
     // A reverse connection the node holds to us: it registered it with its
-    // own certificate, so it is the right node.
-    if let Some(mut stream) = state.reverse_pool.try_take(&node.id) {
-        send_and_check_tunnel(&mut stream, &msg).await?;
-        metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
-            .record(connect_start.elapsed().as_secs_f64());
-        return Ok(Tunnel::Mesh(Box::new(stream)));
+    // own certificate, so it is the right node. One can be dead without our
+    // knowing (its NAT dropped it, its host went away): each gets a short
+    // try, a few of them, before the node's relays get theirs.
+    let mut reverse_err = None;
+    for _ in 0..REVERSE_ATTEMPTS {
+        let Some(mut stream) = state.reverse_pool.try_take(&node.id) else { break };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let slice = REVERSE_ATTEMPT_TIMEOUT.min(left / 2);
+        match tokio::time::timeout(slice, send_and_check_tunnel(&mut stream, &request())).await {
+            Ok(Ok(())) => {
+                metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
+                    .record(connect_start.elapsed().as_secs_f64());
+                return Ok(Tunnel::Mesh(Box::new(stream)));
+            }
+            Ok(Err(e)) => reverse_err = Some(e),
+            Err(_) => reverse_err = Some(anyhow::anyhow!("no answer on a reverse connection within {} ms", slice.as_millis())),
+        }
+        tracing::debug!(
+            "a reverse connection from node {} didn't serve a tunnel ({:#}); trying another way",
+            node.id,
+            reverse_err.as_ref().expect("just set")
+        );
     }
 
     let routes = tunnel_routes(node, state);
@@ -502,8 +523,11 @@ async fn establish_tunnel_untimed(
             .reverse_pool
             .take(&node.id, REVERSE_POOL_TIMEOUT)
             .await
-            .with_context(|| format!("node {} not reachable: no address, relay or reverse connection", node.id))?;
-        send_and_check_tunnel(&mut stream, &msg).await?;
+            .with_context(|| match &reverse_err {
+                Some(e) => format!("node {} not reachable: its reverse connections failed ({e:#}), and it has no relay", node.id),
+                None => format!("node {} not reachable: no address, relay or reverse connection", node.id),
+            })?;
+        send_and_check_tunnel(&mut stream, &request()).await?;
         metrics::histogram!("stouter_tunnel_connect_duration_seconds", "method" => "reverse")
             .record(connect_start.elapsed().as_secs_f64());
         return Ok(Tunnel::Mesh(Box::new(stream)));
@@ -915,6 +939,47 @@ mod tests {
         // request on, the node would refuse the second's as a replay.
         let (a, b) = (nonces.recv().await.unwrap(), nonces.recv().await.unwrap());
         assert!(a.is_some() && b.is_some() && a != b, "{a:?} {b:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This subscriber is also a relay of NAT'd node x, which keeps a
+    /// reverse connection here; that one has died without our knowing. The
+    /// tunnel gives it a short try and then goes through x's other relay,
+    /// rather than failing after the whole setup time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_reverse_connection_falls_through_to_a_relay() {
+        use crate::state::test_support::{mesh_pair, tls_state};
+        let dir = std::env::temp_dir().join(format!("stouter_revdead_{}_{}", std::process::id(), rand::random::<u64>()));
+        let sub = tls_state(&dir, "sub");
+        let x = tls_state(&dir, "x");
+        let (held, dead) = mesh_pair(&x, &sub).await;
+        sub.reverse_pool.push("x".into(), dead);
+        let natd = natd_with_relays("x", &["r1"]);
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap().to_string();
+        let r1 = tls_state(&dir, "r1");
+        tokio::spawn(async move {
+            let (tcp, _) = up.accept().await.unwrap();
+            let mut stream = r1.tls_accept(tcp).await.unwrap();
+            let Ok(Message::TunnelRequest { .. }) = gossip::recv_message(&mut stream).await else { return };
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&[0]).await.unwrap();
+            stream.write_all(b"via the relay").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        sub.update_known_nodes(|kn| {
+            kn.insert("r1".into(), NodeInfo { id: "r1".into(), addr: up_addr.clone(), last_seen: Some(Instant::now()), ..Default::default() });
+        })
+        .await;
+
+        let started = Instant::now();
+        let mut tunnel = establish_tunnel(&natd, "api".into(), &sub).await.expect("through the relay");
+        assert!(started.elapsed() < REVERSE_ATTEMPT_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
+        let mut got = String::new();
+        use tokio::io::AsyncReadExt;
+        tunnel.read_to_string(&mut got).await.unwrap();
+        assert_eq!(got, "via the relay");
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
