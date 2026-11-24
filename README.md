@@ -430,7 +430,8 @@ On `SIGTERM` (what `docker stop` sends) or `SIGINT`, stouter broadcasts
 `NodeLeave`, stops accepting, refuses new tunnels (subscribers retry another
 node) and waits up to 30s for in-flight tunnels and requests to finish. Idle
 pooled connections and mux sessions don't count, so an idle daemon exits at
-once. Docker's default stop timeout is 10s; pass `-t 30` to `docker stop` (or
+once. A second signal during the drain exits at once (status 1). Docker's
+default stop timeout is 10s; pass `-t 30` to `docker stop` (or
 `--stop-timeout 30` to `docker run`) to give long transfers the full window.
 
 Keep `tlsDir` on a mounted volume (inside the config directory, or mounted

@@ -139,17 +139,19 @@ cluster" means one without `requireSignedConfig`.
   delivered it but answered slowly, relay 2's attempt is refused as a replay.
   Fix: sign a fresh request per route.
   Fixed: the request is signed afresh for each route tried.
-- [ ] **14. A route with no backends crashes every request it matches.**
+- [x] **14. A route with no backends crashes every request it matches.**
   `src/subscribe/http.rs:530` indexes `route.backends[0]`; gossip adopts such
   routes (`src/state.rs:918` indexes them unchecked). Fix: skip routes with no
   backends when indexing, or answer 503.
+  Fixed: routes with no backend to send to are left out of the route index (with a warning), and route selection can't index an empty list.
 - [ ] **15. A dead reverse connection at a subscriber that is the NAT'd node's relay fails the tunnel.**
   `src/subscribe/proxy.rs:466-467`: no per-attempt timeout or fallback; waits 15 s
   without trying the node's other relays. Fix: ~5 s per attempt, try another
   reverse connection, then fall through to `tunnel_routes`.
-- [ ] **16. Connecting to the local service has no timeout.** `src/node/tunnel.rs:163`:
+- [x] **16. Connecting to the local service has no timeout.** `src/node/tunnel.rs:163`:
   a backend with a full accept queue holds the tunnel task ~2 min (and delays a
   drain). Fix: time out after a few seconds, under the subscriber's 15 s.
+  Fixed: the connection to the local service times out after 5 s.
 - [ ] **17. A CLI command can race the daemon's renewal save.** `load_existing`
   runs `finish_renewal` (`src/pki.rs:122-126`) on the daemon's `tlsDir` for every
   local CLI command; between `save_renewed`'s two renames it deletes the staged
@@ -170,10 +172,12 @@ cluster" means one without `requireSignedConfig`.
   signer in `adminCns`, though other admin ops accept the node's own name
   (`:343`). Fix: accept the daemon's own name when signing isn't required, or
   document that push needs `adminCns`.
-- [ ] **22. A second SIGTERM/SIGINT during the drain is ignored.** `src/main.rs:491-497`,
+- [x] **22. A second SIGTERM/SIGINT during the drain is ignored.** `src/main.rs:491-497`,
   `1477-1505`. Fix: exit at once on a second signal.
-- [ ] **23. A huge `certLifetime` crashes `check` and the daemon.** `src/pki.rs:40-44`
+  Fixed: a second signal during the drain exits at once (status 1).
+- [x] **23. A huge `certLifetime` crashes `check` and the daemon.** `src/pki.rs:40-44`
   (`time::Duration::days(n)` overflows). Fix: bound `n` before building it.
+  Fixed: the lifetime is multiplied out with a check, and refused when too long.
 - [x] **24. `deploy.sh`'s binary extraction can install a stale binary.**
   `deploy.sh:143-147`: fixed container name `stouter-extract`, no error checks.
   Fix: a unique name, `docker rm -f` it first, `set -e` in the remote script.
@@ -269,14 +273,16 @@ against the code. Numbered on from the list above.
 - [x] **42. At startup, an edit with its version raised by hand keeps the old signature**
   (`status` and history name an admin who never signed it).
   Fixed: #31 routes offline edits through the config poll, which now clears the signature and `signedAt` of any edit it takes and makes this node its author (the time tie-break of #29 applies only to configs that are signed).
-- [ ] **43. A hand edit that doesn't parse is ignored at runtime with only a debug log.**
+- [x] **43. A hand edit that doesn't parse is ignored at runtime with only a debug log.**
+  Fixed: warned about once per distinct error.
 - [x] **44. `deploy.sh` installs the new host binary before the config check** that may
   abort the deploy.
   Fixed: the binary is installed only after the new container stays up.
 - [x] **45. If `deploy.sh`'s image probe fails for any reason, it skips the config check**
   instead of aborting.
   Fixed: a probe that fails to run aborts the deploy; only an image that runs and lacks `--local` is warned about and skipped.
-- [ ] **46. The CLI panics (exit 101) on a closed pipe** (`stouter config history | head`).
+- [x] **46. The CLI panics (exit 101) on a closed pipe** (`stouter config history | head`).
+  Fixed: CLI commands restore SIGPIPE's default, so they stop quietly (status 141) as Unix tools do; the daemon keeps ignoring it.
 - [ ] **47. A huge `signedAt` overflows** formatting a refusal before any signature is
   checked (panic in debug builds). Partly fixed with #30 (`saturating_mul`
   in `verify`); check the other call sites.
