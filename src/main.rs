@@ -430,6 +430,18 @@ enum RouteAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.command.is_none());
+    // A CLI command whose output is cut short (`stouter config history |
+    // head`) just stops, as Unix tools do, rather than panicking on the
+    // closed pipe (Rust ignores SIGPIPE). Not the daemon: there a peer
+    // closing a connection mid-write must never end the process.
+    #[cfg(unix)]
+    if cli.command.is_some() {
+        // SAFETY: restoring a signal's default disposition, before any
+        // other thread exists.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
 
     match cli.command {
         // -----------------------------------------------------------------
@@ -517,7 +529,14 @@ async fn main() -> Result<()> {
                 result = daemon => result?,
                 signal = shutdown_signal() => {
                     info!("received {signal}");
-                    graceful_drain(state).await;
+                    // A second signal while draining means don't wait.
+                    tokio::select! {
+                        () = graceful_drain(state) => {}
+                        again = shutdown_signal() => {
+                            tracing::warn!("received {again} again: exiting without waiting for the drain to finish");
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }

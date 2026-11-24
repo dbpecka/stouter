@@ -47,8 +47,9 @@ rand = "0.9"
 time = { version = "0.3", default-features = false, features = ["std"] }
 
 # Socket options socket2 doesn't cover: how long unacknowledged data is
-# retransmitted to a peer before the connection is dropped (see io.rs).
-[target.'cfg(target_os = "macos")'.dependencies]
+# retransmitted to a peer before the connection is dropped (see io.rs, macOS);
+# and SIGPIPE's default for CLI commands (see main.rs).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
