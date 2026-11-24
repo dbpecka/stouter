@@ -41,6 +41,12 @@ pub const RECONNECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// A relay counts as one this node uses while it holds a reverse
 /// connection there, or registered one this recently (connections are
 /// consumed by tunnels and replaced, so the count dips during bursts).
+/// How recently a NAT'd node must have registered a reverse connection here
+/// for a tunnel to it to wait for one (see `SharedState::relayed_here_lately`).
+/// Its workers register a new one each time one is used, and keep them
+/// alive with pings, so a node relayed here registers far more often.
+const RELAYED_HERE_LATELY: Duration = Duration::from_secs(120);
+
 const RELAY_GRACE: Duration = Duration::from_secs(30);
 
 fn unix_seconds() -> u64 {
@@ -464,6 +470,8 @@ pub struct SharedState {
     pub(crate) own_record: Mutex<Option<OwnRecord>>,
     /// Open connections per (kind, peer CN), for the per-peer limits.
     pub(crate) peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
+    /// When each NAT'd node last registered a reverse connection here.
+    relayed_here: Mutex<HashMap<String, std::time::Instant>>,
     /// Peer addresses known to speak delta sync (their replies say so), so
     /// syncs to them can be compact, with the (version, hash) of the config
     /// each had as of its last reply: one that's behind gets ours.
@@ -557,6 +565,7 @@ impl SharedState {
             unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
+            relayed_here: Mutex::new(HashMap::new()),
             delta_peers: Mutex::new(HashMap::new()),
             own_beat: Mutex::new(None),
             leaving: std::sync::atomic::AtomicBool::new(false),
@@ -871,6 +880,21 @@ impl SharedState {
         }
         *count += 1;
         Some(PeerSlot { state: Arc::clone(self), key })
+    }
+
+    /// Note that NAT'd node `node` (as its certificate says) just registered
+    /// a reverse connection here.
+    pub fn note_relayed_here(&self, node: &str) {
+        let mut relayed = self.relayed_here.lock().unwrap();
+        relayed.retain(|_, at| at.elapsed() < RELAYED_HERE_LATELY);
+        relayed.insert(node.to_string(), std::time::Instant::now());
+    }
+
+    /// Whether NAT'd node `node` registered a reverse connection here in the
+    /// last [`RELAYED_HERE_LATELY`]: one that does keeps some here, so a
+    /// tunnel to it may wait for one to come free.
+    pub fn relayed_here_lately(&self, node: &str) -> bool {
+        self.relayed_here.lock().unwrap().get(node).is_some_and(|at| at.elapsed() < RELAYED_HERE_LATELY)
     }
 
     /// Note a reverse connection registered with `relay` (a node id); the

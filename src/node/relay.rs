@@ -140,6 +140,7 @@ pub async fn handle_reverse_registration(
     }
 
     // --- Store in reverse pool ---
+    state.note_relayed_here(&node_id);
     state.reverse_pool.push(node_id, stream);
 
     Ok(())
@@ -151,17 +152,32 @@ pub async fn handle_reverse_registration(
 /// as a [`Message::TunnelRequest`], reads the response, and bridges the two
 /// streams. Generic over the subscriber stream type so it works with both
 /// raw TCP and yamux streams.
+///
+/// `pending` (a mux stream's place among its peer's streams waiting for
+/// their tunnel) is let go once the tunnel is connected.
+#[allow(clippy::too_many_arguments)]
 pub async fn relay_tunnel<S>(
     mut subscriber: S,
     node_id: &str,
     service_name: &str,
     timestamp_ms: u64,
     caller: Option<crate::config::SignedCaller>,
+    pending: Option<crate::state::PeerSlot>,
     state: &Arc<SharedState>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // A node that keeps no reverse connections here (none idle, none
+    // registered lately) won't have one in a few seconds either: refuse at
+    // once, rather than hold the request, and what the caller sent after
+    // it, for the whole wait.
+    if state.reverse_pool.count(node_id) == 0 && !state.relayed_here_lately(node_id) {
+        let msg = format!("node {node_id} keeps no reverse connections here");
+        crate::node::tunnel::send_tunnel_error(&mut subscriber, &msg).await;
+        bail!("{msg}");
+    }
+
     // The caller's signature goes on as it came: the NAT'd node checks it.
     let msg = Message::TunnelRequest {
         node_id: node_id.to_string(),
@@ -246,6 +262,7 @@ where
     }
 
     // Bridge the subscriber and reverse connection streams.
+    drop(pending);
     crate::io::proxy_bidirectional(subscriber, reverse_stream)
         .await
         .context("relay proxy_bidirectional")?;
@@ -300,7 +317,7 @@ mod tests {
         tokio::time::pause();
         let (subscriber, mut ours) = tokio::io::duplex(4096);
         let started = tokio::time::Instant::now();
-        let err = relay_tunnel(subscriber, "x", "svc", now_ms(), None, &relay).await.unwrap_err();
+        let err = relay_tunnel(subscriber, "x", "svc", now_ms(), None, None, &relay).await.unwrap_err();
         // 3 tries of 5s each would be 15s, as long as the subscriber waits.
         assert!(started.elapsed() <= RELAY_DEADLINE + Duration::from_secs(1), "{:?} ({err})", started.elapsed());
         let mut status = [0u8; 1];
@@ -309,6 +326,34 @@ mod tests {
         let why = crate::node::tunnel::read_tunnel_error(&mut ours).await.unwrap();
         assert!(why.contains("node x"), "{why}");
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tunnel to a node that keeps no reverse connections here (a made-up
+    /// one, or one relayed elsewhere) is refused at once: waiting would only
+    /// hold the request, and whatever the caller sent after it.
+    #[tokio::test]
+    async fn a_tunnel_to_a_node_not_relayed_here_is_refused_at_once() {
+        let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let (subscriber, mut ours) = tokio::io::duplex(4096);
+        let started = std::time::Instant::now();
+        let err = relay_tunnel(subscriber, "ghost", "svc", now_ms(), None, None, &relay).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(err.to_string().contains("keeps no reverse connections here"), "{err}");
+        let mut status = [0u8; 1];
+        ours.read_exact(&mut status).await.unwrap();
+        assert_eq!(status[0], 0x01);
+
+        // One that registered lately waits for a connection to come free.
+        relay.note_relayed_here("x");
+        let (subscriber, _ours) = tokio::io::duplex(4096);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            relay_tunnel(subscriber, "x", "svc", now_ms(), None, None, &relay),
+        )
+        .await;
+        assert!(waited.is_err(), "still waiting for a reverse connection");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -589,13 +589,19 @@ Limits, so one peer can't exhaust a node:
   on both ends. A config change that would make the config larger than 2 MiB
   encoded (a signed config counts its signed copy too) is refused, since it
   could never reach the rest of the cluster.
-- One peer may hold at most 64 connections or mux streams waiting for their
-  first message (subscribers keep 8 warm per node they tunnel to), 16 mux
-  sessions, and 1024 idle reverse connections, and 2 sync connections kept
-  open between rounds. A mux stream's first message is a tunnel request: it
-  may be at most 16 KiB and must arrive within 10 seconds, and a stream
-  counts as work in flight only once it has. A mux session may buffer at
-  most 128 MiB unread across its streams (yamux's default is 1 GiB).
+- One peer may hold at most 64 connections waiting for their first message
+  (subscribers keep 8 warm per node they tunnel to), 16 mux sessions, 1024
+  idle reverse connections, and 2 sync connections kept open between rounds.
+  A mux stream's first message is a tunnel request: it may be at most 16 KiB
+  and must arrive within 10 seconds, and a stream counts as work in flight
+  only once it has. Until its tunnel is set up (the request read, then the
+  service or the NAT'd node connected), nothing reads what the peer sends on
+  a stream, so it may hold a full window (256 KiB): one peer may have at most
+  512 such streams, across all its sessions (128 MiB). A mux session may
+  buffer at most 128 MiB unread across its streams (yamux's default is 1
+  GiB). A relay refuses at once a tunnel to a node that keeps no reverse
+  connections there (none registered in the last two minutes), rather than
+  hold it while waiting for one.
   Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
   so an idle one whose peer vanished is closed within about a minute. So is
   one with data waiting to be acknowledged, after 60s of retransmitting

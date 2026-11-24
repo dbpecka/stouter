@@ -106,7 +106,7 @@ pub async fn handle_tunnel(
     // --- Check if this tunnel targets us or needs relaying ---
     let our_node_id = &state.config.node_id;
     if !node_id.is_empty() && node_id != *our_node_id {
-        return super::relay::relay_tunnel(client, &node_id, &service_name, timestamp_ms, caller, &state)
+        return super::relay::relay_tunnel(client, &node_id, &service_name, timestamp_ms, caller, None, &state)
             .await;
     }
 
