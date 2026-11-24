@@ -172,9 +172,10 @@ cluster" means one without `requireSignedConfig`.
   `1477-1505`. Fix: exit at once on a second signal.
 - [ ] **23. A huge `certLifetime` crashes `check` and the daemon.** `src/pki.rs:40-44`
   (`time::Duration::days(n)` overflows). Fix: bound `n` before building it.
-- [ ] **24. `deploy.sh`'s binary extraction can install a stale binary.**
+- [x] **24. `deploy.sh`'s binary extraction can install a stale binary.**
   `deploy.sh:143-147`: fixed container name `stouter-extract`, no error checks.
   Fix: a unique name, `docker rm -f` it first, `set -e` in the remote script.
+  Fixed: a container name of its own, removed on exit, `set -e`, and the binary moved into place only once fully copied.
 - [ ] **25. `deploy.sh` with no arguments under macOS bash 3.2** dies with
   "ARGS[@]: unbound variable" instead of printing usage (`deploy.sh:26`).
   Fix: `set -- ${ARGS[@]+"${ARGS[@]}"}`.
@@ -266,10 +267,12 @@ against the code. Numbered on from the list above.
   (`status` and history name an admin who never signed it).
   Fixed: #31 routes offline edits through the config poll, which now clears the signature and `signedAt` of any edit it takes and makes this node its author (the time tie-break of #29 applies only to configs that are signed).
 - [ ] **43. A hand edit that doesn't parse is ignored at runtime with only a debug log.**
-- [ ] **44. `deploy.sh` installs the new host binary before the config check** that may
+- [x] **44. `deploy.sh` installs the new host binary before the config check** that may
   abort the deploy.
-- [ ] **45. If `deploy.sh`'s image probe fails for any reason, it skips the config check**
+  Fixed: the binary is installed only after the new container stays up.
+- [x] **45. If `deploy.sh`'s image probe fails for any reason, it skips the config check**
   instead of aborting.
+  Fixed: a probe that fails to run aborts the deploy; only an image that runs and lacks `--local` is warned about and skipped.
 - [ ] **46. The CLI panics (exit 101) on a closed pipe** (`stouter config history | head`).
 - [ ] **47. A huge `signedAt` overflows** formatting a refusal before any signature is
   checked (panic in debug builds). Partly fixed with #30 (`saturating_mul`

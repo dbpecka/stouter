@@ -145,15 +145,6 @@ if [[ "$RESTART_ONLY" == false ]]; then
   debug "Running: docker build -t stouter:latest in $REMOTE_DIR/build"
   remote_sudo "cd $RD/build && docker build -t stouter:latest ."
   debug "Docker build complete"
-
-  echo "==> Copying stouter binary from Docker image to host"
-  debug "Extracting /usr/local/bin/stouter from stouter:latest image"
-  remote_sudo "
-    docker create --name stouter-extract stouter:latest
-    docker cp stouter-extract:/usr/local/bin/stouter /usr/local/bin/stouter
-    docker rm stouter-extract
-  "
-  debug "Host binary installed to /usr/local/bin/stouter"
 else
   debug "Restart-only mode, skipping build"
 fi
@@ -162,7 +153,13 @@ fi
 # tlsDir, a bind without a port, ...): look for them with the new image now,
 # while the running container is still up, rather than replace it with one
 # that can't start.
-CHECK_HELP=$(remote_sudo "docker run --rm $IMAGE_TAG check --help" 2>/dev/null || true)
+# The probe failing (no image, Docker or ssh trouble) is not the same as an
+# image too old to know the check: stop rather than skip it.
+if ! CHECK_HELP=$(remote_sudo "docker run --rm $IMAGE_TAG check --help" 2>&1); then
+  echo "error: can't run $IMAGE_TAG on $REMOTE_HOST to check the config: the running container is left as it is" >&2
+  echo "$CHECK_HELP" >&2
+  exit 1
+fi
 if [[ "$CHECK_HELP" == *--local* ]]; then
   echo "==> Checking the config with the new image"
   if ! remote_sudo "
@@ -226,4 +223,23 @@ fi
 CONTAINER_STATUS=$(remote_sudo "docker ps --filter name=^${CONTAINER_NAME}\$ --format '{{.Status}}'")
 echo "$CONTAINER_STATUS"
 debug "Container status: ${CONTAINER_STATUS:-<not running>}"
+
+# Only now, with the new daemon up, the CLI on the host to match it: a
+# deploy that stopped above leaves the host's CLI with the daemon it talks to.
+if [[ "$RESTART_ONLY" == false ]]; then
+  echo "==> Copying stouter binary from Docker image to host"
+  debug "Extracting /usr/local/bin/stouter from $IMAGE_TAG"
+  # A name of its own (a leftover of a failed run can't be reused), and any
+  # failing step stops the install rather than leave a stale binary.
+  remote_sudo "
+    set -e
+    name=stouter-extract-\$\$
+    docker rm -f \"\$name\" >/dev/null 2>&1 || true
+    docker create --name \"\$name\" $IMAGE_TAG >/dev/null
+    trap 'docker rm -f \"\$name\" >/dev/null 2>&1' EXIT
+    docker cp \"\$name\":/usr/local/bin/stouter /usr/local/bin/stouter.new
+    mv /usr/local/bin/stouter.new /usr/local/bin/stouter
+  "
+  debug "Host binary installed to /usr/local/bin/stouter"
+fi
 debug "Deploy finished at $(date '+%Y-%m-%d %H:%M:%S')"

@@ -446,7 +446,11 @@ daemon from starting) and stops there if it fails, leaving the running
 container as it is. After starting the new one it waits 5 seconds
 (`DEPLOY_SETTLE_SECONDS`) and fails, printing its last log lines, if the
 container isn't running or has been restarted: `docker ps` says "Up" even
-of a daemon that exits at once and is restarted over and over.
+of a daemon that exits at once and is restarted over and over. If the new
+image can't be run to check the config at all, it stops too. Only once the
+new container stays up does it install the image's binary on the host (as
+`/usr/local/bin/stouter`), so a deploy that stops leaves the host's CLI
+matching the daemon still running.
 
 ### Testing
 
