@@ -534,6 +534,8 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
     let mut warned_unsigned: Option<String> = None;
     // The edit last refused for breaking the config.
     let mut warned_problem: Option<String> = None;
+    // Why the file last couldn't be read.
+    let mut warned_unreadable: Option<String> = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
@@ -557,7 +559,13 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             let file_dc = match crate::config::Config::load(&state.config_path) {
                 Ok(c) => c.dynamic_config,
                 Err(e) => {
-                    debug!("config poll: failed to read {}: {e}", state.config_path);
+                    // A hand edit that doesn't parse: say so (once per
+                    // error), or nothing shows until the next start fails.
+                    let why = format!("{e:#}");
+                    if warned_unreadable.as_ref() != Some(&why) {
+                        warn!("ignoring {}: {why}", state.config_path);
+                        warned_unreadable = Some(why);
+                    }
                     continue;
                 }
             };
