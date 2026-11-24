@@ -73,6 +73,11 @@ pub fn record(config_path: &str, dc: &DynamicConfig) {
     if last.is_some_and(|last| last.version == dc.version && last.same_settings(dc)) {
         return;
     }
+    // Another config at a version already recorded: one that lost a
+    // tie-break to this one. It replaces the entry (one per version), so
+    // `config rollback --to` that version puts back what this node took.
+    entries.retain(|e| e.version != dc.version);
+    let last = entries.last().and_then(|e| e.config.as_ref());
     let signed_by = dc.signature.as_ref().and_then(|sig| {
         let der: Option<Vec<u8>> = (0..sig.signer_cert.len())
             .step_by(2)
@@ -251,6 +256,17 @@ mod tests {
             ]
         );
         assert_eq!(entries[1].config.as_ref(), Some(&v2));
+
+        // Another config at version 2 (the tie-break went the other way):
+        // it replaces the entry, described against version 1.
+        let v2b = DynamicConfig { changed_by: "other".into(), ..v1.clone() };
+        let v2b = DynamicConfig { version: 2, ..v2b };
+        record(path, &v2b);
+        let entries = load(path);
+        assert_eq!(entries.len(), 2, "one entry per version");
+        assert_eq!((entries[1].version, entries[1].changed_by.as_str()), (2, "other"));
+        assert_eq!(entries[1].changes, ["no change in services, routes, policies or revocations"], "against version 1");
+        record(path, &v2);
 
         // Only the newest are kept.
         for v in 3..(MAX_ENTRIES as u64 + 10) {

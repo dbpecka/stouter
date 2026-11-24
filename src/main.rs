@@ -1347,7 +1347,7 @@ async fn main() -> Result<()> {
             let from = remote.as_deref().unwrap_or(&cli.config);
             match version {
                 Some(v) => {
-                    let config = entries.into_iter().find_map(|e| e.config).ok_or_else(|| {
+                    let config = entries.into_iter().rev().find_map(|e| e.config).ok_or_else(|| {
                         anyhow::anyhow!("version {v} isn't in the history of {from}: `stouter config history` lists them")
                     })?;
                     println!("{}", serde_json::to_string_pretty(&config)?);
@@ -1381,7 +1381,9 @@ async fn main() -> Result<()> {
                 Some(addr) => fetch_history(addr, Some(to), &local, cli.cert_dir.as_deref()).await?,
                 None => history::load(&cli.config),
             };
-            let earlier = entries.into_iter().filter(|e| e.version == to).find_map(|e| e.config).ok_or_else(|| {
+            // The latest at that version (a history written before versions
+            // were kept unique may hold two).
+            let earlier = entries.into_iter().rev().filter(|e| e.version == to).find_map(|e| e.config).ok_or_else(|| {
                 anyhow::anyhow!("version {to} isn't in the config history: `stouter config history` lists them")
             })?;
             // Where changes must be signed, only what an admin signed is put
