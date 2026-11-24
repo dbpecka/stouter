@@ -444,8 +444,13 @@ impl DynamicConfig {
 
     /// Whether this config should replace `current`: it has a higher
     /// version, or the same version with different content that wins the
-    /// tie-break (higher `changedBy`, then the longer serialized form, then
-    /// the larger one).
+    /// tie-break (more revocations, then higher `changedBy`, then the longer
+    /// serialized form, then the larger one).
+    ///
+    /// Revocations come first so that a change made at the same version as
+    /// a revocation (on a node that hadn't seen it, or one lying about its
+    /// config to an admin) can't settle the tie by dropping it, whoever made
+    /// it: of two configs, the one revoking more wins, on every node.
     ///
     /// Without the tie-break, two nodes changing the config at once both
     /// make version N+1, each node keeps whichever arrived first, and the
@@ -465,7 +470,7 @@ impl DynamicConfig {
         }
         let key = |dc: &DynamicConfig| {
             let bytes = serde_json::to_vec(dc).unwrap_or_default();
-            (dc.changed_by.clone(), bytes.len(), bytes)
+            (dc.revoked.nodes.len() + dc.revoked.certs.len(), dc.changed_by.clone(), bytes.len(), bytes)
         };
         key(self) > key(current)
     }
@@ -2140,6 +2145,21 @@ mod tests {
         let free = serde_json::json!({"dynamicConfig": {"version": 1, "serviceGroups": [{"name": "g", "services": [
             {"name": "api", "nodeId": "n1", "nodePort": 1, "labels": {"anything": "x"}, "meta": {"goes": "y"}}]}]}});
         assert!(unknown_nested_settings(&free).is_empty());
+    }
+
+    /// A change made at the same version as a revocation, by someone who
+    /// hadn't seen it, loses the tie-break whoever made it: on every node.
+    #[test]
+    fn a_tie_never_drops_a_revocation() {
+        let base = DynamicConfig { version: 10, ..DynamicConfig::default() };
+        let mut revoking = DynamicConfig { changed_by: "alice".into(), ..base.clone() };
+        revoking.revoked.nodes.push("x".into());
+        let mut other = DynamicConfig { changed_by: "zoe".into(), ..base.clone() };
+        other.policies.push(Policy { service: "api".into(), allow: vec!["n2".into()] });
+        assert!(revoking.supersedes(&other) && !other.supersedes(&revoking));
+        // Equal revocations: changedBy, as before.
+        other.revoked.certs.push("ab".into());
+        assert!(other.supersedes(&revoking) && !revoking.supersedes(&other));
     }
 
     #[test]

@@ -72,7 +72,7 @@ cluster" means one without `requireSignedConfig`.
   run the checks in `spawn_blocking`.
   Fixed: only each node's newest beat is checked, only for nodes with no address (the only ones that beat) or forgotten ones, at most 4096 per sync, on blocking threads (as many syncs at once as there are CPUs).
 
-- [ ] **6. A lying daemon can steer an admin's signature.**
+- [x] **6. A lying daemon can steer an admin's signature.**
   (a) The CLI builds a change on whatever signed config the daemon serves
   (`src/main.rs:1667-1676`), even one older than the local file's; its result can
   win the same-version tie-break (`src/config.rs:428-432`) and drop the latest
@@ -81,6 +81,7 @@ cluster" means one without `requireSignedConfig`.
   Fix: refuse to build on a config older than the local file's; require the
   verified version to equal N; don't let a same-version tie-break drop
   revocations.
+  Fixed: (a) the CLI refuses to build on, or pull, a verified config older than the admin-signed one in its own config file; (b) `config rollback --to N` refuses a config that isn't, as signed, version N; (c) the same-version tie-break compares the number of revocations first, so the config revoking more wins on every node. (Two configs each revoking something different still settle by `changedBy`.)
 
 - [ ] **7. `requestTimeoutMs` firing during tunnel setup returns 504, with no retry and no ejection.**
   `src/subscribe/http.rs:366-371` wraps the whole request, connector included;

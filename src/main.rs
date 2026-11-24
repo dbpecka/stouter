@@ -1200,8 +1200,10 @@ async fn main() -> Result<()> {
             } else {
                 // Only what an admin signed: the file is what `config push`
                 // signs next.
-                trusted_config(&daemon.dynamic_config, &cfg, &material, &tls_ctx)
-                    .with_context(|| format!("won't write the config from {target} to {}", cli.config))?
+                let verified = trusted_config(&daemon.dynamic_config, &cfg, &material, &tls_ctx)
+                    .with_context(|| format!("won't write the config from {target} to {}", cli.config))?;
+                refuse_older_than_local(&verified, &target, &cfg, &material, &tls_ctx)?;
+                verified
             };
             let version = current.version;
             if !cfg.dynamic_config.same_settings(&current) {
@@ -1353,6 +1355,11 @@ async fn main() -> Result<()> {
             } else {
                 earlier
             };
+            // As signed (or, unsigned, as given): a history can't pass off
+            // another version as the one asked for.
+            if earlier.version != to {
+                anyhow::bail!("the history's version {to} is really version {}: not putting it back", earlier.version);
+            }
             let op = AdminOp::Restore { config: earlier };
             let version = if let Some(addr) = &target {
                 run_admin_rpc(addr, op, &local, cli.cert_dir.as_deref()).await?
@@ -1711,6 +1718,31 @@ fn stale_push(current: &config::DynamicConfig, desired: &config::DynamicConfig, 
     })
 }
 
+/// Refuse `served` (a verified config from `target`) to make a change on, if
+/// it is older than the admin-signed config in the CLI's own file: a node
+/// behind the cluster, or lying about its config, would have the admin sign
+/// a change dropping whatever came since (a revocation, say), and at the
+/// cluster's version it could win the tie-break.
+fn refuse_older_than_local(
+    served: &config::DynamicConfig,
+    target: &str,
+    cfg: &Config,
+    material: &pki::PkiMaterial,
+    tls_ctx: &tls::TlsContext,
+) -> Result<()> {
+    let Ok(local) = trusted_config(&cfg.dynamic_config, cfg, material, tls_ctx) else { return Ok(()) };
+    if served.version < local.version {
+        anyhow::bail!(
+            "the config on {target} is version {}, older than the admin-signed version {} in this CLI's config file: \
+             that node is behind the cluster (or not telling the truth); make the change through another node \
+             (--remote)",
+            served.version,
+            local.version
+        );
+    }
+    Ok(())
+}
+
 /// Times a signed change is re-made after the config changed under it.
 const PUSH_ATTEMPTS: usize = 3;
 
@@ -1751,6 +1783,7 @@ async fn try_admin_rpc(
         }
         let current = trusted_config(&daemon.dynamic_config, cfg, &material, &tls_ctx)
             .with_context(|| format!("the config on {target}"))?;
+        refuse_older_than_local(&current, target, cfg, &material, &tls_ctx)?;
         let mut next = current.clone();
         if let Err(e) = op.clone().apply(&mut next) {
             return Ok(Err(((&e).into(), e.to_string())));
@@ -2470,6 +2503,86 @@ mod tests {
         let as_m = status_answerer(&certs["m"], "m", "node").await;
         let err = fetch_trusted_config(&as_m, &cfg, alice_dir).await.expect_err("unsigned");
         assert!(format!("{err:#}").contains("isn't admin-signed"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon stand-in serving `serve` as its (signed) config, recording
+    /// the configs pushed to it. Returns its address and those.
+    async fn config_server(
+        material: &pki::PkiMaterial,
+        serve: config::DynamicConfig,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<config::DynamicConfig>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let tls_ctx = std::sync::Arc::new(tls::TlsContext::new(material).unwrap());
+        let pushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got = pushed.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let (tls_ctx, serve, got) = (tls_ctx.clone(), serve.clone(), got.clone());
+                tokio::spawn(async move {
+                    let Ok(mut stream) = tls_ctx.accept(tcp).await else { return };
+                    let reply = match gossip::recv_message(&mut stream).await {
+                        Ok(Message::StatusRequest) => Message::StatusResponse {
+                            mode: "node".into(),
+                            node_id: "m".into(),
+                            bind: String::new(),
+                            dynamic_config: serve,
+                            known_nodes: vec![],
+                            require_signed_config: true,
+                            cert_expires: None,
+                            issues_certs: false,
+                        },
+                        Ok(Message::AdminRequest { op: AdminOp::ConfigPush { config, .. } }) => {
+                            let new_version = config.version;
+                            got.lock().unwrap().push(config);
+                            Message::AdminResponse { result: gossip::messages::AdminResult::Ok { new_version } }
+                        }
+                        _ => return,
+                    };
+                    let _ = gossip::send_message(&mut stream, &reply).await;
+                });
+            }
+        });
+        (addr, pushed)
+    }
+
+    /// A node serving a config older than the one the admin's own file holds
+    /// (it is behind, or lying to drop a revocation made since) doesn't get
+    /// the admin to sign a change on it.
+    #[tokio::test]
+    async fn the_cli_wont_build_on_a_config_older_than_its_own() {
+        let (dir, certs) = cluster_certs(&["alice", "zoe", "m"]);
+        let sign = |dc: &config::DynamicConfig| {
+            signing::sign(dc, &signing::Signer::from_material(&certs["alice"]).unwrap()).unwrap()
+        };
+        let v9 = sign(&config::DynamicConfig { version: 9, ..api_on_port(3000) });
+        let mut v10 = config::DynamicConfig { version: 10, ..api_on_port(3000) };
+        v10.revoked.nodes.push("x".into());
+        let v10 = sign(&v10);
+        let zoe = Config {
+            require_signed_config: true,
+            admin_cns: vec!["alice".into(), "zoe".into()],
+            dynamic_config: v10.clone(),
+            ..Config::default()
+        };
+        let zoe_dir = dir.join("zoe");
+        let zoe_dir = zoe_dir.to_str();
+        let op = || AdminOp::PolicyAllow { service: "api".into(), nodes: vec!["n2".into()] };
+
+        let (behind, pushed) = config_server(&certs["m"], v9.clone()).await;
+        let err = try_admin_rpc(&behind, op(), &zoe, zoe_dir).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("older than the admin-signed version 10"), "{err:#}");
+        assert!(pushed.lock().unwrap().is_empty(), "nothing signed");
+
+        let (current, pushed) = config_server(&certs["m"], v10).await;
+        assert_eq!(try_admin_rpc(&current, op(), &zoe, zoe_dir).await.unwrap(), Ok(11));
+        assert_eq!(pushed.lock().unwrap()[0].revoked.nodes, ["x"], "built on v10, its revocation kept");
+
+        // With no signed config of its own to compare with, as before.
+        let laptop = Config { dynamic_config: config::DynamicConfig::default(), ..zoe.clone() };
+        assert_eq!(try_admin_rpc(&behind, op(), &laptop, zoe_dir).await.unwrap(), Ok(10));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

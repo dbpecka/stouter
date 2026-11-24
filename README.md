@@ -511,8 +511,12 @@ On receiving a config:
 
 - If it has a higher version, the local dynamic config is replaced.
   Two *different* configs at the same version (changes made at once on two
-  nodes) are settled the same way everywhere, by the `changedBy` node that made
-  each and then by content, so the cluster can't stay split. Between one
+  nodes) are settled the same way everywhere, so the cluster can't stay
+  split: the one revoking more certificates wins (so a change made without
+  having seen a revocation can't undo it), then by the `changedBy` node that
+  made each, then by content. Nodes running an earlier version settle it
+  without counting revocations, so in a mixed cluster such a tie can stay
+  split until the next change. Between one
   change and a copy of it relayed by an older node that dropped fields it
   doesn't know (a signature, a newer setting), the fuller copy wins, so a
   rolling upgrade doesn't erase them.
@@ -806,7 +810,11 @@ any node can relay a signed config but none can alter it.
   your fellow admins in `adminCns` in the config the CLI reads. `service
   move` checks the source cluster's config the same way, and `config pull`
   writes only a verified config (or an unsigned one, with a warning, before
-  the first signed change).
+  the first signed change). Nor does it build on (or pull) a verified config
+  older than the admin-signed one in its own config file: the node is behind
+  the cluster, or lying, and the admin's change would drop what came since.
+  `config rollback --to N` puts back only a config that is, as signed,
+  version N.
 - A node starts from the text an admin signed, not from edits made around
   the signature in its config file; it logs that it ignores them.
 - Editing a config file by hand no longer changes anything: the node logs a
