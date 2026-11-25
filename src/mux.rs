@@ -230,10 +230,19 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
 
     debug!("mux session started from {peer}");
 
+    let mut accepted: u64 = 0;
     loop {
         let next = poll_fn(|cx| connection.poll_next_inbound(cx)).await;
         match next {
             Some(Ok(yamux_stream)) => {
+                // A burst arriving all at once is read without waiting: let
+                // the tasks of the streams already taken in run now and then
+                // (on a single worker they otherwise wait for the burst's
+                // end, holding their places in the per-peer budget).
+                accepted += 1;
+                if accepted.is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
                 // Every stream counts against its peer's open tunnels for
                 // its whole life (see MAX_TUNNELS_PER_PEER).
                 let open = match crate::node::tunnel::tunnel_slot(&state, &peer) {
@@ -560,6 +569,73 @@ mod tests {
         assert_eq!(pool.drop_revoked(&revocations), 2);
         assert!(pool.contains("m:1") && !pool.contains("n:1") && !pool.contains("o:1"));
     }
+    /// A burst of tunnels on a node with one worker thread (a 1-CPU host):
+    /// none is reset for the per-peer budget. The session's accept loop
+    /// would otherwise take every stream in before any of their tasks ran.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_on_one_worker_resets_no_healthy_stream() {
+        use crate::state::test_support::{tls_state, tls_state_with};
+        use tokio::io::AsyncReadExt as _;
+        let dir = std::env::temp_dir().join(format!("stouter_mux_burst_{}_{}", std::process::id(), rand::random::<u64>()));
+        let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = service.accept().await {
+                tokio::spawn(async move {
+                    let mut sink = Vec::new();
+                    let _ = tcp.read_to_end(&mut sink).await;
+                });
+            }
+        });
+        let dc: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "g", "services": [{"name": "svc", "nodeId": "node", "nodePort": port}]}],
+        }))
+        .unwrap();
+        let node = tls_state_with(&dir, crate::config::Config { node_id: "node".into(), dynamic_config: dc, ..Default::default() }, String::new());
+        let peer = tls_state(&dir, "peer");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, from) = listener.accept().await.unwrap();
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mesh) = node.tls_accept(tcp).await {
+                            crate::gossip::dispatch_connection(mesh, from.to_string(), node).await;
+                        }
+                    });
+                }
+            });
+        }
+        let now_ms = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut sessions = Vec::new(); for _ in 0..8 { sessions.push(establish_mux_session(&addr, &peer).await.unwrap()); }
+        let mut tunnels = Vec::new();
+        for i in 0..1500 {
+            let session = sessions[i % 8].clone();
+            tunnels.push(tokio::spawn(async move {
+                let mut stream = session.open_stream().await.ok()?.compat();
+                let request = Message::TunnelRequest { node_id: "node".into(), service_name: "svc".into(), timestamp_ms: now_ms(), caller: None };
+                gossip::send_message(&mut stream, &request).await.ok()?;
+                let mut status = [0u8; 1];
+                stream.read_exact(&mut status).await.ok()?;
+                Some((status[0], stream))
+            }));
+        }
+        let mut reset = 0;
+        let mut held = Vec::new();
+        for tunnel in tunnels {
+            match tunnel.await.unwrap() {
+                Some((0x00, stream)) => held.push(stream),
+                _ => reset += 1,
+            }
+        }
+        assert_eq!(reset, 0, "{reset} of 1500 tunnels failed on one worker");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every tunnel a peer has open through a node counts against it (see
     /// MAX_TUNNELS_PER_PEER) for as long as it is open, connected or not:
     /// once connected it still holds buffers, and data up to its window.

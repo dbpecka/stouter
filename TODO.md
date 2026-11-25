@@ -247,12 +247,13 @@ against the code. Numbered on from the list above.
   peer (an honest merge took 3.8 s behind 200 junk syncs, debug build).
   Fixed: a sync with nothing to check skips the queue, and a peer may have at most 2 syncs being checked at once.
 
-- [ ] **34. A burst of tunnels to a 1-CPU node may reset healthy streams (unconfirmed).**
+- [x] **34. A burst of tunnels to a 1-CPU node may reset healthy streams (unconfirmed).**
   `src/mux.rs`: the session accept loop doesn't yield; on a single tokio
   worker a burst could exceed the stream budget before any stream runs,
   and each reset is charged to the node by the subscriber. A reviewer saw
   13–34 resets per 100 tunnels; not reproduced on a 4-CPU host. (#28 made
   the budget 512 and separate from warm connections, which should help.)
+  Fixed (defensively; still not reproduced): the accept loop yields every 64 streams, so streams accepted run before the next burst is taken. A test bursts 1,500 tunnels over 8 sessions on one worker thread: no stream is reset.
 
 ## Low
 
@@ -275,9 +276,10 @@ against the code. Numbered on from the list above.
 - [x] **39. Certificate expiry is checked only at the handshake:** long-lived connections
   and beats from an expired certificate keep working.
   Fixed (beats): a beat checked against a certificate that has expired counts for nothing. Connections opened before an expiry keep going, by design (nodes renew long before; revocation closes them): now documented.
-- [ ] **40. `requestTimeoutMs` can be exceeded up to twice over** when a request ends up
+- [x] **40. `requestTimeoutMs` can be exceeded up to twice over** when a request ends up
   on a pooled connection that came free while its own tunnel was being set
   up (the background setup keeps extending its deadline).
+  Fixed: a setup the client finishes in a task of its own, for the pool, lets go of the request at once, so the request is timed from then. A test (paused time) checks the request's deadline; it failed before.
 - [x] **41. The HTTP pool's 60 s idle timeout is never enforced** (no `pool_timer`), so
   idle tunnels linger until the node's 300 s timeout.
   Fixed: the proxy's and the telemetry exporter's clients have a pool timer, so idle connections are closed on time.
@@ -435,7 +437,7 @@ reproduced or checked against the code. Numbered on from the lists above.
 - [x] **69. Nonces expire by the monotonic clock, freshness by the wall clock,** so a
   clock stepped back allows one replay (code reading only).
   Fixed: nonces are kept until their request's timestamp no longer passes the freshness check, by the wall clock.
-- [ ] **70. Smaller items:** deploy.sh's `-r` help says it updates the config (it never
+- [x] **70. Smaller items:** deploy.sh's `-r` help says it updates the config (it never
   replaces one); `cert issue` without a CA says "start the daemon once"
   (which makes a second CA); the README says empty `adminCns` disables
   admin RPC (the node's own certificate still works); deploy.sh uploads
@@ -443,7 +445,7 @@ reproduced or checked against the code. Numbered on from the lists above.
   that changes nothing bumps the version; `config push` writes over a newer
   config a local daemon persisted; the daemon does blocking file I/O under
   the config lock.
-  Fixed: deploy.sh uploads only the files git tracks (keys never), and its `-r` help says an existing config is never replaced; `cert issue` without a CA says to run it on the CA node (#59). The `adminCns` wording is right now; a `service add` that changes nothing is refused (and a refused change exits with the same status through a daemon or in the file); `config push` leaves a newer config a local daemon saved meanwhile. Open: blocking file I/O under the config lock.
+  Fixed: deploy.sh uploads only the files git tracks (keys never), and its `-r` help says an existing config is never replaced; `cert issue` without a CA says to run it on the CA node (#59). The `adminCns` wording is right now; a `service add` that changes nothing is refused (and a refused change exits with the same status through a daemon or in the file); `config push` leaves a newer config a local daemon saved meanwhile. The daemon's file I/O under the config lock runs off the async workers (`block_in_place`), and what serves traffic, `status` and metrics read the config without its lock (a snapshot taken at each change): a hung disk now holds up config changes and gossip, not requests. A test hangs the config file (a FIFO) mid-save.
 - [x] **71. The idle reverse-connection cap can be passed by one** (found running
   `caps.sh`: 1025 kept, once in four runs): `handle_reverse_registration`
   counts the pool, awaits the known-nodes update, then pushes, so
@@ -502,8 +504,9 @@ each finding reproduced. Numbered on.
 
 ## Older, found on the way
 
-- [ ] **81. A node that missed an unrevoke never converges:** v6 revokes admin
+- [x] **81. A node that missed an unrevoke never converges:** v6 revokes admin
   X, v7 unrevokes, v8 is signed by X. A node still on v6, offered only v8,
   refuses it by its own (stale) revocations until another admin signs.
   Fix: check the signer against the revocations in force up to the incoming
   config, not only this node's.
+  Fixed (another way: a config's own revocation list can't be trusted before its signer is): when a peer's config is refused because this node has its signer revoked, and that config's list no longer revokes it, the node asks that peer for its config history and takes the versions it missed in order, each checked as usual (at most 20, once a minute per peer). The unrevoke is among them, so v8 is then taken. A test runs the v6/v7/v8 case.

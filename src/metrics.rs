@@ -79,7 +79,7 @@ pub async fn run_gauge_loop(state: Arc<SharedState>, upkeep: impl Fn()) {
         metrics::gauge!("stouter_known_nodes").set(nodes.len() as f64);
 
         // Config version
-        let version = state.dynamic_config.read().await.version;
+        let version = state.config_now.load().version;
         metrics::gauge!("stouter_config_version").set(version as f64);
 
         // Pool sizes per node

@@ -520,7 +520,7 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
         mode: format!("{:?}", state.config.mode).to_lowercase(),
         node_id: state.config.node_id.clone(),
         bind: state.config.bind.clone(),
-        dynamic_config: state.dynamic_config.read().await.clone(),
+        dynamic_config: crate::config::DynamicConfig::clone(&state.config_now.load()),
         known_nodes: snapshot_nodes(&state),
         require_signed_config: state.config.require_signed_config,
         cert_expires: state.tls.as_ref().and_then(|tls| crate::pki::validity(tls.own_cert().as_ref())).map(|(_, until)| until),
@@ -591,7 +591,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
         // and memory are compared as one consistent snapshot.
         let new_dc = {
             let mut dc = state.dynamic_config.write().await;
-            let file_dc = match crate::config::Config::load(&state.config_path) {
+            let file_dc = match blocking(|| crate::config::Config::load(&state.config_path)) {
                 Ok(c) => c.dynamic_config,
                 Err(e) => {
                     // A hand edit that doesn't parse: say so (once per
@@ -1064,8 +1064,8 @@ async fn send_to_peer(addr: &str, msg: &Message, state: &Arc<SharedState>) -> Re
 /// the task that adopted the config, the sync or config poll loop.
 async fn print_dynamic_config(state: &Arc<SharedState>) {
     use std::io::Write;
-    let dc = state.dynamic_config.read().await.clone();
-    match serde_json::to_string_pretty(&dc) {
+    let dc = state.config_now.load_full();
+    match serde_json::to_string_pretty(&*dc) {
         Ok(json) => {
             let _ = writeln!(std::io::stdout().lock(), "{json}");
         }
@@ -1082,8 +1082,26 @@ async fn print_dynamic_config(state: &Arc<SharedState>) {
 /// in version order (the config poll loop relies on that).
 fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) {
     // Every config change comes through here, with the config's lock held:
-    // index it at once, in the same step.
+    // index it at once, in the same step. What serves traffic reads that
+    // index and `config_now`, never the lock, so a slow or hung disk below
+    // holds up config changes and gossip, not requests.
     state.index_config(dc);
+    blocking(|| persist_to_file(state, dc));
+}
+
+/// Run `f`, file I/O say, on this thread without holding up the other tasks
+/// on its worker: they move to another while it runs. (On a single-threaded
+/// runtime, as in some tests, it just runs.)
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+fn persist_to_file(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) {
     let path = &state.config_path;
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -1450,10 +1468,14 @@ async fn adopt_from_peer(
         return Adoption::NotAdopted;
     }
     let version = incoming.version;
+    let lifted = revocation_lifted_by(state, &incoming);
     let verified = match verify_unlocked(state, incoming, peer).await {
         Some(Ok(config)) => config,
         Some(Err(e)) => {
             crate::signing::log_refusal(state, version, &e);
+            if let (true, Some(peer)) = (lifted, peer) {
+                start_catch_up_from_history(state, peer, version);
+            }
             return Adoption::NotAdopted;
         }
         None => return Adoption::Unchecked,
@@ -1482,6 +1504,79 @@ enum Adoption {
     /// Not checked (one refused lately is `NotAdopted`): the peer had
     /// another being checked. It offers it again next sync.
     Unchecked,
+}
+
+/// Whether `incoming`'s signer is revoked here, but not in `incoming`
+/// itself: the cluster lifted the revocation in a version this node missed
+/// (it may be offered only the newest), so it would refuse every config
+/// that signer makes from now on.
+fn revocation_lifted_by(state: &SharedState, incoming: &crate::config::DynamicConfig) -> bool {
+    let (Some((cn, fingerprint, fingerprint_hex)), Some(tls)) = (crate::signing::signer_of(incoming), state.tls.as_deref()) else {
+        return false;
+    };
+    tls.revocations().is_revoked(Some(&cn), &fingerprint)
+        && !incoming.revoked.nodes.contains(&cn)
+        && !incoming.revoked.certs.contains(&fingerprint_hex)
+}
+
+/// How often one peer is asked for configs this node missed.
+const HISTORY_CATCH_UP_EVERY: Duration = Duration::from_secs(60);
+
+/// Most missed versions taken from one peer's history at a time.
+const MAX_HISTORY_CATCH_UP: usize = 20;
+
+/// Ask `peer` (now and then) for the configs between the one held here and
+/// `upto`, from its history (see [`catch_up_from_history`]).
+fn start_catch_up_from_history(state: &Arc<SharedState>, peer: &str, upto: u64) {
+    {
+        let mut asked = state.history_catch_ups.lock().unwrap();
+        asked.retain(|_, at| at.elapsed() < HISTORY_CATCH_UP_EVERY);
+        if asked.contains_key(peer) {
+            return;
+        }
+        asked.insert(peer.to_string(), std::time::Instant::now());
+    }
+    let Some(addr) = state.known_nodes.load().get(peer).map(|n| n.addr.clone()).filter(|a| !a.is_empty()) else {
+        return;
+    };
+    let (state, peer) = (Arc::clone(state), peer.to_string());
+    tokio::spawn(async move { catch_up_from_history(state, peer, addr, upto).await });
+}
+
+/// Take, oldest first, the configs `peer` (at `addr`) recorded between the
+/// one held here and `upto`: each checked as any config from a peer is,
+/// so a config whose signer this node revoked gets in only after one an
+/// admin it trusts signed lifting that, as the cluster took them.
+async fn catch_up_from_history(state: Arc<SharedState>, peer: String, addr: String, upto: u64) {
+    let ask = |version: Option<u64>| {
+        let (state, peer, addr) = (state.clone(), peer.clone(), addr.clone());
+        async move {
+            let mut stream = state.connect_mesh(&addr, Some(&peer)).await?;
+            send_message(&mut stream, &Message::HistoryRequest { version }).await?;
+            match recv_message(&mut stream).await? {
+                Message::HistoryResponse { entries } => anyhow::Ok(entries),
+                _ => anyhow::bail!("unexpected answer to a history request"),
+            }
+        }
+    };
+    let Ok(Ok(listed)) = time::timeout(Duration::from_secs(10), ask(None)).await else { return };
+    let held = state.dynamic_config.read().await.version;
+    let mut versions: Vec<u64> = listed.iter().map(|e| e.version).filter(|v| *v > held && *v < upto).collect();
+    versions.sort_unstable();
+    versions.dedup();
+    versions.truncate(MAX_HISTORY_CATCH_UP);
+    if !versions.is_empty() {
+        info!("asking {peer} for versions {versions:?}: a revocation this node holds was lifted in one of them");
+    }
+    for version in versions {
+        let Ok(Ok(entries)) = time::timeout(Duration::from_secs(10), ask(Some(version))).await else { return };
+        let Some(config) = entries.into_iter().rev().find_map(|e| e.config) else { continue };
+        let adopted: std::pin::Pin<Box<dyn std::future::Future<Output = Adoption> + Send>> =
+            Box::pin(adopt_from_peer(&state, config, "config missed, from a peer's history", Some(&peer)));
+        if adopted.await == Adoption::Adopted {
+            state.rebuild_service_index().await;
+        }
+    }
 }
 
 /// How long a refused signed config isn't checked again.
@@ -2881,6 +2976,67 @@ mod tests {
         crate::signing::sign(dc, &crate::signing::Signer::from_material(m).unwrap()).unwrap()
     }
 
+    /// v6 revokes admin rob; v7 lifts that; v8 is rob's. A node still on v6,
+    /// offered only v8, refused it for good (rob is revoked here). Now it
+    /// asks the peer for what it missed, takes v7 from its history (signed
+    /// by an admin it trusts), and then v8.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_missed_an_unrevoke_catches_up_from_a_peers_history() {
+        let dir = std::env::temp_dir().join(format!("stouter_unrevoke_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let signer = |id: &str| crate::signing::Signer::from_material(&crate::pki::load_or_create(dir.to_str().unwrap(), id).unwrap()).unwrap();
+        let (boss, rob) = (signer("boss"), signer("rob"));
+        let mut v6 = DynamicConfig { version: 6, changed_by: "boss".into(), ..named_services(&["api"]) };
+        v6.revoked.nodes.push("rob".into());
+        let v6 = crate::signing::sign(&v6, &boss).unwrap();
+        let v7 = crate::signing::sign(&DynamicConfig { version: 7, changed_by: "boss".into(), ..named_services(&["api"]) }, &boss).unwrap();
+        let v8 = crate::signing::sign(&DynamicConfig { version: 8, changed_by: "rob".into(), ..named_services(&["api", "rob-added"]) }, &rob).unwrap();
+        let node = |id: &str, dc: &DynamicConfig| {
+            let path = dir.join(format!("{id}.json")).to_str().unwrap().to_string();
+            let cfg = Config {
+                node_id: id.into(),
+                admin_cns: vec!["boss".into(), "rob".into()],
+                require_signed_config: true,
+                dynamic_config: dc.clone(),
+                ..Config::default()
+            };
+            cfg.save(&path).unwrap();
+            (crate::state::test_support::tls_state_with(&dir, cfg, path.clone()), path)
+        };
+        let (n1, _) = node("n1", &v6);
+        let (n2, n2_path) = node("n2", &v8);
+        for dc in [&v6, &v7, &v8] {
+            crate::history::record(&n2_path, dc);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((tcp, from)) = listener.accept().await {
+                let n2 = n2.clone();
+                tokio::spawn(async move {
+                    if let Ok(mesh) = n2.tls_accept(tcp).await {
+                        dispatch_connection(mesh, from.to_string(), n2).await;
+                    }
+                });
+            }
+        });
+        let mut known = std::collections::HashMap::new();
+        known.insert("n2".to_string(), NodeInfo { id: "n2".into(), addr: addr.clone(), ..Default::default() });
+        n1.known_nodes.store(Arc::new(known));
+
+        apply_message(&n1, Message::ConfigUpdate { config: v8.clone() }, Some("n2")).await;
+        let caught_up = async {
+            while n1.dynamic_config.read().await.version < 7 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), caught_up).await.expect("took v7 from n2's history");
+        apply_message(&n1, Message::ConfigUpdate { config: v8 }, Some("n2")).await;
+        let held = n1.dynamic_config.read().await.clone();
+        assert_eq!((held.version, service_names(&held)), (8, vec!["api".to_string(), "rob-added".into()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Configs claiming a newer version, large, with junk signatures (a
     /// member stalling the node): checked without the config's lock, so its
     /// readers don't wait behind them; one refused isn't checked again.
@@ -3453,6 +3609,79 @@ mod tests {
         assert_eq!(state.dynamic_config.read().await.version, 1, "refused, like the same change from the CLI");
         state.shutdown.cancel();
         let _ = poll.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config file that hangs on read (a FIFO no one writes, standing in
+    /// for a hung disk) holds up the change being saved, not what serves
+    /// traffic: the change is already in force and readable without the
+    /// config's lock, and the node's other tasks keep running.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_config_file_holds_up_no_reader() {
+        let dir = std::env::temp_dir().join(format!("stouter_hung_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path_str = path.to_str().unwrap().to_string();
+        let config_at = |version: u64| -> DynamicConfig {
+            serde_json::from_value(serde_json::json!({
+                "version": version,
+                "serviceGroups": [{"name": "g", "services": [{"name": "api", "nodeId": "n1", "nodePort": 3000}]}],
+            }))
+            .unwrap()
+        };
+        let cfg = Config { node_id: "n1".into(), dynamic_config: config_at(5), ..Config::default() };
+        let text = serde_json::to_string(&cfg).unwrap();
+        let state = SharedState::new(cfg, path_str.clone(), CancellationToken::new(), None);
+        assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+        // Answers the save as the disk would: it reads the file, then checks
+        // it may write there by opening it for writing. Also on a failed
+        // assertion, or the runtime would wait for the hung save forever.
+        struct Disk(Option<(std::path::PathBuf, String)>);
+        impl Disk {
+            fn answer(&mut self) {
+                if let Some((path, text)) = self.0.take() {
+                    std::thread::spawn(move || {
+                        let _ = std::fs::write(&path, text);
+                        drop(std::fs::File::open(&path));
+                    });
+                }
+            }
+        }
+        impl Drop for Disk {
+            fn drop(&mut self) {
+                self.answer();
+            }
+        }
+        let mut disk = Disk(Some((path.clone(), text)));
+
+        let saving = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let dc = state.dynamic_config.write().await;
+                let new = config_at(6);
+                persist_state_with(&state, &new);
+                drop(dc);
+            }
+        });
+        // The change is in force while its save hangs.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.config_now.load().version != 6 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the change isn't in force until saved");
+        // Its lock is still held, but other tasks run, on every worker.
+        assert!(state.dynamic_config.try_read().is_err(), "the save should still be hanging");
+        let ticks = (0..8).map(|_| tokio::spawn(tokio::time::sleep(Duration::from_millis(10))));
+        tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(ticks)).await.expect("tasks stalled");
+        assert!(!saving.is_finished());
+
+        // The disk answers: the save completes.
+        disk.answer();
+        tokio::time::timeout(Duration::from_secs(5), saving).await.expect("the save never finished").unwrap();
+        assert_eq!(crate::config::Config::load(&path_str).unwrap().dynamic_config.version, 6);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

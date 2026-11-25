@@ -145,7 +145,7 @@ async fn manage_proxies(
         }
 
         // Snapshot current desired state.
-        let dc = state.dynamic_config.read().await.clone();
+        let dc = crate::config::DynamicConfig::clone(&state.config_now.load());
         let nodes = state.known_nodes.load_full();
 
         // A node that left may still be draining, and our idle HTTP
@@ -377,7 +377,7 @@ fn nodes_to_unpool(
 /// get warm connections and mux sessions, so a subscriber's idle
 /// connections grow with what it proxies, not with the cluster.
 async fn tunnel_addrs(state: &SharedState) -> HashSet<String> {
-    let wanted = proxied_nodes(&*state.dynamic_config.read().await, &state.config);
+    let wanted = proxied_nodes(&state.config_now.load(), &state.config);
     let known = state.known_nodes.load();
     wanted
         .iter()

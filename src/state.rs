@@ -424,6 +424,10 @@ impl InFlightTracker {
 pub struct SharedState {
     pub config: Arc<Config>,
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
+    /// The dynamic config as of its last change, read without its lock:
+    /// for what serves traffic (the HTTP listener), status and metrics, so
+    /// they never wait behind a change being written to a slow disk.
+    pub config_now: ArcSwap<DynamicConfig>,
     /// The dynamic config (as JSON) that the config file holds as far as
     /// this daemon knows: what it last wrote there or took from there. The
     /// file saying something else means an edit nobody applied, which a
@@ -489,6 +493,9 @@ pub struct SharedState {
     pub(crate) refused_configs: Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>,
     /// When a sync with a peer, either way, was last merged here.
     pub(crate) last_merged: Mutex<Option<std::time::Instant>>,
+    /// When each peer was last asked for configs this node missed (see
+    /// `gossip::catch_up_from_history`).
+    pub(crate) history_catch_ups: Mutex<HashMap<String, std::time::Instant>>,
     /// Keys for those hashes, this process's own.
     pub(crate) refused_hasher: std::collections::hash_map::RandomState,
     /// The cluster CA, when this node holds its key: it issues renewed
@@ -583,6 +590,7 @@ impl SharedState {
         Arc::new(Self {
             config: Arc::new(config),
             file_config: Mutex::new(serde_json::to_string(&dynamic_config).ok()),
+            config_now: ArcSwap::from_pointee(dynamic_config.clone()),
             dynamic_config: Arc::new(RwLock::new(dynamic_config)),
             known_nodes: ArcSwap::from_pointee(HashMap::new()),
             known_nodes_write: tokio::sync::Mutex::new(()),
@@ -612,6 +620,7 @@ impl SharedState {
             tunnel_nonces: Mutex::new(crate::authz::NonceCache::default()),
             refused_configs: Mutex::new(std::collections::VecDeque::new()),
             last_merged: Mutex::new(None),
+            history_catch_ups: Mutex::new(HashMap::new()),
             refused_hasher: std::collections::hash_map::RandomState::new(),
             issuer: std::sync::OnceLock::new(),
             renewals: Mutex::new(HashMap::new()),
@@ -709,6 +718,9 @@ impl SharedState {
         if !tls.revocations().set(&dc.revoked) {
             return;
         }
+        // A config refused lately (see `gossip::adopt_from_peer`) may have
+        // been refused for a revocation now lifted: check them again.
+        self.refused_configs.lock().unwrap().clear();
         tracing::info!(
             "revoked certificates: {} node name(s) {:?}, {} single certificate(s)",
             dc.revoked.nodes.len(),
@@ -759,6 +771,7 @@ impl SharedState {
     /// interrupt a change between taking a config and indexing it (a sync
     /// cut off by its timeout used to leave the index on the old config).
     pub fn index_config(&self, dc: &DynamicConfig) {
+        self.config_now.store(Arc::new(dc.clone()));
         self.service_index.store(Arc::new(build_service_index(dc)));
         self.routes.store(Arc::new(build_route_index(dc)));
         self.policies.store(Arc::new(crate::authz::build(dc)));

@@ -212,7 +212,9 @@ pulled config being edited), it saves the file as `<config>.unapplied`
 (numbered like the backups)
 first and logs a warning, rather than write over the edit. `config push`
 mentions that file when the cluster already has what the config file now
-says.
+says. A slow or hung disk holds up only config changes and gossip: requests
+are routed, and `status` and metrics answered, from the config in force,
+without waiting for it to be written.
 
 ### Registering Services
 
@@ -405,6 +407,11 @@ revoked, as the certificate would be refused everywhere.
   member can revoke (or unrevoke) any other.
 - A node keeps running with its own certificate revoked, and logs an error:
   its peers refuse it until it has a new certificate or is unrevoked.
+- A node that missed an unrevoke (it was down, say) still refuses configs
+  the unrevoked admin signs. When a peer offers one whose own list no longer
+  revokes that admin, the node takes the versions it missed from the peer's
+  history, in order, each checked as usual (up to 20, once a minute per
+  peer), and with them the unrevoke.
 - Every node must run a version that knows revocations: an older one ignores
   the list, and one relaying an unsigned config drops it.
 
@@ -770,7 +777,8 @@ to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
   node, so one long-lived client connection is still spread across instances,
   and tunnels are reused instead of opened per request.
 - **Timeouts:** optional `requestTimeoutMs` per instance (at least 10): the time allowed
-  for response headers, counted from when the tunnel to the node is up;
+  for response headers, counted from when the tunnel to the node is up (or
+  from when the request is given a pooled one that came free meanwhile);
   expiry returns `504`. Setting up a new tunnel may take as long again: one
   that takes longer counts as a failed connection, so the node is charged
   (towards ejection) and the request goes to another node. A NAT'd node's

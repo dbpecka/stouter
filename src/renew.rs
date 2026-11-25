@@ -125,7 +125,7 @@ async fn warn_if_config_signer_expired(state: &SharedState) {
     if !state.config.require_signed_config {
         return;
     }
-    let dc = state.dynamic_config.read().await.clone();
+    let dc = state.config_now.load_full();
     let Some((who, until)) = crate::signing::expired_signer(&dc) else { return };
     if state.warned_expired_signer.lock().unwrap().replace(dc.version) == Some(dc.version) {
         return;

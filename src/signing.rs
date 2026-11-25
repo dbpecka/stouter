@@ -282,6 +282,15 @@ pub fn expired_signer(dc: &DynamicConfig) -> Option<(String, u64)> {
     (until < now_secs()).then(|| (crate::tls::cert_cn(&der.into()).unwrap_or_else(|| "?".into()), until))
 }
 
+/// Who signed `dc` (their certificate's CN) and that certificate's
+/// fingerprint (lowercase hex, as `revoked.certs` holds them).
+pub fn signer_of(dc: &DynamicConfig) -> Option<(String, [u8; 32], String)> {
+    let der = unhex(&dc.signature.as_ref()?.signer_cert).ok()?;
+    let fingerprint = crate::tls::fingerprint(&der);
+    let cn = crate::tls::cert_cn(&der.into())?;
+    Some((cn, fingerprint, fingerprint.iter().map(|b| format!("{b:02x}")).collect()))
+}
+
 /// Why a running node won't take `config`, signed by `who` with a
 /// certificate that expired at `until`.
 pub fn expired_signer_refusal(config: &DynamicConfig, who: &str, until: u64) -> String {

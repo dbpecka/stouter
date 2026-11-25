@@ -475,6 +475,42 @@ impl TunnelSetup {
     }
 }
 
+/// `setting_up` (a tunnel being set up for the request `setup` belongs to)
+/// to completion, with `setup` saying so while the request waits for it.
+/// The client may give the request a pooled connection that came free
+/// meanwhile, and finish this setup in a task of its own, for the pool:
+/// polled outside the request (where [`TUNNEL_SETUP`] isn't set), it lets
+/// go of the request at once, so its answer is timed from then, not
+/// extended by a setup it no longer waits for.
+async fn for_request<F: Future>(setup: &TunnelSetup, setting_up: F) -> F::Output {
+    /// Lets go of the request once: when the setup ends, moves out of the
+    /// request's task, or is dropped unfinished.
+    struct Release<'a>(Option<&'a TunnelSetup>);
+    impl Release<'_> {
+        fn now(&mut self) {
+            if let Some(setup) = self.0.take() {
+                setup.set_setting_up(false);
+            }
+        }
+    }
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.now();
+        }
+    }
+    tokio::pin!(setting_up);
+    let mut release = Release(Some(setup));
+    let result = std::future::poll_fn(|cx| {
+        if TUNNEL_SETUP.try_with(|_| ()).is_err() {
+            release.now();
+        }
+        setting_up.as_mut().poll(cx)
+    })
+    .await;
+    release.now();
+    result
+}
+
 /// `sent`'s result, or `None` if the answer takes longer than `limit`
 /// counted from when the request's tunnel is up (or from the start, on a
 /// pooled connection). While a tunnel is being set up the connector's own
@@ -944,9 +980,8 @@ impl tower_service::Service<Uri> for TunnelConnector {
                 Some(setup) => {
                     // Within the request's limit, a NAT'd node's relays
                     // share it, so a dead one still leaves time for the next.
-                    let result = establish_tunnel_within(&node, service_name, &state, setup.limit).await;
-                    setup.set_setting_up(false);
-                    result?
+                    let limit = setup.limit;
+                    for_request(setup, establish_tunnel_within(&node, service_name, &state, limit)).await?
                 }
                 None => establish_tunnel(&node, service_name, &state).await?,
             };
@@ -991,6 +1026,44 @@ impl Connection for TunnelIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request whose own tunnel is still being set up when a pooled
+    /// connection comes free: the client sends it on that one and finishes
+    /// the setup in a task of its own. The request's answer is timed from
+    /// then, not stretched by a setup it no longer waits for.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_on_a_pooled_connection_isnt_stretched_by_a_setup_it_left() {
+        let limit = Duration::from_millis(100);
+        let setup = Arc::new(TunnelSetup::new(limit));
+        let started = tokio::time::Instant::now();
+        // What the client does: race the setup against the pool, and when
+        // the pool wins, finish the setup in the background.
+        let request = {
+            let setup = setup.clone();
+            async move {
+                setup.set_setting_up(true);
+                let connecting = Box::pin({
+                    let setup = setup.clone();
+                    async move { for_request(&setup, tokio::time::sleep(Duration::from_secs(1))).await }
+                });
+                let checkout = tokio::time::sleep(Duration::from_millis(50));
+                tokio::pin!(checkout);
+                let mut connecting = connecting;
+                tokio::select! {
+                    () = &mut connecting => {}
+                    () = &mut checkout => {
+                        tokio::spawn(connecting);
+                    }
+                }
+                // The answer, on the pooled connection, takes 300 ms.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        };
+        let answered = answer_within(limit, &setup, TUNNEL_SETUP.scope(setup.clone(), request)).await;
+        assert!(answered.is_none(), "timed out");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(200), "within 100 ms of getting the pooled connection: {took:?}");
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

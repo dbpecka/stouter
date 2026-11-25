@@ -85,7 +85,7 @@ async fn dispatch(req: Request<Incoming>, state: &SharedState, proxies: &HttpPro
         return reject(&req, StatusCode::BAD_REQUEST, "missing_host");
     };
     let service = {
-        let dc = state.dynamic_config.read().await;
+        let dc = state.config_now.load();
         resolve_service(&host, &dc, state.config.subscribe_filter.as_ref())
     };
     let Some(service) = service else {
