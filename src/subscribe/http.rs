@@ -1065,6 +1065,100 @@ mod tests {
         assert!(took < Duration::from_millis(200), "within 100 ms of getting the pooled connection: {took:?}");
     }
 
+    /// `policy deny` (here: a policy that leaves "sub" out) reaches a
+    /// subscriber's pooled HTTP keep-alive tunnel, set up before the change:
+    /// the hosting node closes it. Before, it kept carrying new requests to
+    /// the service (5 of 5 answered), as long as one came every 60 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_subscriber_loses_its_pooled_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("stouter_policy_pooled_{}_{}", std::process::id(), rand::random::<u64>()));
+        // The service: answers every request on a connection.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0; 8192];
+                    let mut got = 0;
+                    loop {
+                        match tcp.read(&mut buf[got..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got += n,
+                        }
+                        if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                            got = 0;
+                            let _ = tcp.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+                        }
+                    }
+                });
+            }
+        });
+        let open: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "g", "services": [
+                {"name": "api", "nodeId": "n", "nodePort": port, "protocol": "http"}
+            ]}],
+        }))
+        .unwrap();
+        let closed: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 2, "serviceGroups": [{"name": "g", "services": [
+                {"name": "api", "nodeId": "n", "nodePort": port, "protocol": "http"}
+            ]}],
+            "policies": [{"service": "api", "allow": ["someone-else"]}],
+        }))
+        .unwrap();
+        // The real hosting node, serving tunnels.
+        let node = crate::state::test_support::tls_state_with(
+            &dir,
+            crate::config::Config { node_id: "n".into(), dynamic_config: open.clone(), ..Default::default() },
+            String::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, from) = listener.accept().await.unwrap();
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mesh) = node.tls_accept(tcp).await {
+                            crate::gossip::dispatch_connection(mesh, from.to_string(), node).await;
+                        }
+                    });
+                }
+            });
+        }
+        let sub = crate::state::test_support::tls_state_with(
+            &dir,
+            crate::config::Config { node_id: "sub".into(), mode: crate::config::Mode::Subscribe, dynamic_config: open, ..Default::default() },
+            String::new(),
+        );
+        sub.update_known_nodes(|kn| {
+            kn.insert("n".into(), crate::config::NodeInfo { id: "n".into(), addr: addr.clone(), last_seen: Some(Instant::now()), ..Default::default() });
+        })
+        .await;
+        let proxy = HttpProxy::new("api".into(), sub.clone(), Arc::new(Balancer::new()));
+        assert_eq!(get_through(proxy.clone()).await, 200, "allowed before the policy");
+
+        // The policy arrives on both (as by gossip).
+        for state in [&node, &sub] {
+            state.index_config(&closed);
+            *state.dynamic_config.write().await = closed.clone();
+        }
+        assert!(!crate::authz::may_reach(&sub, "api", "sub"), "sub is no longer allowed");
+        let fresh = HttpProxy::new("api".into(), sub.clone(), Arc::new(Balancer::new()));
+        assert_ne!(get_through(fresh).await, 200, "a new tunnel is refused");
+        let mut answered = 0;
+        for _ in 0..5 {
+            if get_through(proxy.clone()).await == 200 {
+                answered += 1;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(answered, 0, "requests from a denied subscriber still reach the service on its pooled tunnel");
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {

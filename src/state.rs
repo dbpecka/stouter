@@ -513,6 +513,11 @@ pub struct SharedState {
     pub(crate) own_record: Mutex<Option<OwnRecord>>,
     /// Open connections per (kind, peer CN), for the per-peer limits.
     pub(crate) peer_slots: Mutex<HashMap<(&'static str, String), usize>>,
+    /// Tunnels to this node's services, each with its service and the
+    /// caller it was let open for: closed when the policies stop allowing
+    /// it (see [`SharedState::serve_tunnel`]).
+    served_tunnels: Mutex<HashMap<u64, ServedEntry>>,
+    next_served: AtomicU64,
     /// When each NAT'd node last registered a reverse connection here.
     relayed_here: Mutex<HashMap<String, std::time::Instant>>,
     /// Relays that didn't answer a tunnel in time, until when they are tried
@@ -555,6 +560,35 @@ impl Drop for PeerSlot {
                 slots.remove(&self.key);
             }
         }
+    }
+}
+
+/// A tunnel to one of this node's services (see
+/// [`SharedState::serve_tunnel`]): its service, who it was let open for,
+/// and how to close it.
+struct ServedEntry {
+    service: String,
+    caller: Option<String>,
+    close: CancellationToken,
+}
+
+/// A tunnel being served, registered for as long as it lives.
+pub struct ServedTunnel {
+    state: Arc<SharedState>,
+    id: u64,
+    close: CancellationToken,
+}
+
+impl ServedTunnel {
+    /// Completes when the policies no longer allow the tunnel.
+    pub async fn refused(&self) {
+        self.close.cancelled().await
+    }
+}
+
+impl Drop for ServedTunnel {
+    fn drop(&mut self) {
+        self.state.served_tunnels.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -628,6 +662,8 @@ impl SharedState {
             unsigned_cap_warned: std::sync::atomic::AtomicBool::new(false),
             own_record: Mutex::new(None),
             peer_slots: Mutex::new(HashMap::new()),
+            served_tunnels: Mutex::new(HashMap::new()),
+            next_served: AtomicU64::new(0),
             relayed_here: Mutex::new(HashMap::new()),
             lagging_relays: Mutex::new(HashMap::new()),
             catch_up_until: Mutex::new(std::time::Instant::now() + CATCH_UP),
@@ -772,10 +808,40 @@ impl SharedState {
     /// cut off by its timeout used to leave the index on the old config).
     pub fn index_config(&self, dc: &DynamicConfig) {
         self.config_now.store(Arc::new(dc.clone()));
+        // The policies before the services: a service and its policy
+        // arriving together, the service is never reachable without it.
+        self.policies.store(Arc::new(crate::authz::build(dc)));
         self.service_index.store(Arc::new(build_service_index(dc)));
         self.routes.store(Arc::new(build_route_index(dc)));
-        self.policies.store(Arc::new(crate::authz::build(dc)));
         self.apply_revocations(dc);
+        self.close_refused_tunnels();
+    }
+
+    /// Register a tunnel to our `service`, let open for `caller` (see
+    /// `authz::authorize`), for as long as the returned guard lives.
+    pub fn serve_tunnel(self: &Arc<Self>, service: &str, caller: Option<String>) -> ServedTunnel {
+        let id = self.next_served.fetch_add(1, Ordering::Relaxed);
+        let close = CancellationToken::new();
+        let entry = ServedEntry { service: service.to_string(), caller, close: close.clone() };
+        self.served_tunnels.lock().unwrap().insert(id, entry);
+        ServedTunnel { state: Arc::clone(self), id, close }
+    }
+
+    /// Close the tunnels the policies (or the services, whose instances may
+    /// reach one another) in force no longer allow: a policy change reaches
+    /// tunnels already open, as a revocation does, and not only new ones.
+    fn close_refused_tunnels(&self) {
+        let served = self.served_tunnels.lock().unwrap();
+        for entry in served.values() {
+            if !entry.close.is_cancelled() && !crate::authz::still_allowed(self, &entry.service, entry.caller.as_deref()) {
+                tracing::info!(
+                    "closing a tunnel to '{}' from {}: the policy no longer allows it",
+                    entry.service,
+                    entry.caller.as_deref().map_or("a caller not known".to_string(), |c| format!("'{c}'"))
+                );
+                entry.close.cancel();
+            }
+        }
     }
 
     /// Whether `node_id` reports `service_name` as failing its health check.

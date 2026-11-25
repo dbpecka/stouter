@@ -291,21 +291,27 @@ enum ServiceAction {
         name: String,
         #[arg(long)]
         port: u16,
-        /// Comma-separated list of domains to route to this service
+        /// Comma-separated list of domains to route to this service (`""`
+        /// for none).
+        ///
+        /// For an instance already there, only what is given here changes:
+        /// the rest keeps its value. To unset one, remove the instance and
+        /// add it again.
         #[arg(long, value_delimiter = ',')]
-        domains: Vec<String>,
+        domains: Option<Vec<String>>,
         /// Relative share of connections this instance receives among all
-        /// instances of the service. `0` drains it.
-        #[arg(long, default_value_t = config::DEFAULT_WEIGHT)]
-        weight: u32,
+        /// instances of the service (1 for a new one). `0` drains it.
+        #[arg(long)]
+        weight: Option<u32>,
         /// Maximum concurrent connections each subscriber opens to this
         /// instance. Unlimited when unset.
         #[arg(long)]
         max_connections: Option<u32>,
         /// How subscribers proxy the service: `tcp` (byte stream) or `http`
         /// (per-request balancing, timeouts, retries, logs and metrics).
-        #[arg(long, value_enum, default_value_t = config::Protocol::Tcp)]
-        protocol: config::Protocol,
+        /// (`tcp` for a new instance.)
+        #[arg(long, value_enum)]
+        protocol: Option<config::Protocol>,
         /// HTTP only: time allowed for this instance to send response headers.
         #[arg(long)]
         request_timeout_ms: Option<u64>,
@@ -486,6 +492,7 @@ async fn main() -> Result<()> {
             }
             let material = pki::load_or_create_with(tls_dir, &cfg.node_id, cfg.cert_lifetime())?;
             let tls_ctx = tls::TlsContext::new(&material)?;
+            tls_ctx.check_own_cert(&cfg.node_id).with_context(|| format!("the certificates in {tls_dir}"))?;
             tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
 
             cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
@@ -745,32 +752,27 @@ async fn main() -> Result<()> {
             }
             // `--domains ""` is no domains, and `a,,b` is a and b: never an
             // empty one, which every other empty one would clash with.
-            let domains: Vec<String> =
-                domains.into_iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect();
-            let labels: std::collections::BTreeMap<String, String> = labels.into_iter().collect();
-            let meta: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
+            let flags = ServiceFlags {
+                domains: domains
+                    .map(|domains| domains.into_iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect()),
+                weight,
+                max_connections,
+                protocol,
+                request_timeout_ms,
+                health_path,
+                labels: labels.into_iter().collect(),
+                meta: meta.into_iter().collect(),
+                local_port,
+            };
             if let Some(target) = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await? {
                 let cfg = Config::load_or_default(&cli.config)?;
                 let owner_node_id = owner_node(node, Some(&target), &cfg, cli.cert_dir.as_deref()).await?;
+                // On the instance as the cluster has it, if it has it.
+                let current = fetch_remote_dynamic_config(&target, &cfg, cli.cert_dir.as_deref()).await?;
+                let service = flags.apply(instance(&current, &group_name, &name, &owner_node_id), &name, &owner_node_id, port);
                 let version = run_admin_rpc(
                     &target,
-                    AdminOp::service_add(
-                        group_name.clone(),
-                        Service {
-                            name: name.clone(),
-                            node_id: owner_node_id.clone(),
-                            node_port: port,
-                            domains: domains.clone(),
-                            weight,
-                            max_connections,
-                            protocol,
-                            request_timeout_ms,
-                            health_path,
-                            labels,
-                            meta,
-                            local_port,
-                        },
-                    ),
+                    AdminOp::service_add(group_name.clone(), service),
                     &cfg,
                     &cli.config,
                     cli.cert_dir.as_deref(),
@@ -783,31 +785,11 @@ async fn main() -> Result<()> {
             } else {
                 let mut cfg = Config::load(&cli.config)?;
                 let node_id = owner_node(node, None, &cfg, cli.cert_dir.as_deref()).await?;
-                let service = Service {
-                    name: name.clone(),
-                    node_id,
-                    node_port: port,
-                    domains: domains.clone(),
-                    weight,
-                    max_connections,
-                    protocol,
-                    request_timeout_ms,
-                    health_path,
-                    labels,
-                    meta,
-                    local_port,
-                };
+                let existing = instance(&cfg.dynamic_config, &group_name, &name, &node_id);
+                let service = flags.apply(existing, &name, &node_id, port);
                 let before = cfg.dynamic_config.clone();
                 let version = cfg.dynamic_config.upsert_service(&group_name, service).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
-
-                let tls_ctx = local_tls(&cfg)?;
-                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
-                gossip::broadcast_message(
-                    &state,
-                    Message::ConfigUpdate { config: cfg.dynamic_config.clone() },
-                )
-                .await;
 
                 println!(
                     "Service '{}' added to group '{}' (version {})",
@@ -902,14 +884,6 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
-                let tls_ctx = local_tls(&cfg)?;
-                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
-                gossip::broadcast_message(
-                    &state,
-                    Message::ConfigUpdate { config: cfg.dynamic_config.clone() },
-                )
-                .await;
-
                 println!(
                     "Service '{}' renamed to '{}' in group '{}' (version {})",
                     from, to, group_name, version
@@ -959,14 +933,6 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
-                let tls_ctx = local_tls(&cfg)?;
-                let state = SharedState::new(cfg.clone(), cli.config.clone(), CancellationToken::new(), tls_ctx);
-                gossip::broadcast_message(
-                    &state,
-                    Message::ConfigUpdate { config: cfg.dynamic_config.clone() },
-                )
-                .await;
-
                 println!(
                     "Service '{}' removed from group '{}' (version {})",
                     name, group_name, version
@@ -1008,7 +974,6 @@ async fn main() -> Result<()> {
                     .set_routes(&service, routes)
                     .unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
-                broadcast_config(&cfg, &cli.config).await?;
                 version
             };
             println!("Set {count} route(s) for '{service}' (version {version})");
@@ -1391,7 +1356,6 @@ async fn main() -> Result<()> {
                 let before = cfg.dynamic_config.clone();
                 let version = op.apply(&mut cfg.dynamic_config).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
-                broadcast_config(&cfg, &cli.config).await?;
                 version
             };
             let what: Vec<String> =
@@ -1506,7 +1470,6 @@ async fn main() -> Result<()> {
                 let before = cfg.dynamic_config.clone();
                 let version = op.apply(&mut cfg.dynamic_config).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
-                broadcast_config(&cfg, &cli.config).await?;
                 version
             };
             println!("Put back the services, routes and policies of version {to}, as version {version}");
@@ -1536,7 +1499,6 @@ async fn main() -> Result<()> {
                 let before = cfg.dynamic_config.clone();
                 let version = op.apply(&mut cfg.dynamic_config).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
-                broadcast_config(&cfg, &cli.config).await?;
                 (version, Some(cfg.dynamic_config))
             };
             match dc.as_ref().map(|dc| dc.policies.iter().find(|p| p.service == service)) {
@@ -2424,6 +2386,66 @@ async fn owner_node(node: Option<String>, remote: Option<&str>, cfg: &Config, ce
 }
 
 /// Fetch the `DynamicConfig` from a remote daemon via `StatusRequest`.
+/// What `service add` was given besides the name and port: `None` (or
+/// empty) for what wasn't.
+struct ServiceFlags {
+    domains: Option<Vec<String>>,
+    weight: Option<u32>,
+    max_connections: Option<u32>,
+    protocol: Option<config::Protocol>,
+    request_timeout_ms: Option<u64>,
+    health_path: Option<String>,
+    labels: std::collections::BTreeMap<String, String>,
+    meta: std::collections::BTreeMap<String, String>,
+    local_port: Option<u16>,
+}
+
+impl ServiceFlags {
+    /// The instance `existing` (if there is one) with what was given
+    /// changed, and the rest as it was: `--weight 9` changes only the
+    /// weight, not the domains, protocol or health check too. A new one
+    /// gets the defaults for what wasn't given.
+    fn apply(self, existing: Option<Service>, name: &str, node_id: &str, port: u16) -> Service {
+        let base = existing.unwrap_or_else(|| Service {
+            name: name.to_string(),
+            node_id: node_id.to_string(),
+            node_port: port,
+            domains: Vec::new(),
+            weight: config::DEFAULT_WEIGHT,
+            max_connections: None,
+            protocol: config::Protocol::Tcp,
+            request_timeout_ms: None,
+            health_path: None,
+            labels: Default::default(),
+            meta: Default::default(),
+            local_port: None,
+        });
+        Service {
+            node_port: port,
+            domains: self.domains.unwrap_or(base.domains),
+            weight: self.weight.unwrap_or(base.weight),
+            max_connections: self.max_connections.or(base.max_connections),
+            protocol: self.protocol.unwrap_or(base.protocol),
+            request_timeout_ms: self.request_timeout_ms.or(base.request_timeout_ms),
+            health_path: self.health_path.or(base.health_path),
+            labels: if self.labels.is_empty() { base.labels } else { self.labels },
+            meta: if self.meta.is_empty() { base.meta } else { self.meta },
+            local_port: self.local_port.or(base.local_port),
+            ..base
+        }
+    }
+}
+
+/// Service `name`'s instance on `node_id` in `group`, if `dc` has it.
+fn instance(dc: &config::DynamicConfig, group: &str, name: &str, node_id: &str) -> Option<Service> {
+    dc.service_groups
+        .iter()
+        .filter(|g| g.name == group)
+        .flat_map(|g| &g.services)
+        .find(|s| s.name == name && s.node_id == node_id)
+        .cloned()
+}
+
 async fn fetch_remote_dynamic_config(
     target: &str,
     cfg: &Config,
@@ -2584,12 +2606,20 @@ fn save_local_change(
     if history::load(path).is_empty() {
         history::record(path, before);
     }
+    // Nor is it sent to peers: the file may be behind the cluster (a node
+    // stopped a while, or never started), and a peer would take it whole,
+    // undoing every change since. The daemon takes it on top of the
+    // cluster's config instead.
+    eprintln!(
+        "note: changed {path} only: this host's daemon takes the change from there (once caught up with the \
+         cluster, if it isn't running now); to change the cluster directly, use --remote"
+    );
     Ok(())
 }
 
-/// This host's TLS identity, from its `tlsDir`, for telling peers about a
-/// local change. `None` if it has none yet (its daemon never ran): the
-/// daemon tells them itself when it starts. Never creates a CA, as one made
+/// This host's TLS identity, from its `tlsDir`, for announcing a new node
+/// to its peers (`init`). `None` if it has none yet (its daemon never
+/// ran): the daemon tells them itself when it starts. Never creates a CA, as one made
 /// here would become the daemon's, cut off from the cluster's.
 fn local_tls(cfg: &Config) -> Result<Option<tls::TlsContext>> {
     let Some(dir) = cfg.tls_dir.as_deref() else { return Ok(None) };
@@ -2600,14 +2630,6 @@ fn local_tls(cfg: &Config) -> Result<Option<tls::TlsContext>> {
             Ok(None)
         }
     }
-}
-
-/// Push a locally changed config to the cluster.
-async fn broadcast_config(cfg: &Config, path: &str) -> Result<()> {
-    let tls_ctx = local_tls(cfg)?;
-    let state = SharedState::new(cfg.clone(), path.to_string(), CancellationToken::new(), tls_ctx);
-    gossip::broadcast_message(&state, Message::ConfigUpdate { config: cfg.dynamic_config.clone() }).await;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3392,6 +3414,46 @@ mod tests {
         assert!(parse_routes("api", r#"[{"service": "web", "backends": [{}]}]"#).is_err());
         assert!(parse_routes("api", r#"{"not": "an array"}"#).is_err());
         assert!(parse_routes("api", r#"[{"backends": []}]"#).is_err());
+    }
+
+    /// The README's canary and drain examples (`service add ... --weight 9`
+    /// on an instance already there) change the weight only. Before, the
+    /// instance was replaced by what the command line said, dropping its
+    /// domains, protocol, health check and labels.
+    #[test]
+    fn service_add_on_an_instance_changes_only_what_is_given() {
+        let none = || ServiceFlags {
+            domains: None,
+            weight: None,
+            max_connections: None,
+            protocol: None,
+            request_timeout_ms: None,
+            health_path: None,
+            labels: Default::default(),
+            meta: Default::default(),
+            local_port: None,
+        };
+        let existing: Service = serde_json::from_value(serde_json::json!({
+            "name": "api", "nodeId": "host1", "nodePort": 3000, "domains": ["api.example.com"], "protocol": "http",
+            "healthPath": "/health", "labels": {"track": "canary"}, "meta": {"k": "v"}, "maxConnections": 50,
+        }))
+        .unwrap();
+        let weighted = ServiceFlags { weight: Some(9), ..none() }.apply(Some(existing.clone()), "api", "host1", 3000);
+        assert_eq!(weighted, Service { weight: 9, ..existing.clone() });
+        // What is given replaces what was there; `--domains ""` is none.
+        let changed = ServiceFlags { domains: Some(vec![]), protocol: Some(config::Protocol::Tcp), ..none() }
+            .apply(Some(existing.clone()), "api", "host1", 3001);
+        assert!(changed.domains.is_empty() && changed.protocol == config::Protocol::Tcp && changed.node_port == 3001);
+        assert_eq!(changed.health_path.as_deref(), Some("/health"));
+        // A new instance: the defaults.
+        let new = none().apply(None, "api", "host2", 3000);
+        assert_eq!((new.weight, new.protocol, new.domains.len()), (config::DEFAULT_WEIGHT, config::Protocol::Tcp, 0));
+        let dc: config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "web", "services": [existing]}],
+        }))
+        .unwrap();
+        assert!(instance(&dc, "web", "api", "host1").is_some());
+        assert!(instance(&dc, "other", "api", "host1").is_none());
     }
 
     #[test]

@@ -516,6 +516,32 @@ impl TlsContext {
         self.revocations.cert_revoked(self.own_cert().as_ref())
     }
 
+    /// Whether this node's own certificate is one it can take part in the
+    /// cluster with: issued by the CA beside it, for `node_id`. Otherwise
+    /// the node would run cut off, its records refused by every peer for
+    /// another name, or its connections for another CA, with nothing said.
+    /// Checked as of the certificate's start, so an expired one isn't
+    /// refused here (it is renewed, or peers say why).
+    pub fn check_own_cert(&self, node_id: &str) -> Result<()> {
+        let cert = self.own_cert();
+        let start = crate::pki::validity(cert.as_ref()).map_or(0, |(from, _)| from.max(0) as u64);
+        self.cert_verifier
+            .verify_client_cert(&cert, &[], UnixTime::since_unix_epoch(std::time::Duration::from_secs(start + 1)))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "node.crt wasn't issued by the CA in ca.crt ({e}): copy all three files from the same `stouter cert issue`"
+                )
+            })?;
+        let cn = cert_cn(&cert).unwrap_or_default();
+        if cn != node_id {
+            anyhow::bail!(
+                "node.crt is for '{cn}', but this node's nodeId is '{node_id}': peers would refuse its records; issue \
+                 one for '{node_id}' (`stouter cert issue --node {node_id}`), or set nodeId to '{cn}'"
+            );
+        }
+        Ok(())
+    }
+
     /// Check that `cert` (DER) was issued by the cluster CA and is currently
     /// valid; returns its Common Name.
     pub fn verify_cluster_cert(&self, cert: &CertificateDer<'_>) -> Result<Option<String>> {

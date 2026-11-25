@@ -215,12 +215,24 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
             timestamp_ms,
             caller,
         } => {
+            // Counted against the relay while open. At its limit, refused,
+            // and this worker backs off before registering again: a relay
+            // can't have this node open tunnels without end.
+            let relay = stream.peer_cn().unwrap_or_default().to_string();
+            let open = match super::tunnel::relayed_tunnel_slot(state, &relay) {
+                Ok(slot) => slot,
+                Err(why) => {
+                    super::tunnel::send_tunnel_error(&mut stream, &why).await;
+                    bail!("{why}");
+                }
+            };
             // Spawn tunnel handling in a background task so this worker can
             // immediately reconnect and replenish the pool.
             let state = Arc::clone(state);
             let in_flight = state.in_flight.track();
             tokio::spawn(async move {
                 let _in_flight = in_flight;
+                let _open = open;
                 if let Err(e) =
                     // Through a relay: who asks is only what the caller signed.
                     super::tunnel::handle_tunnel(stream, node_id, service_name, timestamp_ms, caller, true, state)
@@ -369,5 +381,83 @@ mod message_tests {
         tokio::time::sleep(Duration::from_secs(11)).await;
         let err = waiting.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("not sent within"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod relayed_tunnel_tests {
+    use super::*;
+    use crate::state::test_support::{tls_state, tls_state_with};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A relay this NAT'd node registered with sends a tunnel request down
+    /// every reverse connection and never closes the tunnels. Each worker
+    /// registers again at once after a dispatch, so before, the NAT'd node
+    /// opened tunnels (and connections to its backend) without limit: 207
+    /// against a cap of 8, in 2.6 s. Now they count against the relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_cant_make_a_natd_node_hold_unbounded_tunnels() {
+        let dir = std::env::temp_dir().join(format!("stouter_relayed_cap_{}_{}", std::process::id(), rand::random::<u64>()));
+        // The NAT'd node's backend: accepts and holds every connection.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        let backend_conns = Arc::new(AtomicUsize::new(0));
+        {
+            let backend_conns = backend_conns.clone();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((tcp, _)) = backend.accept().await {
+                    backend_conns.fetch_add(1, Ordering::SeqCst);
+                    held.push(tcp);
+                }
+            });
+        }
+        let dc: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "g", "services": [{"name": "svc", "nodeId": "x", "nodePort": port}]}],
+        }))
+        .unwrap();
+        let cap = 8;
+        let x = tls_state_with(
+            &dir,
+            crate::config::Config { node_id: "x".into(), outbound_only: true, max_tunnels_per_peer: Some(cap), dynamic_config: dc, ..Default::default() },
+            String::new(),
+        );
+        // A malicious relay.
+        let relay = tls_state(&dir, "relay");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (relay, held) = (relay.clone(), held.clone());
+                tokio::spawn(async move {
+                    let Ok(mut stream) = relay.tls_accept(tcp).await else { return };
+                    let Ok(_registration) = gossip::recv_message(&mut stream).await else { return };
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let request = Message::TunnelRequest { node_id: "x".into(), service_name: "svc".into(), timestamp_ms: now, caller: None };
+                    if gossip::send_message(&mut stream, &request).await.is_err() {
+                        return;
+                    }
+                    let mut status = [0u8; 1];
+                    if stream.read_exact(&mut status).await.is_ok() && status[0] == 0 {
+                        let _ = stream.flush().await;
+                        held.lock().unwrap().push(stream);
+                    }
+                });
+            }
+        });
+        let stop = CancellationToken::new();
+        for slot in 0..4 {
+            tokio::spawn(reverse_worker(x.clone(), addr.clone(), slot, stop.clone()));
+        }
+        let limit = cap * crate::node::tunnel::RELAYED_TUNNELS_FACTOR;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        stop.cancel();
+        let open = backend_conns.load(Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(open <= limit, "the NAT'd node holds {open} tunnels from one relay, over its limit of {limit}");
+        assert_eq!(open, limit, "tunnels up to the limit are served");
     }
 }

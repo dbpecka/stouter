@@ -360,10 +360,13 @@ async fn handle_mux_stream(
 
             // Only a caller its policy allows.
             let via = crate::authz::Via::Direct(Some(peer).filter(|p| !p.is_empty()));
-            if let Err(why) = crate::authz::authorize(&state, &service_name, timestamp_ms, caller.as_ref(), via) {
-                send_tunnel_error(&mut stream, &why).await;
-                bail!("{why}");
-            }
+            let who = match crate::authz::authorize(&state, &service_name, timestamp_ms, caller.as_ref(), via) {
+                Ok(who) => who,
+                Err(why) => {
+                    send_tunnel_error(&mut stream, &why).await;
+                    bail!("{why}");
+                }
+            };
 
             // Connect to local service
             let backend = match connect_local_service(&service_name, &state).await {
@@ -382,10 +385,14 @@ async fn handle_mux_stream(
             stream.flush().await.context("flush tunnel success byte")?;
             drop(pending);
 
-            // Proxy the yamux stream to the local service
-            crate::io::proxy_bidirectional(stream, backend)
-                .await
-                .context("mux proxy_bidirectional")?;
+            // Proxy the yamux stream to the local service, until it ends
+            // or the policies stop allowing it.
+            let served = state.serve_tunnel(&service_name, who);
+            tokio::select! {
+                biased;
+                () = served.refused() => bail!("tunnel to '{service_name}' closed: the policy no longer allows it"),
+                proxied = crate::io::proxy_bidirectional(stream, backend) => proxied.context("mux proxy_bidirectional")?,
+            }
 
             Ok(())
         }

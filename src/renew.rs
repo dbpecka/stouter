@@ -84,7 +84,8 @@ pub async fn run_renewal_loop(state: Arc<SharedState>) {
             () = tokio::time::sleep(wait) => {}
             () = state.shutdown.cancelled() => return,
         }
-        if let Err(e) = take_up_copied_cert(&state) {
+        // Reads the disk: off the async workers' way, should it hang.
+        if let Err(e) = crate::gossip::blocking(|| take_up_copied_cert(&state)) {
             warn!("not using the certificate in tlsDir: {e:#}");
         }
         warn_if_config_signer_expired(&state).await;

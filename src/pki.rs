@@ -163,6 +163,11 @@ pub fn issue_cert_to_dir(tls_dir: &str, node_id: &str, out_dir: &str) -> Result<
 
 /// [`issue_cert_to_dir`], for `lifetime`.
 pub fn issue_cert_to_dir_with(tls_dir: &str, node_id: &str, out_dir: &str, lifetime: time::Duration) -> Result<()> {
+    // A name no node can run with (a node's id is its hostname, never an
+    // address), and so a certificate for nothing.
+    if node_id.trim().is_empty() || node_id.contains(':') || node_id.chars().any(char::is_whitespace) {
+        bail!("'{node_id}' isn't a node name: give the nodeId of the node the certificate is for (its hostname)");
+    }
     let dir = Path::new(tls_dir);
     let ca_cert_path = dir.join("ca.crt");
     let ca_key_path  = dir.join("ca.key");
@@ -579,7 +584,8 @@ pub fn check_dir(tls_dir: &str, node_id: &str) -> Result<()> {
     // And taken as the daemon takes them, which checks the key against its
     // certificate whatever the key's format (the check above reads only
     // PKCS#8 keys).
-    crate::tls::TlsContext::new(&material).context("certificate and key")?;
+    let tls = crate::tls::TlsContext::new(&material).context("certificate and key")?;
+    tls.check_own_cert(node_id)?;
     Ok(())
 }
 
@@ -779,6 +785,34 @@ mod validity_tests {
         std::fs::remove_file(dir.join("ca.key")).unwrap();
         let err = check_dir(s, "n1").unwrap_err();
         assert!(format!("{err:#}").contains("not a complete set"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A certificate for another name, or from another CA than the ca.crt
+    /// beside it: the node would run cut off from its peers, so neither the
+    /// daemon nor `check --local` takes it. And `cert issue` refuses a name
+    /// no node can have.
+    #[test]
+    fn check_dir_refuses_a_certificate_for_another_node_or_ca() {
+        let dir = temp_dir("check_cn_ca");
+        let (x, y) = (dir.join("x"), dir.join("y"));
+        load_or_create(x.to_str().unwrap(), "ca-x").unwrap();
+        load_or_create(y.to_str().unwrap(), "ca-y").unwrap();
+        let from_x = dir.join("from-x");
+        issue_cert_to_dir(x.to_str().unwrap(), "host2", from_x.to_str().unwrap()).unwrap();
+        check_dir(from_x.to_str().unwrap(), "host2").expect("its own");
+        let err = format!("{:#}", check_dir(from_x.to_str().unwrap(), "host3").unwrap_err());
+        assert!(err.contains("is for 'host2'"), "{err}");
+
+        let mixed = dir.join("mixed");
+        issue_cert_to_dir(y.to_str().unwrap(), "host2", mixed.to_str().unwrap()).unwrap();
+        std::fs::copy(from_x.join("ca.crt"), mixed.join("ca.crt")).unwrap();
+        let err = format!("{:#}", check_dir(mixed.to_str().unwrap(), "host2").unwrap_err());
+        assert!(err.contains("wasn't issued by the CA"), "{err}");
+
+        for name in ["", " ", "host2:7000", "a b"] {
+            assert!(issue_cert_to_dir(x.to_str().unwrap(), name, dir.join("bad").to_str().unwrap()).is_err(), "{name:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

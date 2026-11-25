@@ -533,10 +533,21 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
     }
 }
 
+/// Most history requests one peer may have answered at once.
+const MAX_HISTORY_REQUESTS_PER_PEER: usize = 2;
+
 /// Answer a `HistoryRequest` from this node's config history: every version
 /// recorded (without the configs), or just `version` (with its config).
 async fn handle_history_request(mut stream: MeshStream, version: Option<u64>, state: Arc<SharedState>) {
-    let mut entries = crate::history::load(&state.config_path);
+    // Read off the async workers (up to 16 MiB, from a disk that may hang),
+    // and only so many at once for one peer: any member may ask.
+    let peer = stream.peer_cn().unwrap_or_default().to_string();
+    let Some(_slot) = state.try_peer_slot("history request", &peer, MAX_HISTORY_REQUESTS_PER_PEER) else {
+        debug!("history: '{peer}' already has {MAX_HISTORY_REQUESTS_PER_PEER} requests being answered");
+        return;
+    };
+    let path = state.config_path.clone();
+    let Ok(mut entries) = tokio::task::spawn_blocking(move || crate::history::load(&path)).await else { return };
     match version {
         Some(v) => entries.retain(|e| e.version == v),
         None => entries.iter_mut().for_each(|e| e.config = None),
@@ -613,7 +624,7 @@ pub async fn run_config_poll_loop(state: Arc<SharedState>) {
             // waiting there.
             let taken = |state: &SharedState, file_dc: &crate::config::DynamicConfig| {
                 *state.file_config.lock().unwrap() = Some(config_text(file_dc));
-                for unknown in crate::config::Config::unknown_nested_settings_in(&state.config_path) {
+                for unknown in blocking(|| crate::config::Config::unknown_nested_settings_in(&state.config_path)) {
                     warn!("{}: {unknown}", state.config_path);
                 }
             };
@@ -1092,7 +1103,7 @@ fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfi
 /// Run `f`, file I/O say, on this thread without holding up the other tasks
 /// on its worker: they move to another while it runs. (On a single-threaded
 /// runtime, as in some tests, it just runs.)
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)
@@ -1135,6 +1146,26 @@ fn persist_to_file(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) 
         // usual checks. Only an edit that meets a change of the cluster's
         // is set aside.
         let base = known.as_deref().and_then(|text| serde_json::from_str::<crate::config::DynamicConfig>(text).ok());
+        // A file at an older version than this node last wrote there wasn't
+        // edited from that: taken as an edit of it, it would undo every
+        // change made since (a file saved from an old editor buffer, pulled
+        // from a node behind, a backup put back). Just an old version this
+        // node ran, there is nothing to keep; anything else is set aside.
+        if let Some(older) = base.as_ref().filter(|base| cfg.dynamic_config.version < base.version) {
+            let ran = crate::history::load(path)
+                .into_iter()
+                .any(|e| e.config.is_some_and(|ran| ran.version == cfg.dynamic_config.version && ran.same_settings(&cfg.dynamic_config)));
+            if ran {
+                info!(
+                    "{path} held version {}, older than version {} this node wrote there: writing version {} over it",
+                    cfg.dynamic_config.version, older.version, dc.version
+                );
+            } else if !set_aside_unapplied(state, path, &text, &cfg.dynamic_config, dc) {
+                return;
+            }
+            write_config_file(path, &mut cfg, dc, &mut known, new);
+            return;
+        }
         match base.and_then(|base| dc.rebase_edit(&base, &cfg.dynamic_config)) {
             Some(merged) if merged.same_settings(dc) => {
                 info!("{path}: the edit to it (version {}) is in version {} already", cfg.dynamic_config.version, dc.version);
@@ -1163,6 +1194,18 @@ fn persist_to_file(state: &Arc<SharedState>, dc: &crate::config::DynamicConfig) 
             }
         }
     }
+    write_config_file(path, &mut cfg, dc, &mut known, new);
+}
+
+/// Write `dc` into the config file `cfg` (as read from `path`), and record
+/// it as what this node last wrote there, and ran.
+fn write_config_file(
+    path: &str,
+    cfg: &mut crate::config::Config,
+    dc: &crate::config::DynamicConfig,
+    known: &mut Option<String>,
+    new: String,
+) {
     cfg.dynamic_config = dc.clone();
     match cfg.save(path) {
         Ok(()) => {
@@ -3750,6 +3793,148 @@ mod tests {
         persist_state_with(&state, &config_at(9, 3000));
         assert!(!aside.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_file_does_not_undo_changes_it_never_saw() {
+        let dir = std::env::temp_dir().join(format!("stouter_stale_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path_str = dir.join("stouter.json").to_str().unwrap().to_string();
+        let v5 = DynamicConfig { version: 5, ..named_services(&["api"]) };
+        let cfg = Config { node_id: "n1".into(), dynamic_config: v5.clone(), ..Config::default() };
+        cfg.save(&path_str).unwrap();
+        let state = SharedState::new(cfg.clone(), path_str.clone(), CancellationToken::new(), None);
+
+        // The operator opens the file in an editor (v5).
+        let mut buffer = crate::config::Config::load(&path_str).unwrap();
+        // Another admin adds service b and revokes node x: v6 arrives.
+        let mut v6 = DynamicConfig { version: 6, changed_by: "n2".into(), ..named_services(&["api", "b"]) };
+        v6.revoked.nodes.push("x".into());
+        {
+            let mut dc = state.dynamic_config.write().await;
+            *dc = v6.clone();
+            persist_state_with(&state, &dc);
+        }
+        // The operator adds service c in the buffer and saves it.
+        buffer.dynamic_config.service_groups[0]
+            .services
+            .push(serde_json::from_value(serde_json::json!({"name": "c", "nodeId": "n1", "nodePort": 1})).unwrap());
+        buffer.save(&path_str).unwrap();
+        // A poll pass: the file is behind memory, ignored as stale.
+        let poll = tokio::spawn(run_config_poll_loop(state.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.dynamic_config.read().await.version, 6);
+
+        // An unrelated change (v7: service d) arrives and is persisted.
+        let mut v7 = DynamicConfig { version: 7, changed_by: "n3".into(), ..named_services(&["api", "b", "d"]) };
+        v7.revoked.nodes.push("x".into());
+        {
+            let mut dc = state.dynamic_config.write().await;
+            *dc = v7.clone();
+            persist_state_with(&state, &dc);
+        }
+        // The next poll pass takes what the file now says, as version 8.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        poll.abort();
+        let held = state.dynamic_config.read().await.clone();
+        assert_eq!(held.version, 7, "nothing taken from the file");
+        assert!(service_names(&held).contains(&"b".to_string()), "v6's service b was removed: {:?}", service_names(&held));
+        assert!(held.revoked.nodes.contains(&"x".to_string()), "v6's revocation of x was undone");
+        // The edit isn't lost: it is set aside, and the file holds v7.
+        let aside = std::fs::read_to_string(dir.join("stouter.json.unapplied")).expect("the edit set aside");
+        assert!(aside.contains("\"c\""), "{aside}");
+        assert_eq!(crate::config::Config::load(&path_str).unwrap().dynamic_config.version, 7);
+
+        // A plain old version this node ran (a backup put back): written
+        // over, nothing set aside.
+        std::fs::remove_file(dir.join("stouter.json.unapplied")).unwrap();
+        Config { dynamic_config: v6.clone(), ..cfg.clone() }.save(&path_str).unwrap();
+        let v8 = DynamicConfig { version: 8, changed_by: "n3".into(), ..v7.clone() };
+        {
+            let mut dc = state.dynamic_config.write().await;
+            *dc = v8.clone();
+            persist_state_with(&state, &dc);
+        }
+        assert_eq!(crate::config::Config::load(&path_str).unwrap().dynamic_config, v8);
+        assert!(!dir.join("stouter.json.unapplied").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// A history request (from any peer: the CLI's `config history
+    /// --remote`, a peer catching up after a missed unrevoke) reads the
+    /// history file off the async workers. Read on one, a hung disk let one
+    /// request per worker stop every task on the node.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_history_file_holds_up_no_worker() {
+        use crate::state::test_support::{mesh_pair, tls_state, tls_state_with};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = std::env::temp_dir().join(format!("stouter_hunghist_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json").to_str().unwrap().to_string();
+        Config { node_id: "n1".into(), ..Config::default() }.save(&path).unwrap();
+        let node = tls_state_with(&dir, Config { node_id: "n1".into(), ..Config::default() }, path.clone());
+        let peer = tls_state(&dir, "peer");
+        let history = crate::history::path_for(&path);
+        assert!(std::process::Command::new("mkfifo").arg(&history).status().unwrap().success());
+        let mut clients = Vec::new();
+        // Connect all first (a handshake needs a free worker), then ask.
+        for _ in 0..4 {
+            clients.push(mesh_pair(&peer, &node).await);
+        }
+        let mut clients: Vec<_> = clients
+            .into_iter()
+            .map(|(client, server)| {
+                tokio::spawn(dispatch_connection(server, "127.0.0.1:1".into(), node.clone()));
+                client
+            })
+            .collect();
+        // (Control: with REVIEW_CONTROL set, a status request instead.)
+        let request = if std::env::var_os("REVIEW_CONTROL").is_some() {
+            Message::StatusRequest
+        } else {
+            Message::HistoryRequest { version: None }
+        };
+        let frame = encode_message(&request).unwrap();
+        for client in &mut clients {
+            use tokio::io::AsyncWriteExt;
+            let mut bytes = (frame.len() as u32).to_be_bytes().to_vec();
+            bytes.extend_from_slice(&frame);
+            // Written straight to the socket buffer; no flush awaited past it.
+            let _ = tokio::time::timeout(Duration::from_millis(200), client.write_all(&bytes)).await;
+            let _ = tokio::time::timeout(Duration::from_millis(200), client.flush()).await;
+        }
+        // Give both requests time to reach the (hung) history file.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // Do the node's other tasks still run? A watchdog thread answers the
+        // disk after 3 s either way (with every worker blocked, no timer of
+        // the runtime's fires).
+        let ticked = Arc::new(AtomicUsize::new(0));
+        let ticked_at_3s = Arc::new(AtomicUsize::new(usize::MAX));
+        {
+            let (ticked, at3, history) = (ticked.clone(), ticked_at_3s.clone(), history.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                at3.store(ticked.load(SeqCst), SeqCst);
+                for _ in 0..200 {
+                    let _ = std::fs::write(&history, b"{}"); std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        }
+        let ticks: Vec<_> = (0..8)
+            .map(|_| {
+                let ticked = ticked.clone();
+                tokio::spawn(async move {
+                    ticked.fetch_add(1, SeqCst);
+                })
+            })
+            .collect();
+        futures::future::join_all(ticks).await;
+        std::thread::sleep(std::time::Duration::from_millis(3200));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at3 = ticked_at_3s.load(SeqCst);
+        assert_eq!(at3, 8, "four history requests on a hung disk: {at3} of 8 other tasks ran in 3 s");
     }
 
     #[tokio::test]

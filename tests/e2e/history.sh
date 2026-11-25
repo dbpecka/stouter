@@ -69,6 +69,21 @@ start D "$WORK/D.json"
 check "a service added on a new node before it started reaches the cluster" wait_for 60 grep -q '"dsvc"' "$WORK/A.json"
 check "  on top of what the cluster had" grep -q '"cache"' "$WORK/A.json"
 check "  with nothing set aside" sh -c "! ls '$WORK'/D.json.unapplied* > /dev/null 2>&1"
+# The same with the new node's file at the cluster's own version (as on a
+# new cluster): the change isn't sent to the cluster from the file, where a
+# peer would take it whole and lose every service the file lacks. The
+# daemon makes it on top of the cluster's config once it runs.
+v=$(version_of A)
+cat > "$WORK/E.json" <<JSON
+{"mode": "node", "bind": "127.0.0.1:27805", "nodeId": "E", "knownNodes": ["127.0.0.1:27801"], "tlsDir": "$WORK/tls",
+ "apiPort": 27885, "dynamicConfig": {"version": $v, "serviceGroups": []}}
+JSON
+"$BIN" --config "$WORK/E.json" service add --group web --name esvc --port 3901 >> "$WORK/cli.log" 2>&1
+sleep 3
+check "a change made with no daemon running stays in its file" sh -c "! grep -q '\"esvc\"' '$WORK/A.json' && grep -q '\"db\"' '$WORK/A.json'"
+start E "$WORK/E.json"
+check "  and reaches the cluster once the daemon runs" wait_for 60 grep -q '"esvc"' "$WORK/A.json"
+check "  without losing what the cluster had" sh -c "grep -q '\"db\"' '$WORK/A.json' && grep -q '\"dsvc\"' '$WORK/A.json'"
 
 # A command whose output is cut short (`| head`) ends as Unix tools do,
 # by SIGPIPE, with nothing on stderr; more output than a pipe holds.

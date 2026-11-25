@@ -47,18 +47,26 @@ pub enum Via<'a> {
     Relay,
 }
 
-/// Whether a tunnel request for our `service` may go ahead; if not, why
-/// (to send back to the caller). `caller` is the request's signature, if
-/// it has one; `timestamp_ms` its timestamp (already checked for skew).
+/// Whether a tunnel request for our `service` may go ahead, and if so, the
+/// node known to be asking (the certificate at the other end, or a
+/// signature checked), for checking the tunnel again when the policies
+/// change (see [`still_allowed`]); if not, why (to send back to the
+/// caller). `caller` is the request's signature, if it has one;
+/// `timestamp_ms` its timestamp (already checked for skew).
 pub fn authorize(
     state: &SharedState,
     service: &str,
     timestamp_ms: u64,
     caller: Option<&SignedCaller>,
     via: Via<'_>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if !state.policies.load().contains_key(service) {
-        return Ok(());
+        // Open to every node: a signature isn't checked, so through a
+        // relay, who asks isn't known.
+        return Ok(match via {
+            Via::Direct(peer) => peer.map(str::to_string),
+            Via::Relay => None,
+        });
     }
     let own = state.config.node_id.as_str();
     let who = match (caller, via) {
@@ -78,7 +86,7 @@ pub fn authorize(
             // fill the cache, locking allowed ones out.
             return if signer == own || may_reach(state, service, &signer) {
                 if state.tunnel_nonces.lock().unwrap().note(&signer, signed.nonce, timestamp_ms) {
-                    Ok(())
+                    Ok(Some(signer))
                 } else {
                     Err(format!("tunnel request to '{service}' from '{signer}' was already used (or it sent too many)"))
                 }
@@ -96,13 +104,23 @@ pub fn authorize(
         }
     };
     if who == own || may_reach(state, service, &who) {
-        return Ok(());
+        return Ok(Some(who));
     }
     refuse(service, &who)
 }
 
+/// Whether a tunnel to our `service` that [`authorize`] let `caller` open
+/// (`None`: a caller not known, through a relay to a service with no policy
+/// then) would still be let open by the policies now in force.
+pub fn still_allowed(state: &SharedState, service: &str, caller: Option<&str>) -> bool {
+    if !state.policies.load().contains_key(service) {
+        return true;
+    }
+    caller.is_some_and(|caller| caller == state.config.node_id || may_reach(state, service, caller))
+}
+
 /// Refuse `who` a tunnel to `service` (policy), counted.
-fn refuse(service: &str, who: &str) -> Result<(), String> {
+fn refuse(service: &str, who: &str) -> Result<Option<String>, String> {
     metrics::counter!("stouter_tunnel_denied_total", "service" => service.to_string()).increment(1);
     tracing::debug!("refusing a tunnel to '{service}' from '{who}' (policy)");
     Err(format!("node '{who}' may not reach service '{service}' (policy)"))

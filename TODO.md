@@ -515,11 +515,12 @@ each finding reproduced. Numbered on.
 
 Three independent reviews (data plane and authz; cluster state; CLI, PKI
 and operations), each finding reproduced by a failing test or a script,
-then checked again here. Numbered on.
+then checked again here. Numbered on. #93's policy-before-services ordering
+is fixed with #85.
 
 ## High
 
-- [ ] **82. A CLI change made with no daemon running is broadcast from the file, and replaces the cluster's config.**
+- [x] **82. A CLI change made with no daemon running is broadcast from the file, and replaces the cluster's config.**
   `src/main.rs` (`service add` around 802, `rename`, `remove`; `broadcast_config`
   for route set, cert revoke/unrevoke, rollback, policy). The CLI edits the
   file, then sends it as a `ConfigUpdate` to `knownNodes` with this node's
@@ -530,7 +531,8 @@ then checked again here. Numbered on.
   service web/api on host1 removed"). Contrary to README ("skip telling
   peers"). Fix: don't broadcast from the file-edit path; the daemon takes
   the edit once caught up.
-- [ ] **83. A config file at an older version is rebased as an edit, undoing every change since** (unsigned clusters).
+  Fixed: no change made in the local file is sent to peers (`service`, `route`, `cert revoke`/`unrevoke`, `config rollback`, `policy`); the CLI says the daemon takes it, or to use `--remote`. history.sh adds a new node whose file is at the cluster's version: its change stays in its file until its daemon runs, then reaches the cluster with nothing lost (both checks failed before).
+- [x] **83. A config file at an older version is rebased as an edit, undoing every change since** (unsigned clusters).
   `persist_to_file` rebases with base = what the daemon last wrote, so a file
   saved from an old editor buffer, pulled from a node that is behind, or
   restored from a `.bak` counts as an edit that undoes everything in
@@ -540,37 +542,43 @@ then checked again here. Numbered on.
   itself already refuses an older file for this reason. Fix: rebase only
   from the version the file says it was edited from (the history's entry
   at that version), else set it aside; the same at startup.
+  Fixed: a file at an older version than the daemon last wrote isn't rebased: if it is a version this node ran (per its history), it is written over; otherwise it is set aside as `.unapplied`. This covers startup too (the daemon starts on its history's last entry). Not rebased from the history entry at the file's version either: a CLI `--file-only` edit made on an old file carries version+1, so that base could be wrong. A test runs the reviewer's case and a backup put back.
 
 ## Medium
 
-- [ ] **84. A relay can make a NAT'd node hold unbounded tunnels:** tunnels that
+- [x] **84. A relay can make a NAT'd node hold unbounded tunnels:** tunnels that
   come through a reverse connection take no `maxTunnelsPerPeer` slot, and the
   reverse worker registers again at once. A test: 207 tunnels and backend
   connections from one relay against a cap of 8, in 2.6 s. Fix: count them
   against the relay (with a larger cap), or the signer, and bound tunnels in
   flight per relay.
-- [ ] **85. A policy change doesn't reach tunnels already open:** `policy deny`
+  Fixed: a tunnel arriving on a reverse connection counts against the relay, up to 4 times `maxTunnelsPerPeer`; past that the NAT'd node refuses it and that reverse worker backs off before registering again. A test: tunnels from one relay stop at the limit.
+- [x] **85. A policy change doesn't reach tunnels already open:** `policy deny`
   stops only new tunnels. A subscriber's pooled HTTP keep-alives (and open TCP
   and mux tunnels) keep reaching the service: 5 of 5 requests still answered
   after the deny. Revocation, by contrast, fails open streams at once. Fix:
   on a policy change, close tunnels whose caller is no longer allowed
   (hosting node), and reset the HTTP pool for such services (subscriber).
-- [ ] **86. The daemon and `check --local` take a `node.crt` that isn't for this `nodeId`, or isn't from the `ca.crt` beside it**
+  Fixed: the hosting node registers each tunnel it serves with its service and caller (the peer's certificate, or a verified signature; through a relay to a service with no policy, a caller not known). On every config change it closes those the policies no longer allow. The subscriber's pooled connection then dies and its next tunnel is refused. A test: 0 of 5 requests answered after the deny.
+- [x] **86. The daemon and `check --local` take a `node.crt` that isn't for this `nodeId`, or isn't from the `ca.crt` beside it**
   (`pki::load_issued` checks only that the key matches). The node runs cut off
   from its peers with nothing logged above info, and deploy.sh reports
   success. `cert issue` also takes `--node ''` and `--node x:1`. Fix: refuse a
   CN other than `nodeId`, and a certificate the CA didn't issue; validate
   the name in `cert issue`.
-- [ ] **87. `service add` on an existing instance replaces it whole:** the README's
+  Fixed: the daemon and `check --local` refuse a `node.crt` whose CN isn't `nodeId`, or that the `ca.crt` beside it didn't issue (checked as of the certificate's start, so an expired one is left to renewal). `cert issue` refuses an empty name, a `host:port` and whitespace.
+- [x] **87. `service add` on an existing instance replaces it whole:** the README's
   canary (`--weight 9`) and drain (`--weight 0`) examples drop the instance's
   domains, `protocol: http`, health path, labels and meta. One instance
   falling back to tcp makes the whole service plain TCP. Fix: keep what isn't
   given on the command line (or a `service set`).
-- [ ] **88. A history request reads the history file on an async worker:** up to
+  Fixed: on an instance already there, only the options given change (`--domains ""` still clears the domains); a new instance gets the defaults. With `--remote`, the instance is read from that daemon first. README says so.
+- [x] **88. A history request reads the history file on an async worker:** up to
   16 MiB, outside `block_in_place`, with no per-peer cap. On a hung disk a few
   requests stop every worker (a test, 2 workers: 0 of 8 other tasks ran in
   3 s, in some runs), against #70's promise. Also `unknown_nested_settings_in`
   under the config lock, and renew's check of a copied-in `node.crt`.
+  Fixed: a history request is read with `spawn_blocking`, at most 2 at a time per peer; `unknown_nested_settings_in` and renew's check of a copied-in `node.crt` go through `block_in_place`. The reviewer's test passes every time (it failed 1 run in 3).
 
 ## Low
 

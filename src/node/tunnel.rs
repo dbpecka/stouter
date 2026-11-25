@@ -72,6 +72,22 @@ pub(crate) fn tunnel_slot(state: &Arc<SharedState>, peer: &str) -> std::result::
     })
 }
 
+/// How many times a peer's own tunnel limit may be open through one of this
+/// node's relays: they come from every caller using that relay.
+pub(crate) const RELAYED_TUNNELS_FACTOR: usize = 4;
+
+/// A place among the tunnels open through `relay`, which this node keeps
+/// reverse connections at; or why there is none. Without it, a relay could
+/// send a request down each reverse connection, and since the node
+/// registers a new one at once, have it open tunnels (and backend
+/// connections) without end.
+pub(crate) fn relayed_tunnel_slot(state: &Arc<SharedState>, relay: &str) -> std::result::Result<crate::state::PeerSlot, String> {
+    let limit = state.config.max_tunnels_per_peer.unwrap_or(MAX_TUNNELS_PER_PEER).saturating_mul(RELAYED_TUNNELS_FACTOR);
+    state.try_peer_slot("relayed tunnel", relay, limit).ok_or_else(|| {
+        format!("this node already has {limit} tunnels open through relay '{relay}' ({RELAYED_TUNNELS_FACTOR}x maxTunnelsPerPeer)")
+    })
+}
+
 /// Why a tunnel to `target` that `caller` asks this node to relay is
 /// refused, if it is: one back to the caller itself, down the reverse
 /// connections it keeps here. Never needed (a node reaches its own
@@ -129,9 +145,10 @@ pub async fn handle_tunnel(
         bail!("{msg}");
     }
 
-    // Counted against the peer's tunnels while open. Not one that came on
-    // a reverse connection this node keeps at a relay: this node opened
-    // that connection, and the certificate at its other end is the relay's.
+    // Counted against the peer's tunnels while open. One that came on a
+    // reverse connection this node keeps at a relay is counted against the
+    // relay instead, as it arrives (`reverse::open_reverse_connection`):
+    // the certificate at the other end of it is the relay's.
     let _open = if via_relay {
         None
     } else {
@@ -157,10 +174,13 @@ pub async fn handle_tunnel(
 
     // --- Only a caller its policy allows ---
     let via = if via_relay { crate::authz::Via::Relay } else { crate::authz::Via::Direct(client.peer_cn()) };
-    if let Err(why) = crate::authz::authorize(&state, &service_name, timestamp_ms, caller.as_ref(), via) {
-        send_tunnel_error(&mut client, &why).await;
-        bail!("{why}");
-    }
+    let who = match crate::authz::authorize(&state, &service_name, timestamp_ms, caller.as_ref(), via) {
+        Ok(who) => who,
+        Err(why) => {
+            send_tunnel_error(&mut client, &why).await;
+            bail!("{why}");
+        }
+    };
 
     // --- Locate service and connect ---
     let backend = match connect_local_service(&service_name, &state).await {
@@ -177,9 +197,13 @@ pub async fn handle_tunnel(
         .await
         .context("write tunnel success byte")?;
 
-    crate::io::proxy_bidirectional(client, backend)
-        .await
-        .context("proxy_bidirectional")?;
+    // Until it ends, or the policies stop allowing it.
+    let served = state.serve_tunnel(&service_name, who);
+    tokio::select! {
+        biased;
+        () = served.refused() => bail!("tunnel to '{service_name}' closed: the policy no longer allows it"),
+        proxied = crate::io::proxy_bidirectional(client, backend) => proxied.context("proxy_bidirectional")?,
+    }
 
     Ok(())
 }

@@ -95,7 +95,7 @@ run: then it is a new cluster's first node, and takes it at once). If the
 cluster moved on meanwhile, the newer config comes first, and the edit is
 compared with it, piece by piece (each service instance, each service's
 routes and policy, each revocation): already in it (the cluster took it,
-from the CLI or a push), there is nothing to do; touching nothing the
+from a push, say), there is nothing to do; touching nothing the
 cluster changed, it is made again on top of the newer config and taken as
 the next version; only an edit that meets a change of the cluster's is
 kept as `<config>.unapplied`, to make again by hand. A change the CLI makes
@@ -210,7 +210,11 @@ A running daemon writes each new config into its file. If the file holds an
 edit it hasn't applied (a hand edit not yet picked up, one it refused, a
 pulled config being edited), it saves the file as `<config>.unapplied`
 (numbered like the backups)
-first and logs a warning, rather than write over the edit. `config push`
+first and logs a warning, rather than write over the edit. A file at an
+older version than the daemon last wrote there (saved from an editor opened
+before, a backup put back) isn't taken as an edit of the newer one, which
+would undo every change since: if it is just a version the node ran, it is
+written over, and otherwise set aside the same way. `config push`
 mentions that file when the cluster already has what the config file now
 says. A slow or hung disk holds up only config changes and gossip: requests
 are routed, and `status` and metrics answered, from the config in force,
@@ -253,7 +257,9 @@ When the same service name is registered on several nodes, subscribers spread
 connections across them. An optional `weight` (default `1`) sets each
 instance's relative share, e.g. `9` and `1` for a 90/10 canary split. A weight
 of `0` drains an instance: it gets no new connections unless every instance is
-drained.
+drained. `service add` on an instance already there changes only what it is
+given (`--weight 9` leaves the domains, protocol and health check as they
+were); to unset an option, remove the instance and add it again.
 
 An optional `maxConnections` caps how many concurrent connections each
 subscriber opens to an instance (a circuit breaker). Instances at their limit
@@ -319,9 +325,11 @@ the node off for good.
 
 Only the daemon does step 3. CLI commands (with `--cert-dir`, or the local
 config's `tlsDir`) refuse a directory without certificates, so a mistyped path
-gives a clear error instead of a new CA that no node trusts. Local `service`
-commands on a host whose daemon has never run skip telling peers; the daemon
-does when it starts.
+gives a clear error instead of a new CA that no node trusts. A change the
+CLI makes in the local file (no daemon listening, or `--file-only`) is not
+sent to peers: the file may be behind the cluster, and a peer would take it
+whole. This host's daemon takes it, on top of the cluster's config; to
+change the cluster directly, use `--remote`.
 
 Private keys (`ca.key`, and the `node.key` written by `cert issue`) are created
 readable by their owner only (`0600`); stouter warns at startup if an existing
@@ -453,6 +461,9 @@ the daemon (`--remote`) or the local file like `service` commands. With
   still carries the
   tunnel's bytes, as it always has: it can tamper with or cut off the
   tunnels that go through it.)
+- A policy change reaches tunnels already open, as a revocation does: the
+  hosting node closes those the new policy doesn't allow (pooled HTTP
+  connections, TCP and mux tunnels alike), logging each.
 - A subscriber doesn't proxy a service its policy keeps it from, so local
   callers are refused at once; it logs which.
 - The grant is to a node: every local process on an allowed node can use its
@@ -689,7 +700,10 @@ Limits, so one peer can't exhaust a node:
   long as each is open: a connected tunnel still holds buffers, and data up
   to its window, whether or not anything reads it. A node can't have a
   tunnel relayed back to itself (down its own reverse connections): it
-  reaches its own services locally.
+  reaches its own services locally. A NAT'd node counts the tunnels that
+  reach it through a relay against that relay, up to 4 times
+  `maxTunnelsPerPeer` (they come from every caller using it); past that, it
+  refuses them and its reverse connection there backs off.
   Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
   so an idle one whose peer vanished is closed within about a minute. So is
   one with data waiting to be acknowledged, after 60s of retransmitting
@@ -893,7 +907,7 @@ To amortize TLS handshake cost, subscribe nodes maintain yamux-multiplexed sessi
 - A single cluster CA signs all node certificates.
 - All node certs share the fixed SAN `stouter-node`, which allows standard WebPki hostname verification without per-node DNS configuration.
 - Servers require client certificates; clients verify server certificates. Both sides authenticate against the cluster CA.
-- A node's identity is its certificate's CN, which must match its `nodeId`. A tunnel to X, whether on a mux session, a pooled connection or a new one, must reach a server whose certificate names X (or, for a NAT'd X, a relay X signed for); a relay accepts reverse registrations for X only from X; only X may announce X joining or leaving; and only X's signature makes gossip about X believed (see [Gossip Protocol](#gossip-protocol)).
+- A node's identity is its certificate's CN, which must match its `nodeId`: the daemon and `check --local` refuse a `node.crt` for another name, or one the `ca.crt` beside it didn't issue (with either, the node would run cut off from its peers). A tunnel to X, whether on a mux session, a pooled connection or a new one, must reach a server whose certificate names X (or, for a NAT'd X, a relay X signed for); a relay accepts reverse registrations for X only from X; only X may announce X joining or leaving; and only X's signature makes gossip about X believed (see [Gossip Protocol](#gossip-protocol)).
 - Certificates are valid from the day they are issued (backdated a day for clock skew): 20 years for a new CA, 10 years for a node certificate, never past the CA's own expiry, unless revoked (see [Revoking certificates](#revoking-certificates)).
 - Tunnel requests include a millisecond timestamp. The receiving node rejects requests with clock skew greater than ±30 seconds, providing basic replay protection.
 
