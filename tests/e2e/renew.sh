@@ -31,7 +31,14 @@ check "B's renewed certificate is saved in its tlsDir" test "$(sha256sum "$WORK/
 
 # Past the first certificates' expiry (90s after they were issued).
 sleep $(( started + 100 - $(date +%s) > 0 ? started + 100 - $(date +%s) : 0 ))
-status() { "$BIN" --config "$WORK/$1.json" status ${2:+--remote "$2"} 2>/dev/null | grep -q "running (node mode)"; }
+# status NAME [ADDR]: NAME's CLI gets an answer from its daemon (or ADDR's);
+# if not, what the CLI said, with the time (against the daemons' logs).
+status() {
+  local out
+  out=$("$BIN" --config "$WORK/$1.json" status ${2:+--remote "$2"} 2>&1) && grep -q "running (node mode)" <<< "$out" && return
+  echo "$(date -u +%T) $1's status${2:+ of $2}: $out" | tail -n 5
+  return 1
+}
 check "past its first certificate's expiry, B still answers (with its renewed one on disk)" status B
 check "and A reaches B over a new connection" status A 127.0.0.1:27902
 check "A (the CA node) answers past its first certificate's expiry too" status A
