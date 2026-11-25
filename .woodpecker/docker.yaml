@@ -18,13 +18,19 @@ steps:
       - (dockerd-entrypoint.sh dockerd > /tmp/dockerd.log 2>&1 &)
       - for i in $(seq 60); do docker info > /dev/null 2>&1 && break; sleep 1; done
       - docker info > /dev/null || { cat /tmp/dockerd.log; exit 1; }
+      - "docker info --format 'Docker {{.ServerVersion}}: storage {{.Driver}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'"
       # ssh from this container to itself, as to a remote host.
       - ssh-keygen -A && /usr/sbin/sshd
       - mkdir -p ~/.ssh && chmod 700 ~/.ssh
       - ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
       - cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
       - ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2> /dev/null
-      - ssh -o BatchMode=yes localhost true
-      # Builds stouter:latest on the "host" from the Dockerfile.
-      - tests/e2e/deploy-host.sh
-      - tests/e2e/docker-stop.sh
+      # -n, and the scripts' stdin from /dev/null below: Woodpecker feeds
+      # this script to the shell on stdin, and ssh would read the rest of it.
+      - ssh -n -o BatchMode=yes localhost true
+      # Builds stouter:latest on the "host" from the Dockerfile (minutes).
+      # SHOW_DEPLOY: deploy.sh's output here as it runs, not only on
+      # failure. Both bounded, so a hang ends with the Docker daemon's log
+      # rather than at the pipeline's timeout with nothing to go on.
+      - SHOW_DEPLOY=1 timeout 1500 tests/e2e/deploy-host.sh < /dev/null || { tail -n 40 /tmp/dockerd.log; exit 1; }
+      - timeout 300 tests/e2e/docker-stop.sh < /dev/null || { tail -n 40 /tmp/dockerd.log; exit 1; }

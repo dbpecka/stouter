@@ -33,11 +33,13 @@ cat > "$WORK/stouter.json" <<JSON
  "apiPort": $((PORT + 80)), "dynamicConfig": {"version": 1, "serviceGroups": []}}
 JSON
 # deploy [-r]: deploy.sh, building unless RESTART_ONLY (or -r) says not to.
+# Its output goes to $WORK/deploy.log; with SHOW_DEPLOY set, shown as it
+# runs too (CI: the image build takes minutes).
 deploy() {
   local flags=()
   [[ -n "${RESTART_ONLY:-}" || "${1:-}" == -r ]] && flags+=(-r)
-  printf '%s\n' "${SUDO_PASS:-}" | "$REPO/deploy.sh" "${flags[@]}" -c "$WORK/stouter.json" -n "$CLUSTER" "$HOST" \
-    > "$WORK/deploy.log" 2>&1
+  printf '%s\n' "${SUDO_PASS:-}" | "$REPO/deploy.sh" "${flags[@]}" -c "$WORK/stouter.json" -n "$CLUSTER" "$HOST" 2>&1 |
+    if [[ -n "${SHOW_DEPLOY:-}" ]]; then tee "$WORK/deploy.log"; else cat > "$WORK/deploy.log"; fi
 }
 container_id() { on_host "docker inspect -f '{{.Id}}' $CONTAINER" 2>/dev/null; }
 running() { on_host "docker ps --filter name=^$CONTAINER\$ --format '{{.Status}}'" | grep -q '^Up'; }
