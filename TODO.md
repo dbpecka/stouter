@@ -293,7 +293,7 @@ against the code. Numbered on from the list above.
   instead of aborting.
   Fixed: a probe that fails to run aborts the deploy; only an image that runs and lacks `--local` is warned about and skipped.
 - [x] **46. The CLI panics (exit 101) on a closed pipe** (`stouter config history | head`).
-  Fixed: CLI commands restore SIGPIPE's default, so they stop quietly (status 141) as Unix tools do; the daemon keeps ignoring it.
+  Fixed: CLI commands restore SIGPIPE's default, so they stop quietly (status 141) as Unix tools do; the daemon keeps ignoring it. (Reworked in #53: only a failed print ends the CLI by SIGPIPE.)
 - [x] **47. A huge `signedAt` overflows** formatting a refusal before any signature is
   checked (panic in debug builds). Partly fixed with #30 (`saturating_mul`
   in `verify`); check the other call sites.
@@ -301,3 +301,134 @@ against the code. Numbered on from the list above.
 - [x] **48. `service move` and `--remote` with another cluster's `--cert-dir`** apply this
   cluster's revocations to the other one (fails safe, confusing error).
   Fixed: the local config's revocations are applied only with certificates from the local tlsDir's CA (or when that can't be told).
+
+# Third review, of main at db67147 (before going live)
+
+Five independent reviews (gossip and config; identity and security; CLI and
+operations; data plane; concurrency, panics and resources), each finding
+reproduced or checked against the code. Numbered on from the lists above.
+
+## High
+
+- [x] **49. Histogram samples pile up in memory unless something scrapes `/metrics`.**
+  `metrics::install` used `install_recorder`, whose caller must run the
+  exporter's upkeep; nothing did, so every request, tunnel setup and sync
+  timing stayed in memory until a scrape (about 16 bytes a sample: 1.3 GiB a
+  day at 1,000 requests/s).
+  Fixed: the gauge loop runs the recorder's upkeep every 5 seconds.
+
+- [x] **50. A peer's mux streams left the #28 budget once connected,** so any member
+  could make any node hold gigabytes: registering reverse connections for
+  itself at the node, then having the node relay thousands of tunnels back
+  to itself, never reading them (600 connected, none counted). Plain
+  relayed tunnels had no cap at all.
+  Fixed: every tunnel a peer has open through a node counts against it for its whole life (at most 4096, plain connections and mux streams alike, served or relayed); a tunnel relayed back to its caller is refused; proxy buffers are allocated once data flows.
+
+## Medium
+
+- [x] **51. A CLI change made while the daemon was stopped was lost if the cluster had moved on.**
+  The CLI recorded its change in the history as the version the daemon
+  last ran, so at startup the file matched it, the change was in force at
+  once and the first sync overwrote it, with no `.unapplied` copy (the
+  README's way to add a node: `service add` on a new node, then start it).
+  Signed clusters too.
+  Fixed: the CLI records nothing in the history (on a node that never ran, the config it changed, as the starting point), so the daemon takes the change once caught up, or keeps it as `.unapplied`; signed changes in the file wait the same way.
+
+- [x] **52. `cert revoke --remote` didn't protect the admin who ran it.**
+  The CLI refuses configs signed with certificates its own file revokes,
+  but no `--remote` change wrote the file: a node holding the revoked key
+  could serve a forged config, and the admin's next change was signed on
+  top of it, undoing the revocation cluster-wide.
+  Fixed: after a signed change, the CLI's file holds the config it signed (as after `config push`), unless the file holds edits not yet pushed (then it says so) or another cluster's config. README: other admins pull after a revocation, and drop the revoked CN from `adminCns`.
+
+- [x] **53. The CLI died silently (status 141) when a daemon refused its certificate,**
+  a regression from #46: TLS writes get no `MSG_NOSIGNAL`, so with SIGPIPE
+  at its default the write after the daemon's close killed the process.
+  When it survived, `change_target` took any failure (a refused
+  certificate, a 2 s timeout) for "no daemon" and edited the file behind
+  the running daemon.
+  Fixed: SIGPIPE stays ignored, and only a failed print on stdout or stderr ends the CLI by SIGPIPE; the CLI edits the file only when the connection to this host's daemon is refused, anything else is an error.
+
+- [x] **54. A closed stdout or stderr silently stopped the daemon's loops.**
+  The config dump used `println!`, which panics on a closed pipe; a failed
+  log write was reported with `eprintln!`, which panics too; and a panic
+  ended the loop for good while the process looked healthy (an
+  `outboundOnly` node stopped gossiping).
+  Fixed: the dump ignores write errors, the log drops lines it can't write, and a background loop that stops makes the daemon drain and exit with status 1, to be restarted.
+
+- [ ] **55. A higher version signed over an hour earlier splits a signed cluster** after a
+  partition heals (side B refuses side A's v12 as signed too early; side A
+  ignores B's older v11), until the next change. The warning blames clocks.
+  Fix: apply `signed_too_early` only when the signer's certificate has
+  expired by now (`src/signing.rs:243`).
+
+- [ ] **56. A node with no `knownNodes` counts as caught up at once,** so its offline
+  edit is taken before any peer syncs, then lost with no `.unapplied` copy
+  (`src/state.rs` `caught_up`). Fix: drop the "no peers" shortcut, or keep
+  the pre-edit text in `file_config` until the edit survives a sync.
+
+- [ ] **57. With `requireSignedConfig`, any member can hold the config write lock** with
+  large configs carrying junk signatures: `adopt_if_newer` decodes and
+  verifies under `dynamic_config.write()` (a reader waited about 0.5 s with 8
+  senders). Fix: refuse oversized signed text first; verify outside the
+  lock with a per-peer slot; remember the last refused signature.
+
+- [ ] **58. `ca.key` is never checked against `ca.crt`** (`src/pki.rs` `load_ca`). A node
+  deployed before its certificates are copied in makes its own CA; copying
+  the cluster's in afterwards leaves a mismatched key, accepted silently:
+  the node runs isolated with nothing logged at warn. Fix: refuse a
+  mismatched key; warn when a node with `knownNodes` makes a new CA; log
+  repeated handshake failures at warn.
+
+- [ ] **59. The README's `cert issue --out /etc/stouter/tls/` overwrites the CA node's own
+  `node.crt` and `node.key`** with the new node's (its example tlsDir). The
+  CA node then runs as itself with the other node's certificate, and that
+  node gets the same key. Fix: refuse to write over an existing `node.key`
+  (or into the CA's own tlsDir); fix the example.
+
+## Low
+
+- [ ] **60. A relay can make a NAT'd node hold up to 8 MiB per reverse connection,**
+  with no deadline (`src/node/reverse.rs` reads the relay's first message
+  with the 8 MiB cap); the plain-connection dispatcher likewise. The
+  attacker sends every byte held. Fix: cap a reverse connection's message
+  at the tunnel-request size; a deadline once a length prefix arrives.
+- [ ] **61. A relay refuses a burst of tunnels after a quiet spell:** `relayed_here` is
+  refreshed only on registration, so once idle connections registered over
+  two minutes ago are used up, the next tunnels are refused at once while
+  replacements register. Fix: refresh it when a reverse connection is taken.
+- [ ] **62. `config rollback` and `service move` accept history entries forged with an expired admin key.**
+  Fix: refuse a fetched entry whose signer has expired unless accepted
+  explicitly, or it matches the local history.
+- [ ] **63. deploy.sh's pre-check ignores tlsDir:** a missing `node.key` passes `check
+  --local` and the new container crash-loops. Fix: mount tlsDir in the
+  check, and have `check --local` check the certificate set (and #58).
+- [ ] **64. The nonce cache caps a caller at about 143 tunnels/s per node** to policy
+  services (10,000 per signer per 70 s), and rescans the cache on every call
+  at the cap. Fix: scale the cap, prune incrementally.
+- [ ] **65. The same-version tie-break can cycle between three configs** signed 40
+  minutes apart (`src/config.rs` `supersedes`); it settles in a live
+  cluster. Fix: a total order (#55 removes most of the need).
+- [ ] **66. The #35 check is skipped on a daemon's word** (`config pull` with a daemon
+  saying `require_signed_config: false`). Fix: treat the cluster as signed
+  when the local file holds a verified signed config.
+- [ ] **67. Relay retries resend the caller's nonce,** so the NAT'd node refuses the retry
+  as a replay and the real cause is lost. Fix: retry only when the first
+  send failed.
+- [ ] **68. `requestTimeoutMs: 0` is accepted,** then fails every request and ejects
+  every node. Fix: a minimum in `config_problems`.
+- [ ] **69. Nonces expire by the monotonic clock, freshness by the wall clock,** so a
+  clock stepped back allows one replay (code reading only).
+- [ ] **70. Smaller items:** deploy.sh's `-r` help says it updates the config (it never
+  replaces one); `cert issue` without a CA says "start the daemon once"
+  (which makes a second CA); the README says empty `adminCns` disables
+  admin RPC (the node's own certificate still works); deploy.sh uploads
+  untracked files from the repo directory, keys included; a `service add`
+  that changes nothing bumps the version; `config push` writes over a newer
+  config a local daemon persisted; the daemon does blocking file I/O under
+  the config lock.
+- [ ] **71. The idle reverse-connection cap can be passed by one** (found running
+  `caps.sh`: 1025 kept, once in four runs): `handle_reverse_registration`
+  counts the pool, awaits the known-nodes update, then pushes, so
+  registrations arriving together all pass at 1023. Fix: check and push
+  under one lock (a capped `StreamPool::push`).

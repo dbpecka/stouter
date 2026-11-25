@@ -49,11 +49,11 @@ struct ProxyHandle {
 /// Starts the gossip sync loop, REST API, local proxy manager, and a TCP
 /// listener that accepts inbound connections.
 pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHandle) -> Result<()> {
-    tokio::spawn(gossip::run_sync_loop(state.clone()));
-    tokio::spawn(gossip::run_member_log(state.clone()));
-    tokio::spawn(gossip::run_config_poll_loop(state.clone()));
+    state.spawn_essential("gossip", gossip::run_sync_loop(state.clone()));
+    state.spawn_essential("the membership log", gossip::run_member_log(state.clone()));
+    state.spawn_essential("the config poll", gossip::run_config_poll_loop(state.clone()));
     if matches!(state.config.mode, crate::config::Mode::NodeSubscribe) {
-        tokio::spawn(crate::health::run_health_checks(state.clone()));
+        state.spawn_essential("health checks", crate::health::run_health_checks(state.clone()));
     }
 
     let service_ports: Arc<RwLock<HashMap<String, ServiceInfo>>> =
@@ -69,7 +69,7 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
     });
 
     let http_proxies = http::HttpProxies::new(state.clone());
-    tokio::spawn(manage_proxies(state.clone(), service_ports, http_proxies.clone()));
+    state.spawn_essential("the proxy manager", manage_proxies(state.clone(), service_ports, http_proxies.clone()));
     if let Some(addr) = state.config.http_listen.clone() {
         let (state, proxies) = (state.clone(), http_proxies.clone());
         tokio::spawn(async move {
@@ -78,8 +78,8 @@ pub async fn run_subscribe(state: Arc<SharedState>, metrics_handle: PrometheusHa
             }
         });
     }
-    tokio::spawn(fill_tunnel_pool(state.clone()));
-    tokio::spawn(maintain_mux_sessions(state.clone()));
+    state.spawn_essential("the tunnel pool", fill_tunnel_pool(state.clone()));
+    state.spawn_essential("mux sessions", maintain_mux_sessions(state.clone()));
 
     if state.config.outbound_only {
         info!(

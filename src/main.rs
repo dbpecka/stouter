@@ -430,17 +430,9 @@ enum RouteAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.command.is_none());
-    // A CLI command whose output is cut short (`stouter config history |
-    // head`) just stops, as Unix tools do, rather than panicking on the
-    // closed pipe (Rust ignores SIGPIPE). Not the daemon: there a peer
-    // closing a connection mid-write must never end the process.
     #[cfg(unix)]
     if cli.command.is_some() {
-        // SAFETY: restoring a signal's default disposition, before any
-        // other thread exists.
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        }
+        end_quietly_when_output_is_closed();
     }
 
     match cli.command {
@@ -506,15 +498,16 @@ async fn main() -> Result<()> {
             if let Some(issuer) = pki::Issuer::load(tls_dir, cfg.cert_lifetime())? {
                 let _ = state.issuer.set(issuer);
             }
-            tokio::spawn(renew::run_renewal_loop(state.clone()));
+            state.spawn_essential("certificate renewal", renew::run_renewal_loop(state.clone()));
 
             if let Some(tracing_cfg) = &cfg.tracing {
                 let _ = state.tracer.set(telemetry::Tracer::start(tracing_cfg, &cfg.node_id));
             }
 
             let metrics_handle = metrics::install();
-            tokio::spawn(metrics::run_gauge_loop(state.clone()));
-            tokio::spawn(state::run_pool_sweeper(state.clone()));
+            let upkeep = metrics_handle.clone();
+            state.spawn_essential("metrics", metrics::run_gauge_loop(state.clone(), move || upkeep.run_upkeep()));
+            state.spawn_essential("the pool sweeper", state::run_pool_sweeper(state.clone()));
 
             let daemon = async {
                 match cfg.mode {
@@ -525,6 +518,7 @@ async fn main() -> Result<()> {
                 }
             };
 
+            let failed = state.failed.clone();
             tokio::select! {
                 result = daemon => result?,
                 signal = shutdown_signal() => {
@@ -537,6 +531,16 @@ async fn main() -> Result<()> {
                             std::process::exit(1);
                         }
                     }
+                }
+                // A loop the daemon needs stopped (see
+                // `SharedState::spawn_essential`): drain, then exit with an
+                // error so Docker or systemd starts it again.
+                () = failed.cancelled() => {
+                    tokio::select! {
+                        () = graceful_drain(state) => {}
+                        signal = shutdown_signal() => info!("received {signal}: not waiting for the drain to finish"),
+                    }
+                    std::process::exit(1);
                 }
             }
         }
@@ -724,6 +728,7 @@ async fn main() -> Result<()> {
                         },
                     ),
                     &cfg,
+                    &cli.config,
                     cli.cert_dir.as_deref(),
                 )
                 .await?;
@@ -834,6 +839,7 @@ async fn main() -> Result<()> {
                         to: to.clone(),
                     },
                     &cfg,
+                    &cli.config,
                     cli.cert_dir.as_deref(),
                 )
                 .await?;
@@ -890,6 +896,7 @@ async fn main() -> Result<()> {
                         name: name.clone(),
                     },
                     &cfg,
+                    &cli.config,
                     cli.cert_dir.as_deref(),
                 )
                 .await?;
@@ -945,6 +952,7 @@ async fn main() -> Result<()> {
                     target,
                     AdminOp::RoutesSet { service: service.clone(), routes },
                     &cfg,
+                    &cli.config,
                     cli.cert_dir.as_deref(),
                 )
                 .await?
@@ -1066,6 +1074,7 @@ async fn main() -> Result<()> {
                 &to,
                 AdminOp::service_add(dest_group.clone(), Service { node_id: dest_node.clone(), ..src_svc }),
                 &cfg,
+                &cli.config,
                 to_certs,
             )
             .await?
@@ -1085,6 +1094,7 @@ async fn main() -> Result<()> {
                     name: name.clone(),
                 },
                 &cfg,
+                &cli.config,
                 from_certs,
             )
             .await;
@@ -1135,6 +1145,7 @@ async fn main() -> Result<()> {
                             name: name.clone(),
                         },
                         &cfg,
+                        &cli.config,
                         to_certs,
                     )
                     .await;
@@ -1335,7 +1346,7 @@ async fn main() -> Result<()> {
             };
             let remote = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
             let version = if let Some(target) = &remote {
-                run_admin_rpc(target, op, &local, cli.cert_dir.as_deref()).await?
+                run_admin_rpc(target, op, &local, &cli.config, cli.cert_dir.as_deref()).await?
             } else {
                 let mut cfg = Config::load(&cli.config)?;
                 let before = cfg.dynamic_config.clone();
@@ -1437,7 +1448,7 @@ async fn main() -> Result<()> {
             }
             let op = AdminOp::Restore { config: earlier };
             let version = if let Some(addr) = &target {
-                run_admin_rpc(addr, op, &local, cli.cert_dir.as_deref()).await?
+                run_admin_rpc(addr, op, &local, &cli.config, cli.cert_dir.as_deref()).await?
             } else {
                 let mut cfg = Config::load(&cli.config)?;
                 let before = cfg.dynamic_config.clone();
@@ -1466,7 +1477,7 @@ async fn main() -> Result<()> {
             let local = Config::load_or_default(&cli.config)?;
             let remote = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
             let (version, dc) = if let Some(target) = &remote {
-                let version = run_admin_rpc(target, op, &local, cli.cert_dir.as_deref()).await?;
+                let version = run_admin_rpc(target, op, &local, &cli.config, cli.cert_dir.as_deref()).await?;
                 (version, fetch_remote_dynamic_config(target, &local, cli.cert_dir.as_deref()).await.ok())
             } else {
                 let mut cfg = Config::load(&cli.config)?;
@@ -1574,17 +1585,51 @@ fn startup_config(cfg: &Config, tls_ctx: &tls::TlsContext, path: &str) -> config
 /// trace) or skip the checks a running daemon makes; so the daemon starts
 /// on what it last ran, and its config poll takes the edit once it has
 /// caught up (see `gossip::run_config_poll_loop`). If the cluster moved on
-/// meanwhile, the edit is kept aside as `.unapplied` instead.
+/// meanwhile, the edit is kept aside as `.unapplied` instead. A CLI change
+/// made with no daemon running is such an edit (see `save_local_change`).
 ///
-/// Not with `requireSignedConfig`, where a hand edit isn't taken at all (see
-/// [`startup_config`]); nor without a history to compare with.
+/// With `requireSignedConfig`, only a signed one (`cfg` holds what
+/// [`startup_config`] took from the file): a hand edit isn't taken at all.
+/// Not without a history to compare with.
 fn edited_while_stopped(cfg: &Config, history: &[history::HistoryEntry]) -> Option<config::DynamicConfig> {
-    if cfg.require_signed_config {
+    if cfg.require_signed_config && cfg.dynamic_config.signature.is_none() {
         return None;
     }
     let ran = history.last()?.config.as_ref()?;
     let file = &cfg.dynamic_config;
     (file.version != ran.version || !file.same_settings(ran)).then(|| ran.clone())
+}
+
+/// A CLI command whose output is cut short (`stouter config history |
+/// head`) ends as Unix tools do, killed by SIGPIPE, rather than with a
+/// panic about the closed pipe.
+///
+/// SIGPIPE itself stays ignored (as Rust sets it): at its default it would
+/// also end the process, silently, when a daemon closes a connection the
+/// CLI is writing to (TLS writes don't ask the kernel to hold the signal
+/// back), as one refusing the CLI's certificate does. That is an error to
+/// report. Only a failed print, which panics, is turned into the signal.
+#[cfg(unix)]
+fn end_quietly_when_output_is_closed() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        let broken_pipe = std::io::Error::from_raw_os_error(libc::EPIPE).to_string();
+        if message.starts_with("failed printing to std") && message.ends_with(&broken_pipe) {
+            // SAFETY: restoring a signal's default action and raising it,
+            // which ends the process.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::raise(libc::SIGPIPE);
+            }
+        }
+        report(info);
+    }));
 }
 
 /// Structured logging, filtered by `RUST_LOG` if set. The daemon logs to
@@ -1599,7 +1644,14 @@ fn init_logging(daemon: bool) {
     };
     let logs = tracing_subscriber::fmt();
     if daemon {
-        logs.with_env_filter(filter("info")).with_ansi(std::io::stdout().is_terminal()).init();
+        // A log line that can't be written (stdout closed: `stouter |
+        // logger` whose reader died) is dropped. By default the subscriber
+        // reports it on stderr, and printing to a closed stderr panics,
+        // which would end whatever task was logging.
+        logs.with_env_filter(filter("info"))
+            .with_ansi(std::io::stdout().is_terminal())
+            .log_internal_errors(false)
+            .init();
     } else {
         logs.with_env_filter(filter("warn"))
             .with_writer(std::io::stderr)
@@ -1894,6 +1946,7 @@ async fn try_admin_rpc(
     target: &str,
     op: AdminOp,
     cfg: &Config,
+    config_path: &str,
     cert_dir: Option<&str>,
 ) -> Result<std::result::Result<u64, (AdminErrCode, String)>> {
     let material = load_cli_material(cfg, cert_dir)?;
@@ -1923,12 +1976,55 @@ async fn try_admin_rpc(
             return Ok(Err((AdminErrCode::Validation, problem)));
         }
         let push = signed_push(next, current.version, &material)?;
+        let AdminOp::ConfigPush { config: pushed, .. } = &push else { unreachable!("signed_push makes a ConfigPush") };
+        let pushed = pushed.clone();
         match send_admin(target, &tls_ctx, push).await? {
             Err((AdminErrCode::Conflict, _)) if attempt < PUSH_ATTEMPTS => continue,
+            Ok(version) => {
+                keep_pushed(config_path, &pushed, &material);
+                return Ok(Ok(version));
+            }
             result => return Ok(result),
         }
     }
     unreachable!("the last attempt always returns")
+}
+
+/// After a signed change was taken: the CLI's config file takes the config
+/// it signed, as `config push` leaves it, so what this CLI trusts from now
+/// on is at least that. Above all its revocations: the CLI refuses configs
+/// signed with a certificate its file revokes (see [`cli_tls_context`]),
+/// and an admin who ran `cert revoke --remote` and kept an older file
+/// would sign their next change on top of a config forged with the revoked
+/// key, undoing the revocation.
+///
+/// Only over a config of the same cluster, as an admin signed it with no
+/// edits made around it, and older: never over edits not yet pushed (say
+/// so, if they keep a revocation out of the file), or another cluster's
+/// config (`service move`).
+fn keep_pushed(config_path: &str, pushed: &config::DynamicConfig, material: &pki::PkiMaterial) {
+    let Ok(mut file) = Config::load(config_path) else { return };
+    let held = &file.dynamic_config;
+    if held.version >= pushed.version {
+        return;
+    }
+    let unedited = cli_tls_context(&file, material)
+        .and_then(|tls_ctx| trusted_config(held, &file, material, &tls_ctx))
+        .is_ok_and(|signed| signed.version == held.version && signed.same_settings(held));
+    if !unedited {
+        if held.revoked != pushed.revoked && held.signature.is_some() {
+            eprintln!(
+                "note: {config_path} holds edits not yet pushed, so it was left at version {}: until it holds \
+                 version {} (`stouter config pull`), this CLI doesn't know that version's revocations",
+                held.version, pushed.version
+            );
+        }
+        return;
+    }
+    file.dynamic_config = pushed.clone();
+    if let Err(e) = file.save(config_path) {
+        eprintln!("warning: could not update {config_path} to version {}: {e:#}", pushed.version);
+    }
 }
 
 /// Like `try_admin_rpc`, but on `AdminResult::Err` exits the process with a
@@ -1938,9 +2034,10 @@ async fn run_admin_rpc(
     target: &str,
     op: AdminOp,
     cfg: &Config,
+    config_path: &str,
     cert_dir: Option<&str>,
 ) -> Result<u64> {
-    match try_admin_rpc(target, op, cfg, cert_dir).await? {
+    match try_admin_rpc(target, op, cfg, config_path, cert_dir).await? {
         Ok(new_version) => Ok(new_version),
         Err((code, message)) => {
             eprintln!("error: {message}");
@@ -2064,10 +2161,14 @@ async fn fetch_trusted_config(target: &str, cfg: &Config, cert_dir: Option<&str>
 }
 
 /// Where a config change goes: `--remote` if given; else the daemon running
-/// on this host for this config, if one answers (so the change is made
-/// where the config is in force, not in its file behind its back, where a
-/// change the daemon makes at the same time could undo it); else `None`:
-/// edit the file.
+/// on this host for this config (so the change is made where the config is
+/// in force, not in its file behind its back, where a change the daemon
+/// makes at the same time could undo it); else, with no daemon listening,
+/// `None`: edit the file.
+///
+/// Only a refused connection means no daemon. One that is listening but
+/// won't take this CLI's request (its certificate refused, say, or expired)
+/// or doesn't answer is an error, never a reason to edit the file anyway.
 async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Option<&str>) -> Result<Option<String>> {
     if remote.is_some() {
         return Ok(remote);
@@ -2078,18 +2179,44 @@ async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Opti
         return Ok(None);
     }
     let target = cfg.local_target();
-    let Ok(tls_ctx) = build_cli_tls(&cfg, cert_dir) else { return Ok(None) };
-    let asked = tokio::time::timeout(Duration::from_secs(2), daemon_request(&target, &tls_ctx, &Message::StatusRequest));
-    match asked.await {
+    match tokio::time::timeout(LOCAL_DAEMON_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&target)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
+        Ok(Err(e)) => anyhow::bail!("can't tell whether this host's daemon is running: connecting to {target}: {e}"),
+        Err(_) => anyhow::bail!(
+            "can't tell whether this host's daemon is running: {target} didn't accept a connection within {}s",
+            LOCAL_DAEMON_CONNECT_TIMEOUT.as_secs()
+        ),
+    }
+    let not_made = || format!("a daemon is running at {target} (the bind in {config_path}); the change was not made");
+    let tls_ctx = build_cli_tls(&cfg, cert_dir).with_context(not_made)?;
+    let asked = tokio::time::timeout(LOCAL_DAEMON_STATUS_TIMEOUT, daemon_request(&target, &tls_ctx, &Message::StatusRequest))
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {}s", LOCAL_DAEMON_STATUS_TIMEOUT.as_secs()))
+        .and_then(|answer| answer)
+        .with_context(not_made)?;
+    match asked {
         // A subscribe-mode daemon takes no admin requests (it hosts no
         // services, and its config is only ever what the cluster sends): a
         // change there is to the file, as with no daemon running.
-        Ok(Ok(Message::StatusResponse { node_id, mode, .. })) if node_id == cfg.node_id && mode != "subscribe" => {
-            Ok(Some(target))
+        Message::StatusResponse { node_id, mode, .. } if node_id == cfg.node_id => {
+            Ok((mode != "subscribe").then_some(target))
         }
-        _ => Ok(None),
+        Message::StatusResponse { node_id, .. } => anyhow::bail!(
+            "the daemon at {target} (the bind in {config_path}) is node '{node_id}', not '{}': is this the config of the \
+             daemon running here? The change was not made",
+            cfg.node_id
+        ),
+        other => anyhow::bail!("{}: it answered {other:?}", not_made()),
     }
 }
+
+/// How long connecting to this host's daemon may take before the CLI gives
+/// up (an unanswered port is refused at once; this is a port that drops).
+const LOCAL_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long this host's daemon may take to say who it is.
+const LOCAL_DAEMON_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The node a service command is about: `--node` if given, else the node at
 /// `remote` (it says, in its status) with `--remote`, else this host's
@@ -2279,7 +2406,17 @@ fn save_local_change(
         cfg.dynamic_config.signed_at = None;
     }
     cfg.save(path)?;
-    history::record(path, &cfg.dynamic_config);
+    // Not into the history: that lists what the daemon ran, and it hasn't
+    // run this. When it starts, it sees the file differs from what it last
+    // ran and takes the change once caught up with the cluster, or, if the
+    // cluster moved on meanwhile, keeps it aside as `.unapplied` (see
+    // `edited_while_stopped`). Recorded as ran, the change would be in
+    // force at once and lost at the first sync to the cluster's newer
+    // config, with no trace. A node that never ran has no history: the
+    // config the change was made on goes in, as its starting point.
+    if history::load(path).is_empty() {
+        history::record(path, before);
+    }
     Ok(())
 }
 
@@ -2430,9 +2567,55 @@ mod tests {
         // Unchanged, or no history: as is.
         assert!(edited_while_stopped(&with(ran.clone()), &history).is_none());
         assert!(edited_while_stopped(&with(api_on_port(4000)), &[]).is_none());
-        // With requireSignedConfig, an edit isn't taken (startup_config).
-        let signed = Config { require_signed_config: true, ..with(api_on_port(4000)) };
-        assert!(edited_while_stopped(&signed, &history).is_none());
+        // With requireSignedConfig, an unsigned edit isn't taken
+        // (startup_config); a signed one (the CLI's) waits like any other.
+        let unsigned = Config { require_signed_config: true, ..with(api_on_port(4000)) };
+        assert!(edited_while_stopped(&unsigned, &history).is_none());
+        let mut signed_edit = api_on_port(4000);
+        signed_edit.version = 4;
+        signed_edit.signature =
+            Some(config::ConfigSignature { config_json: String::new(), signer_cert: String::new(), signature: String::new() });
+        let signed = Config { require_signed_config: true, ..with(signed_edit) };
+        assert_eq!(edited_while_stopped(&signed, &history), Some(ran.clone()));
+    }
+
+    #[test]
+    fn a_cli_change_made_with_no_daemon_running_waits_for_it_like_any_edit() {
+        let dir = std::env::temp_dir().join(format!("stouter_offline_cli_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path = path.to_str().unwrap();
+        let add_service = |path: &str| {
+            let mut cfg = Config::load(path).unwrap();
+            let before = cfg.dynamic_config.clone();
+            let mut dc = before.clone();
+            dc.version = before.next_version().unwrap();
+            dc.service_groups[0].services.push(serde_json::from_value(serde_json::json!(
+                {"name": "added", "nodeId": "n1", "nodePort": 5000}
+            )).unwrap());
+            cfg.dynamic_config = dc;
+            save_local_change(&mut cfg, &before, path, None).unwrap();
+            Config::load(path).unwrap()
+        };
+
+        // A node that ran version 3: the change isn't recorded as run, so
+        // the daemon starts on 3 and takes it once caught up (or keeps it
+        // aside if the cluster moved on meanwhile).
+        let ran = api_on_port(3000);
+        Config { node_id: "n1".into(), dynamic_config: ran.clone(), ..Config::default() }.save(path).unwrap();
+        history::record(path, &ran);
+        let changed = add_service(path);
+        assert_eq!(changed.dynamic_config.version, 4);
+        assert_eq!(history::load(path).last().unwrap().version, 3, "history still ends at what ran");
+        assert_eq!(edited_while_stopped(&changed, &history::load(path)), Some(ran.clone()));
+
+        // A node that never ran: what the change was made on is its start.
+        let _ = std::fs::remove_file(history::path_for(path));
+        Config { node_id: "n1".into(), dynamic_config: ran.clone(), ..Config::default() }.save(path).unwrap();
+        let changed = add_service(path);
+        assert_eq!(history::load(path).iter().map(|e| e.version).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(edited_while_stopped(&changed, &history::load(path)), Some(ran));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2736,18 +2919,94 @@ mod tests {
         let op = || AdminOp::PolicyAllow { service: "api".into(), nodes: vec!["n2".into()] };
 
         let (behind, pushed) = config_server(&certs["m"], v9.clone()).await;
-        let err = try_admin_rpc(&behind, op(), &zoe, zoe_dir).await.expect_err("refused");
+        let err = try_admin_rpc(&behind, op(), &zoe, "", zoe_dir).await.expect_err("refused");
         assert!(format!("{err:#}").contains("older than the admin-signed version 10"), "{err:#}");
         assert!(pushed.lock().unwrap().is_empty(), "nothing signed");
 
         let (current, pushed) = config_server(&certs["m"], v10).await;
-        assert_eq!(try_admin_rpc(&current, op(), &zoe, zoe_dir).await.unwrap(), Ok(11));
+        assert_eq!(try_admin_rpc(&current, op(), &zoe, "", zoe_dir).await.unwrap(), Ok(11));
         assert_eq!(pushed.lock().unwrap()[0].revoked.nodes, ["x"], "built on v10, its revocation kept");
 
         // With no signed config of its own to compare with, as before.
         let laptop = Config { dynamic_config: config::DynamicConfig::default(), ..zoe.clone() };
-        assert_eq!(try_admin_rpc(&behind, op(), &laptop, zoe_dir).await.unwrap(), Ok(10));
+        assert_eq!(try_admin_rpc(&behind, op(), &laptop, "", zoe_dir).await.unwrap(), Ok(10));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An admin revokes a leaked admin key with `cert revoke --remote`; a
+    /// node holding that key then serves a config forged with it (the key
+    /// not revoked, its own policy in force). The admin's next change isn't
+    /// signed on top of it: the revocation went into the admin's own file.
+    #[tokio::test]
+    async fn a_revocation_made_with_remote_protects_the_admin_who_made_it() {
+        let (dir, certs) = cluster_certs(&["alice", "rob", "m"]);
+        let path = dir.join("alice.json");
+        let path = path.to_str().unwrap();
+        let alice = signing::Signer::from_material(&certs["alice"]).unwrap();
+        let rob = signing::Signer::from_material(&certs["rob"]).unwrap();
+        let v10 = signing::sign(&config::DynamicConfig { version: 10, ..api_on_port(3000) }, &alice).unwrap();
+        let admins = vec!["alice".to_string(), "rob".to_string()];
+        Config { require_signed_config: true, admin_cns: admins, dynamic_config: v10.clone(), ..Config::default() }
+            .save(path)
+            .unwrap();
+        let alice_dir = dir.join("alice");
+        let alice_dir = alice_dir.to_str();
+
+        let (honest, _) = config_server(&certs["m"], v10.clone()).await;
+        let revoke = AdminOp::Revoke { nodes: vec!["rob".into()], certs: vec![] };
+        let alice_cfg = Config::load(path).unwrap();
+        assert_eq!(try_admin_rpc(&honest, revoke, &alice_cfg, path, alice_dir).await.unwrap(), Ok(11));
+        let kept = Config::load(path).unwrap().dynamic_config;
+        assert_eq!((kept.version, kept.revoked.nodes.clone()), (11, vec!["rob".to_string()]), "the file holds what was pushed");
+
+        // Rob's forgery, newer, with rob not revoked.
+        let forged = config::DynamicConfig { version: 12, changed_by: "rob".into(), ..api_on_port(6666) };
+        let (lying, pushed) = config_server(&certs["m"], signing::sign(&forged, &rob).unwrap()).await;
+        let op = AdminOp::PolicyAllow { service: "api".into(), nodes: vec!["n2".into()] };
+        let alice_cfg = Config::load(path).unwrap();
+        try_admin_rpc(&lying, op, &alice_cfg, path, alice_dir).await.expect_err("the forgery is refused");
+        assert!(pushed.lock().unwrap().is_empty(), "nothing signed on it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pushed_config_is_kept_only_over_an_older_unedited_one_of_its_cluster() {
+        let (dir, certs) = cluster_certs(&["alice"]);
+        let (other_dir, other_certs) = cluster_certs(&["alice"]);
+        let path = dir.join("alice.json");
+        let path = path.to_str().unwrap();
+        let alice = signing::Signer::from_material(&certs["alice"]).unwrap();
+        let v10 = signing::sign(&config::DynamicConfig { version: 10, ..api_on_port(3000) }, &alice).unwrap();
+        let v11 = signing::sign(&config::DynamicConfig { version: 11, ..api_on_port(3001) }, &alice).unwrap();
+        let save = |dc: &config::DynamicConfig| {
+            let admins = vec!["alice".to_string()];
+            Config { require_signed_config: true, admin_cns: admins, dynamic_config: dc.clone(), ..Config::default() }
+                .save(path)
+                .unwrap();
+        };
+        let held = || Config::load(path).unwrap().dynamic_config;
+
+        // Another cluster's config (`service move` to it): not kept.
+        save(&v10);
+        let theirs = signing::sign(&v11, &signing::Signer::from_material(&other_certs["alice"]).unwrap()).unwrap();
+        keep_pushed(path, &theirs, &other_certs["alice"]);
+        assert_eq!(held(), v10);
+        // Edits not yet pushed, around the signature: not written over.
+        let mut edited = v10.clone();
+        edited.service_groups[0].services[0].node_port = 4000;
+        save(&edited);
+        keep_pushed(path, &v11, &certs["alice"]);
+        assert_eq!(held(), edited);
+        // A newer config: kept.
+        save(&v11);
+        keep_pushed(path, &v10, &certs["alice"]);
+        assert_eq!(held(), v11);
+        // An older unedited one of its cluster: replaced.
+        save(&v10);
+        keep_pushed(path, &v11, &certs["alice"]);
+        assert_eq!(held(), v11);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     /// A key whose certificate expired (and was never revoked) signs configs
@@ -2777,12 +3036,12 @@ mod tests {
 
         // Another config at alice's version: refused.
         let (lying, pushed) = config_server(&certs["m"], forge(10)).await;
-        let err = try_admin_rpc(&lying, op(), &alice_cfg, alice_dir.to_str()).await.expect_err("refused");
+        let err = try_admin_rpc(&lying, op(), &alice_cfg, "", alice_dir.to_str()).await.expect_err("refused");
         assert!(format!("{err:#}").contains("another config at version 10"), "{err:#}");
         // A newer one, which every other check passes: refused for its
         // expired signer.
         let (lying_newer, pushed_newer) = config_server(&certs["m"], forge(11)).await;
-        let err = try_admin_rpc(&lying_newer, op(), &alice_cfg, alice_dir.to_str()).await.expect_err("refused");
+        let err = try_admin_rpc(&lying_newer, op(), &alice_cfg, "", alice_dir.to_str()).await.expect_err("refused");
         assert!(format!("{err:#}").contains("whose certificate expired"), "{err:#}");
         assert!(pushed.lock().unwrap().is_empty() && pushed_newer.lock().unwrap().is_empty(), "nothing signed");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2806,6 +3065,58 @@ mod tests {
             assert_eq!(target, to_daemon.then_some(addr), "{mode}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_change_goes_to_the_file_only_when_no_daemon_is_listening() {
+        let (dir, certs) = cluster_certs(&["s1"]);
+        let (other_dir, _) = cluster_certs(&["s1"]);
+        let path = dir.join("stouter.json");
+        let path = path.to_str().unwrap();
+        let config_for = |bind: &str| {
+            let cfg = Config {
+                node_id: "s1".into(),
+                bind: bind.into(),
+                tls_dir: Some(dir.join("s1").to_str().unwrap().into()),
+                ..Config::default()
+            };
+            cfg.save(path).unwrap();
+        };
+
+        // Nothing listening: the file.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        config_for(&free);
+        assert_eq!(change_target(None, path, None).await.unwrap(), None);
+
+        // A daemon that refuses this CLI's certificate (another cluster's,
+        // or an expired one): an error, not an edit behind its back.
+        let addr = status_answerer(&certs["s1"], "s1", "node").await;
+        config_for(&addr);
+        let other = other_dir.join("s1");
+        let err = change_target(None, path, other.to_str()).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("the change was not made"), "{err:#}");
+
+        // Something else at this config's address: not this daemon's.
+        let addr = status_answerer(&certs["s1"], "s2", "node").await;
+        config_for(&addr);
+        let err = change_target(None, path, None).await.expect_err("another node");
+        assert!(format!("{err:#}").contains("is node 's2', not 's1'"), "{err:#}");
+
+        // A listener that never says who it is.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config_for(&silent.local_addr().unwrap().to_string());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = silent.accept().await {
+                held.push(tcp);
+            }
+        });
+        tokio::time::pause();
+        let err = change_target(None, path, None).await.expect_err("no answer");
+        assert!(format!("{err:#}").contains("the change was not made"), "{err:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     #[test]

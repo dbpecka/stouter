@@ -234,6 +234,16 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
         let next = poll_fn(|cx| connection.poll_next_inbound(cx)).await;
         match next {
             Some(Ok(yamux_stream)) => {
+                // Every stream counts against its peer's open tunnels for
+                // its whole life (see MAX_TUNNELS_PER_PEER).
+                let open = match crate::node::tunnel::tunnel_slot(&state, &peer) {
+                    Ok(slot) => slot,
+                    Err(why) => {
+                        gossip::warn_rarely(&LAST_LIMIT_WARNING, format_args!("refusing a mux stream: {why}"));
+                        drop(yamux_stream);
+                        continue;
+                    }
+                };
                 // Until its tunnel is set up, a stream counts against its
                 // peer's limit across all sessions (see
                 // MAX_PENDING_STREAMS_PER_PEER): otherwise a peer could stall
@@ -252,6 +262,7 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
                 let state = state.clone();
                 let peer = peer.clone();
                 tokio::spawn(async move {
+                    let _open = open;
                     let compat = yamux_stream.compat();
                     if let Err(e) = handle_mux_stream(compat, &peer, pending, state).await {
                         debug!("mux stream error: {e}");
@@ -317,6 +328,10 @@ async fn handle_mux_stream(
             // Check if this tunnel targets us or needs relaying
             let our_node_id = &state.config.node_id;
             if !node_id.is_empty() && node_id != *our_node_id {
+                if let Some(why) = crate::node::tunnel::self_relay(Some(peer), &node_id) {
+                    send_tunnel_error(&mut stream, &why).await;
+                    bail!("{why}");
+                }
                 return crate::node::relay::relay_tunnel(
                     stream,
                     &node_id,
@@ -540,6 +555,104 @@ mod tests {
         assert_eq!(pool.drop_revoked(&revocations), 2);
         assert!(pool.contains("m:1") && !pool.contains("n:1") && !pool.contains("o:1"));
     }
+    /// Every tunnel a peer has open through a node counts against it (see
+    /// MAX_TUNNELS_PER_PEER) for as long as it is open, connected or not:
+    /// once connected it still holds buffers, and data up to its window.
+    /// And a node can't have a tunnel relayed back to itself, down its own
+    /// reverse connections, on a mux stream or a plain connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_tunnels_count_against_their_peer_and_none_is_relayed_back_to_it() {
+        use crate::state::test_support::{mesh_pair, tls_state, tls_state_with};
+        use tokio::io::AsyncReadExt as _;
+        let dir = std::env::temp_dir().join(format!("stouter_mux_open_{}_{}", std::process::id(), rand::random::<u64>()));
+        // A service that never answers, and closes when its caller does.
+        let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = service.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = service.accept().await {
+                tokio::spawn(async move {
+                    let mut sink = Vec::new();
+                    let _ = tcp.read_to_end(&mut sink).await;
+                });
+            }
+        });
+        let dc: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "g", "services": [{"name": "svc", "nodeId": "node", "nodePort": port}]}],
+        }))
+        .unwrap();
+        let node = tls_state_with(&dir, crate::config::Config { node_id: "node".into(), dynamic_config: dc, ..Default::default() }, String::new());
+        let peer = tls_state(&dir, "peer");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let node = node.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, from) = listener.accept().await.unwrap();
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mesh) = node.tls_accept(tcp).await {
+                            crate::gossip::dispatch_connection(mesh, from.to_string(), node).await;
+                        }
+                    });
+                }
+            });
+        }
+        let count = |kind: &'static str| node.peer_slots.lock().unwrap().get(&(kind, "peer".to_string())).copied().unwrap_or(0);
+        let now_ms = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let request = |to: &str| Message::TunnelRequest { node_id: to.into(), service_name: "svc".into(), timestamp_ms: now_ms(), caller: None };
+
+        let session = establish_mux_session(&addr, &peer).await.unwrap();
+        let mut connected = Vec::new();
+        for _ in 0..5 {
+            let mut stream = session.open_stream().await.unwrap().compat();
+            gossip::send_message(&mut stream, &request("node")).await.unwrap();
+            let mut status = [0u8; 1];
+            stream.read_exact(&mut status).await.unwrap();
+            assert_eq!(status, [0x00], "connected");
+            connected.push(stream);
+        }
+        assert_eq!(count("mux-stream"), 0, "none is waiting for its tunnel any more");
+        assert_eq!(count("tunnel"), 5, "but each counts while open");
+
+        // Relayed back to the peer itself: refused, on a stream and on a
+        // plain connection alike.
+        let mut stream = session.open_stream().await.unwrap().compat();
+        gossip::send_message(&mut stream, &request("peer")).await.unwrap();
+        let mut status = [0u8; 1];
+        stream.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x01]);
+        let why = crate::node::tunnel::read_tunnel_error(&mut stream).await.unwrap();
+        assert!(why.contains("to itself"), "{why}");
+        let (mut client, server) = mesh_pair(&peer, &node).await;
+        let refused = crate::node::tunnel::handle_tunnel(server, "peer".into(), "svc".into(), now_ms(), None, false, node.clone());
+        assert!(format!("{:#}", refused.await.expect_err("refused")).contains("to itself"));
+        client.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x01]);
+
+        // Closed, they count no more.
+        drop(connected);
+        let freed = async {
+            while count("tunnel") > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), freed).await.expect("places freed");
+
+        // At the limit, no more.
+        let held: Vec<_> = (0..crate::node::tunnel::MAX_TUNNELS_PER_PEER)
+            .map(|_| crate::node::tunnel::tunnel_slot(&node, "peer").unwrap())
+            .collect();
+        assert!(crate::node::tunnel::tunnel_slot(&node, "peer").is_err());
+        let (mut client, server) = mesh_pair(&peer, &node).await;
+        let refused = crate::node::tunnel::handle_tunnel(server, "node".into(), "svc".into(), now_ms(), None, false, node.clone());
+        assert!(format!("{:#}", refused.await.expect_err("refused")).contains("tunnels open"));
+        client.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x01]);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A peer can't make a node hold more than a little for streams that
     /// never finish their first message: one longer than a tunnel request is
     /// refused on its length, at most 64 may wait (the same limit as plain

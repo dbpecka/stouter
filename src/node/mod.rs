@@ -20,10 +20,10 @@ use crate::state::SharedState;
 /// Otherwise, binds to `state.config.bind` and accepts incoming connections.
 pub async fn run_node(state: Arc<SharedState>, metrics: metrics_exporter_prometheus::PrometheusHandle) -> Result<()> {
     tokio::spawn(crate::metrics::serve_metrics(state.config.api_port(), metrics, state.clone()));
-    tokio::spawn(gossip::run_sync_loop(state.clone()));
-    tokio::spawn(gossip::run_member_log(state.clone()));
-    tokio::spawn(gossip::run_config_poll_loop(state.clone()));
-    tokio::spawn(crate::health::run_health_checks(state.clone()));
+    state.spawn_essential("gossip", gossip::run_sync_loop(state.clone()));
+    state.spawn_essential("the membership log", gossip::run_member_log(state.clone()));
+    state.spawn_essential("the config poll", gossip::run_config_poll_loop(state.clone()));
+    state.spawn_essential("health checks", crate::health::run_health_checks(state.clone()));
 
     if state.config.outbound_only {
         info!(

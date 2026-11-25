@@ -13,7 +13,11 @@ const GAUGE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 
 /// Install the Prometheus metrics recorder globally.
 ///
-/// Returns a handle that can render the `/metrics` scrape endpoint.
+/// Returns a handle that can render the `/metrics` scrape endpoint. Its
+/// `run_upkeep` must be called regularly (see [`run_gauge_loop`]): until
+/// then every histogram sample (one per request, tunnel and sync) is kept,
+/// and nothing else drains them but a scrape, which many deployments never
+/// make.
 pub fn install() -> PrometheusHandle {
     let builder = metrics_exporter_prometheus::PrometheusBuilder::new()
         .idle_timeout(metrics_util::MetricKindMask::GAUGE, Some(GAUGE_IDLE_TIMEOUT));
@@ -53,14 +57,18 @@ pub async fn serve_metrics(port: u16, handle: PrometheusHandle, state: Arc<Share
 ///
 /// Gauges like pool sizes and node counts can't be emitted at callsites
 /// because they represent point-in-time snapshots. This task samples them
-/// every 5 seconds.
-pub async fn run_gauge_loop(state: Arc<SharedState>) {
+/// every 5 seconds, and runs `upkeep` (the recorder's
+/// `PrometheusHandle::run_upkeep`) as often: it folds the histogram samples
+/// recorded since into their summaries, which otherwise grow without bound
+/// unless something scrapes `/metrics`.
+pub async fn run_gauge_loop(state: Arc<SharedState>, upkeep: impl Fn()) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = interval.tick() => {}
             _ = state.shutdown.cancelled() => break,
         }
+        upkeep();
 
         // In-flight connections
         metrics::gauge!("stouter_in_flight_connections")
@@ -143,5 +151,22 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), serve_metrics(port, handle, state.clone())).await.expect("returns");
         state.shutdown.cancel();
         server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_gauge_loop_runs_the_recorders_upkeep_every_few_seconds() {
+        // Upkeep is what drains histogram samples when nothing scrapes
+        // /metrics: without it, every request ever served stays in memory.
+        let state = SharedState::new(crate::config::Config::default(), String::new(), tokio_util::sync::CancellationToken::new(), None);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = runs.clone();
+        let task = tokio::spawn(run_gauge_loop(state.clone(), move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+        let n = runs.load(std::sync::atomic::Ordering::Relaxed);
+        assert!((12..=14).contains(&n), "upkeep ran {n} times in a minute");
+        state.shutdown.cancel();
+        task.await.unwrap();
     }
 }

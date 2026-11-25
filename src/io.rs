@@ -46,6 +46,10 @@ impl AcceptBackoff {
 /// Buffer size for bidirectional proxy (64 KiB).
 const BUF_SIZE: usize = 65536;
 
+/// Buffer for the first read in each direction, before the full one is
+/// allocated (see `copy_then_shutdown`).
+const FIRST_BUF_SIZE: usize = 2048;
+
 /// Close the tunnel if no data flows in either direction for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -172,15 +176,18 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; BUF_SIZE];
+    // The full buffer only once data flows: a tunnel can stay open, idle,
+    // for long, and a node holds thousands (see MAX_TUNNELS_PER_PEER).
+    let mut first = [0u8; FIRST_BUF_SIZE];
+    let mut buf = Vec::new();
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = if buf.is_empty() { reader.read(&mut first).await? } else { reader.read(&mut buf).await? };
         if n == 0 {
             break;
         }
         activity.touch();
         // Write piecewise so a slow but progressing reader counts as activity.
-        let mut chunk = &buf[..n];
+        let mut chunk = if buf.is_empty() { &first[..n] } else { &buf[..n] };
         while !chunk.is_empty() {
             let written = writer.write(chunk).await?;
             if written == 0 {
@@ -190,6 +197,9 @@ where
             chunk = &chunk[written..];
         }
         writer.flush().await?;
+        if buf.is_empty() {
+            buf = vec![0u8; BUF_SIZE];
+        }
     }
     writer.shutdown().await
 }

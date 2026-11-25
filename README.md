@@ -90,8 +90,11 @@ the daemon was stopped (the file says something else than the last version
 in its config history) waits until the daemon has caught up with the
 cluster after starting (a first sync, or two minutes): if the cluster moved
 on meanwhile, the newer config comes first and the edit is kept as
-`<config>.unapplied`, to make again on top of it. Without
-`requireSignedConfig`, that is; with it, a hand edit isn't taken at all.
+`<config>.unapplied`, to make again on top of it. A change the CLI makes
+while the daemon is stopped (`service add`, say, on a new node not yet
+started) is such an edit too. With `requireSignedConfig`, only a signed
+change (the CLI's, with an admin certificate) is taken; a hand edit isn't
+taken at all.
 
 CLI commands that change the local file (`init`, `service add` without
 `--remote`, and so on) refuse a file they can't parse instead of starting
@@ -208,9 +211,9 @@ Services are organized into groups. Each service entry maps a name to a local po
 
 `stouter service add|rename|remove` and `stouter route set|clear`, local or `--remote`, refuse a change that would break the config, such as claiming another service's domain, or removing or renaming a service that still has routes (clear them first). A problem the config already had doesn't block unrelated changes.
 
-Without `--remote`, these commands make the change through this host's daemon when it is running (`outboundOnly` ones have no listener to ask), as if `--remote` named it: editing the file behind a running daemon's back could undo a change the daemon took in at the same moment. Otherwise they edit the file, refusing if it changed while they ran. The daemon accepts these changes from its own certificate; with `requireSignedConfig` they must still be signed by an admin. `--node` defaults to this host's node, or with `--remote`, to the node at that address.
+Without `--remote`, these commands make the change through this host's daemon when it is running (`outboundOnly` ones have no listener to ask), as if `--remote` named it: editing the file behind a running daemon's back could undo a change the daemon took in at the same moment. They edit the file only when nothing is listening at the config's `bind` (the connection is refused), refusing if the file changed while they ran; the daemon takes the change when it starts (see [Configuration](#configuration)). A daemon that is listening but refuses the CLI's certificate (another cluster's, or expired) or doesn't answer is an error, and nothing is changed. The daemon accepts these changes from its own certificate; with `requireSignedConfig` they must still be signed by an admin. `--node` defaults to this host's node, or with `--remote`, to the node at that address.
 
-CLI commands print their results on stdout, and only those: their log lines (warnings and errors; more with `RUST_LOG=info`) go to stderr. The daemon logs to stdout from `info` up (`RUST_LOG` sets the level), in colour only on a terminal.
+CLI commands print their results on stdout, and only those: their log lines (warnings and errors; more with `RUST_LOG=info`) go to stderr. A command whose output is cut short (`stouter config history | head`) ends as Unix tools do, by SIGPIPE (status 141), with nothing on stderr; a daemon closing the connection on it is an error, reported (status 1). The daemon logs to stdout from `info` up (`RUST_LOG` sets the level), in colour only on a terminal.
 
 `stouter service move` copies a service from one cluster to another and then removes it from the source. It refuses to move onto an instance the destination already has (it would replace it, and a rollback would then delete it). If the source doesn't answer the remove, it checks whether the service is still there before rolling the add back, so the service isn't left in neither cluster.
 
@@ -439,7 +442,13 @@ On `SIGTERM` (what `docker stop` sends) or `SIGINT`, stouter broadcasts
 `NodeLeave`, stops accepting, refuses new tunnels (subscribers retry another
 node) and waits up to 30s for in-flight tunnels and requests to finish. Idle
 pooled connections and mux sessions don't count, so an idle daemon exits at
-once. A second signal during the drain exits at once (status 1). Docker's
+once. A second signal during the drain exits at once (status 1). If one of
+the daemon's background loops (gossip, the config poll, health checks, and
+so on) ever stops, the process doesn't carry on without it, looking
+healthy: it logs why, drains the same way and exits with status 1, for
+Docker's or systemd's restart policy to start it again. A closed stdout
+(`stouter | logger` whose reader died) stops nothing: log lines and config
+dumps that can't be written are dropped. Docker's
 default stop timeout is 10s; pass `-t 30` to `docker stop` (or
 `--stop-timeout 30` to `docker run`) to give long transfers the full window.
 
@@ -627,6 +636,12 @@ Limits, so one peer can't exhaust a node:
   GiB). A relay refuses at once a tunnel to a node that keeps no reverse
   connections there (none registered in the last two minutes), rather than
   hold it while waiting for one.
+- One peer may have at most 4096 tunnels open through a node at once, on
+  plain connections and mux streams alike, served there or relayed, for as
+  long as each is open: a connected tunnel still holds buffers, and data up
+  to its window, whether or not anything reads it. A node can't have a
+  tunnel relayed back to itself (down its own reverse connections): it
+  reaches its own services locally.
   Connections use TCP keepalive (probes after 30s idle, every 10s, 3 tries),
   so an idle one whose peer vanished is closed within about a minute. So is
   one with data waiting to be acknowledged, after 60s of retransmitting
@@ -862,6 +877,16 @@ any node can relay a signed config but none can alter it.
   `config rollback --to N` puts back only a config that is, as signed,
   version N. Nor does `config pull` write an unsigned config over a file
   that holds a signed one.
+- After a signed change made with `--remote` (or through this host's
+  daemon), the CLI's config file holds the config it signed, as after
+  `config push`: the CLI then trusts at least that version, its
+  revocations above all. An admin who revokes a leaked admin key with
+  `cert revoke --remote` is protected from configs forged with it from then
+  on. Not over edits in the file not yet pushed (the CLI says so, if they
+  keep a revocation out), nor over another cluster's config (`service
+  move`). Other admins' CLIs learn of a revocation when they `config
+  pull`: after revoking an admin certificate, have every admin pull, and
+  drop the revoked CN from `adminCns` in their configs.
 - A node starts from the text an admin signed, not from edits made around
   the signature in its config file; it logs that it ignores them.
 - Editing a config file by hand no longer changes anything: the node logs a
@@ -938,7 +963,9 @@ The API also serves `GET /metrics` (Prometheus) and `GET /__health`. A
 port (`127.0.0.1:5381`, or `apiPort`), so what nodes record (tunnels they
 relay and serve, gossip) can be scraped too. If that port is taken, for
 example by a subscriber on the same host, the node logs a warning and runs
-without it: give one of them another `apiPort`.
+without it: give one of them another `apiPort`. Timings (request, tunnel
+setup and sync durations) are folded into their summaries every 5 seconds,
+so a daemon nothing scrapes doesn't keep every sample.
 
 ### Calling Services from Another Node
 

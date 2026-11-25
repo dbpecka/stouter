@@ -55,6 +55,31 @@ pub(crate) async fn read_tunnel_error<R: AsyncRead + Unpin>(stream: &mut R) -> R
     .map_err(|_| anyhow::anyhow!("tunnel error message not sent in time"))?
 }
 
+/// Most tunnels one peer may have open through this node at once: on plain
+/// connections and mux streams alike, served here or relayed, for as long
+/// as each is open. Each holds memory (buffers, and data up to its window)
+/// and, relayed, a connection to the NAT'd node, whether or not anything
+/// reads it: uncapped, one member could make a node hold gigabytes. Far
+/// more than a subscriber keeps open to one node.
+pub(crate) const MAX_TUNNELS_PER_PEER: usize = 4096;
+
+/// A place among `peer`'s open tunnels (see [`MAX_TUNNELS_PER_PEER`]),
+/// held for the tunnel's whole life; or why there is none.
+pub(crate) fn tunnel_slot(state: &Arc<SharedState>, peer: &str) -> std::result::Result<crate::state::PeerSlot, String> {
+    state
+        .try_peer_slot("tunnel", peer, MAX_TUNNELS_PER_PEER)
+        .ok_or_else(|| format!("'{peer}' already has {MAX_TUNNELS_PER_PEER} tunnels open through this node"))
+}
+
+/// Why a tunnel to `target` that `caller` asks this node to relay is
+/// refused, if it is: one back to the caller itself, down the reverse
+/// connections it keeps here. Never needed (a node reaches its own
+/// services locally), and a way for a node to hold tunnels here that
+/// nothing on its side reads.
+pub(crate) fn self_relay(caller: Option<&str>, target: &str) -> Option<String> {
+    (caller == Some(target)).then(|| format!("node {target} asked to be relayed a tunnel to itself"))
+}
+
 /// Refuse a new tunnel once shutdown has begun, so a draining node only
 /// finishes the work it already has. The subscriber sees the error and tries
 /// another node.
@@ -103,9 +128,28 @@ pub async fn handle_tunnel(
         bail!("{msg}");
     }
 
+    // Counted against the peer's tunnels while open. Not one that came on
+    // a reverse connection this node keeps at a relay: this node opened
+    // that connection, and the certificate at its other end is the relay's.
+    let _open = if via_relay {
+        None
+    } else {
+        match tunnel_slot(&state, client.peer_cn().unwrap_or_default()) {
+            Ok(slot) => Some(slot),
+            Err(why) => {
+                send_tunnel_error(&mut client, &why).await;
+                bail!("{why}");
+            }
+        }
+    };
+
     // --- Check if this tunnel targets us or needs relaying ---
     let our_node_id = &state.config.node_id;
     if !node_id.is_empty() && node_id != *our_node_id {
+        if let Some(why) = self_relay(client.peer_cn(), &node_id) {
+            send_tunnel_error(&mut client, &why).await;
+            bail!("{why}");
+        }
         return super::relay::relay_tunnel(client, &node_id, &service_name, timestamp_ms, caller, None, &state)
             .await;
     }

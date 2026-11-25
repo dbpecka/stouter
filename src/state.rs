@@ -433,6 +433,10 @@ pub struct SharedState {
     /// TLS context when `tls_dir` is configured; `None` → plain TCP.
     pub tls: Option<Arc<TlsContext>>,
     pub shutdown: CancellationToken,
+    /// Cancelled when a task the daemon can't run without (see
+    /// [`SharedState::spawn_essential`]) ended before shutdown: the daemon
+    /// then drains and exits with an error, for whatever runs it to restart.
+    pub failed: CancellationToken,
     pub in_flight: Arc<InFlightTracker>,
     /// Span exporter, set at daemon start when `tracing` is configured.
     pub tracer: std::sync::OnceLock<Arc<crate::telemetry::Tracer>>,
@@ -569,6 +573,7 @@ impl SharedState {
             mux_pool: Arc::new(crate::mux::MuxPool::new()),
             tls: tls.map(Arc::new),
             shutdown,
+            failed: CancellationToken::new(),
             in_flight: InFlightTracker::new(),
             tracer: std::sync::OnceLock::new(),
             heartbeat: AtomicU64::new(0),
@@ -899,6 +904,38 @@ impl SharedState {
 
     /// Take one of `peer`'s at most `limit` connections of `kind`, or `None`
     /// if it already holds them all.
+    /// Run `task`, one of the loops the daemon can't do without (gossip,
+    /// the config poll, health checks, ...), which only ever end at
+    /// shutdown. If it ends before then (a panic: tokio would otherwise
+    /// just drop the task, leaving a process that looks healthy but no
+    /// longer gossips, say), the daemon is marked [`failed`](Self::failed).
+    pub fn spawn_essential<F>(self: &Arc<Self>, name: &'static str, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(task);
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let why = match handle.await {
+                Ok(()) => "it returned".to_string(),
+                Err(e) if e.is_panic() => {
+                    let panic = e.into_panic();
+                    let message = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("no message");
+                    format!("it panicked: {message}")
+                }
+                Err(e) => e.to_string(),
+            };
+            if !state.shutdown.is_cancelled() {
+                tracing::error!("{name} stopped ({why}): shutting down, to be restarted");
+                state.failed.cancel();
+            }
+        });
+    }
+
     pub fn try_peer_slot(self: &Arc<Self>, kind: &'static str, peer: &str, limit: usize) -> Option<PeerSlot> {
         let key = (kind, peer.to_string());
         let mut slots = self.peer_slots.lock().unwrap();
@@ -1053,6 +1090,27 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_essential_task_that_ends_early_fails_the_daemon_and_one_at_shutdown_doesnt() {
+        let state = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
+        // Ending at shutdown is what these loops do.
+        let stops = state.clone();
+        state.spawn_essential("a loop", async move { stops.shutdown.cancelled().await });
+        state.shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!state.failed.is_cancelled(), "ending at shutdown is no failure");
+
+        // A panic anywhere else (printing to a closed stdout, say) is.
+        let state = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
+        state.spawn_essential("the config poll", async { panic!("failed printing to stdout: Broken pipe") });
+        tokio::time::timeout(Duration::from_secs(5), state.failed.cancelled()).await.expect("the daemon is marked failed");
+
+        // So is just returning.
+        let state = SharedState::new(Config::default(), String::new(), CancellationToken::new(), None);
+        state.spawn_essential("gossip", async {});
+        tokio::time::timeout(Duration::from_secs(5), state.failed.cancelled()).await.expect("the daemon is marked failed");
+    }
 
     #[tokio::test(start_paused = true)]
     async fn wait_zero_returns_when_the_last_guard_drops() {

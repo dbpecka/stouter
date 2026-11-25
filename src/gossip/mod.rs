@@ -991,11 +991,16 @@ async fn send_to_peer(addr: &str, msg: &Message, state: &Arc<SharedState>) -> Re
 // State helpers
 // ---------------------------------------------------------------------------
 
-/// Print the current dynamic config as pretty JSON to stdout.
+/// Print the current dynamic config as pretty JSON to stdout. Failing to
+/// (stdout closed) is no reason to stop: `println!` would panic, ending
+/// the task that adopted the config, the sync or config poll loop.
 async fn print_dynamic_config(state: &Arc<SharedState>) {
+    use std::io::Write;
     let dc = state.dynamic_config.read().await.clone();
     match serde_json::to_string_pretty(&dc) {
-        Ok(json) => println!("{json}"),
+        Ok(json) => {
+            let _ = writeln!(std::io::stdout().lock(), "{json}");
+        }
         Err(e) => error!("failed to serialize dynamic config for display: {e}"),
     }
 }
