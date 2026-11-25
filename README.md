@@ -537,10 +537,13 @@ non-zero on a failure (`KEEP_LOGS=1` keeps the logs of a failed run):
 | `docker-stop.sh` | `docker stop` on stouter as a container's PID 1: it leaves, drains and exits 0 within seconds | Docker, the `stouter:latest` image |
 | `deploy-host.sh [user@host]` | `deploy.sh` against a real host: the container runs and answers, a redeploy keeps the CA, a config the daemon can't start with fails the deploy before the running container is touched, one it can't stay up with fails it after | ssh with keys, sudo and Docker on the host |
 
-CI (`.github/workflows/ci.yml`) runs clippy and the tests on Linux, the
-tests on macOS and Windows, a build check with Rust 1.88 (the Docker
-image's), and all eight scripts, `deploy-host.sh` over ssh from the runner
-to itself.
+CI runs on Woodpecker (`.woodpecker/`, at https://wp.pecka.cloud): clippy
+and the tests on Linux, a build check with Rust 1.88 (the Docker image's),
+and all eight scripts, `deploy-host.sh` over ssh from a container running
+its own Docker to itself (`multihost.sh` and the Docker scripts run
+privileged, so the repo is trusted there). GitHub Actions
+(`.github/workflows/ci.yml`) runs the tests on macOS and Windows, and
+builds releases (`release.yml`, made by cargo-dist).
 
 ---
 
