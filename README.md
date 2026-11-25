@@ -88,7 +88,8 @@ revocation) is taken without raising its version by hand: the daemon gives
 it the next version (it checks the file every 10 seconds). One made while
 the daemon was stopped (the file says something else than the last version
 in its config history) waits until the daemon has caught up with the
-cluster after starting (a first sync, or two minutes): if the cluster moved
+cluster after starting (a first sync, or two minutes; a node with no
+`knownNodes` waits for its peers to sync with it too): if the cluster moved
 on meanwhile, the newer config comes first and the edit is kept as
 `<config>.unapplied`, to make again on top of it. A change the CLI makes
 while the daemon is stopped (`service add`, say, on a new node not yet
@@ -281,13 +282,23 @@ Subscribe nodes can filter which service groups they proxy:
 On first startup, stouter generates a cluster CA and node certificate automatically. For multi-node clusters, issue certificates from the CA node:
 
 ```sh
-stouter cert issue --node host2 --out /etc/stouter/tls/
+stouter cert issue --node host2 --out host2-tls
 ```
 
-Copy the resulting files to the new node's `tlsDir` before starting it.
+Copy `ca.crt`, `node.crt` and `node.key` from `host2-tls` to the new node's
+`tlsDir` before starting it, and never `ca.key`: whoever holds it can issue
+certificates for any name. `cert issue` won't write beside a `ca.key` (the
+CA node's own `tlsDir`, say), nor over another node's certificate. A node
+started before its certificates are in place makes a CA of its own (it
+warns if its config lists peers) and can't join: stop it, remove its
+`ca.key`, copy the files in and start it again. A `ca.key` that isn't the
+key of the `ca.crt` beside it (the cluster's, copied in over the node's
+own) is refused, as is a `node.key` that isn't `node.crt`'s. A node whose
+every sync has failed for a minute says so, at warn, every ten minutes.
 
 **Certificate loading precedence:**
 1. `ca.crt` + `ca.key` present → load CA, generate fresh node cert in memory
+   (a `node.crt` there is not used)
 2. `ca.crt` + `node.crt` + `node.key` present → use pre-issued cert
 3. Nothing present → generate new CA (written to disk) and node cert (memory only)
 
@@ -460,12 +471,16 @@ when it lies outside the config
 directory. It also takes only cluster names of letters, digits, `-` and `_`
 (they become remote paths), but not `build` or `config` (the default
 cluster's own directories), and uploads the repository it is in, wherever
-it's run from.
+it's run from: only the files git tracks, as they are in the working tree
+(`git add` a new file to deploy it), so keys, certificates and configs left
+in the directory (`init` and `cert issue` write there by default) never
+leave the machine.
 
 Before replacing the running container, `deploy.sh` checks the host's
-config with the new image (`stouter check --local`: what would stop the
-daemon from starting) and stops there if it fails, leaving the running
-container as it is. After starting the new one it waits 5 seconds
+config and the certificates in its `tlsDir` with the new image (`stouter
+check --local`: what would stop the daemon from starting, an incomplete set
+of certificates or a key that isn't its certificate's among them) and stops
+there if it fails, leaving the running container as it is. After starting the new one it waits 5 seconds
 (`DEPLOY_SETTLE_SECONDS`) and fails, printing its last log lines, if the
 container isn't running or has been restarted: `docker ps` says "Up" even
 of a daemon that exits at once and is restarted over and over. If the new
@@ -552,10 +567,9 @@ On receiving a config:
   nodes) are settled the same way everywhere, so the cluster can't stay
   split: the one revoking more certificates wins (so a change made without
   having seen a revocation can't undo it), then by the `changedBy` node that
-  made each, then by content. Two signed configs signed more than an hour
-  apart (on either side of a partition, say) are settled by when instead:
-  the later wins, as nodes refuse a config signed that long before the one
-  they hold. Every node that drops a revocation this way logs a warning
+  made each, then by content. Before all that, a config whose signer's
+  certificate has expired loses to one whose signer's hasn't, as running
+  nodes refuse it. Every node that drops a revocation this way logs a warning
   naming it. Nodes running an earlier version settle ties without either
   rule, so in a mixed cluster such a tie can stay split until the next
   change. Between one
@@ -634,7 +648,7 @@ Limits, so one peer can't exhaust a node:
   512 such streams, across all its sessions (128 MiB). A mux session may
   buffer at most 128 MiB unread across its streams (yamux's default is 1
   GiB). A relay refuses at once a tunnel to a node that keeps no reverse
-  connections there (none registered in the last two minutes), rather than
+  connections there (none registered or used in the last two minutes), rather than
   hold it while waiting for one.
 - One peer may have at most 4096 tunnels open through a node at once, on
   plain connections and mux streams alike, served there or relayed, for as
@@ -728,7 +742,7 @@ to make subscribers proxy it as HTTP/1.1 instead of a byte stream:
 - **Per-request load balancing** over pooled keep-alive connections to each
   node, so one long-lived client connection is still spread across instances,
   and tunnels are reused instead of opened per request.
-- **Timeouts:** optional `requestTimeoutMs` per instance: the time allowed
+- **Timeouts:** optional `requestTimeoutMs` per instance (at least 10): the time allowed
   for response headers, counted from when the tunnel to the node is up;
   expiry returns `504`. Setting up a new tunnel may take as long again: one
   that takes longer counts as a failed connection, so the node is charged
@@ -906,8 +920,11 @@ any node can relay a signed config but none can alter it.
   signed change.
 - An expired key that wasn't revoked can still sign, dating the config back
   into its certificate's life. So:
-  - Nodes refuse a config signed more than an hour before the one they
-    hold.
+  - Nodes refuse a config from an expired signer signed more than an hour
+    before the one they hold. (From a signer still valid, an earlier date
+    is no reason to refuse: such a key can sign one dated now. A config
+    made on the other side of a partition, earlier but at a higher version,
+    is taken.)
   - A running node takes no config whose signer's certificate has expired;
     only a node catching up in its first two minutes after starting does
     (it can't tell one from the cluster's config, signed in time).

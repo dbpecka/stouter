@@ -228,9 +228,23 @@ impl<T: Send + tokio::io::AsyncRead + Unpin> StreamPool<T> {
 
     /// Add an idle connection for `key` and wake one waiter.
     pub fn push(&self, key: String, stream: T) {
+        if self.push_capped(key, stream, usize::MAX).is_err() {
+            unreachable!("no limit to reach");
+        }
+    }
+
+    /// [`push`](Self::push), unless `key` already has `limit` idle
+    /// connections: then the stream is handed back, with that count.
+    /// Counted and added under one lock, so connections arriving together
+    /// can't all slip in under the limit.
+    pub fn push_capped(&self, key: String, stream: T, limit: usize) -> std::result::Result<(), (T, usize)> {
         {
             let mut conns = self.connections.lock().unwrap();
-            conns.entry(key.clone()).or_default().push(stream);
+            let idle = conns.entry(key.clone()).or_default();
+            if idle.len() >= limit {
+                return Err((stream, idle.len()));
+            }
+            idle.push(stream);
         }
         let notify = {
             let notifiers = self.notifiers.lock().unwrap();
@@ -239,6 +253,7 @@ impl<T: Send + tokio::io::AsyncRead + Unpin> StreamPool<T> {
         if let Some(n) = notify {
             n.notify_one();
         }
+        Ok(())
     }
 
     /// Take a connection, waiting up to `timeout` for one to become available.
@@ -955,12 +970,12 @@ impl SharedState {
     }
 
     /// Whether this node has caught up with the cluster since it started:
-    /// it merged a sync with a peer, has no peers to sync with, or is past
-    /// [`CATCH_UP`].
+    /// it merged a sync with a peer, or is past [`CATCH_UP`]. Not just for
+    /// having no peers to sync with: a node with no `knownNodes` (the one
+    /// the others list, often) knows of none at first, after every
+    /// restart, though peers are on their way to sync with it.
     pub fn caught_up(&self) -> bool {
-        self.synced.load(std::sync::atomic::Ordering::Relaxed)
-            || !self.catching_up()
-            || (self.bootstrap_peers.is_empty() && self.known_nodes.load().is_empty())
+        self.synced.load(std::sync::atomic::Ordering::Relaxed) || !self.catching_up()
     }
 
     /// Note that relay `relay` (a node id) didn't answer a tunnel in time:
@@ -983,6 +998,15 @@ impl SharedState {
         let mut relayed = self.relayed_here.lock().unwrap();
         relayed.retain(|_, at| at.elapsed() < RELAYED_HERE_LATELY);
         relayed.insert(node.to_string(), std::time::Instant::now());
+    }
+
+    /// Make `node`'s last reverse connection here older than "lately".
+    #[cfg(test)]
+    pub fn age_relayed_here(&self, node: &str) {
+        let long_ago = std::time::Instant::now().checked_sub(RELAYED_HERE_LATELY + Duration::from_secs(1));
+        if let Some(at) = long_ago {
+            self.relayed_here.lock().unwrap().insert(node.to_string(), at);
+        }
     }
 
     /// Whether NAT'd node `node` registered a reverse connection here in the
@@ -1090,6 +1114,17 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_push_counts_and_adds_as_one() {
+        let pool: StreamPool<tokio::io::Empty> = StreamPool::new();
+        assert!(pool.push_capped("x".into(), tokio::io::empty(), 2).is_ok());
+        assert!(pool.push_capped("x".into(), tokio::io::empty(), 2).is_ok());
+        let refused = pool.push_capped("x".into(), tokio::io::empty(), 2);
+        assert!(matches!(refused, Err((_, 2))), "a third is handed back");
+        assert_eq!(pool.count("x"), 2);
+        assert!(pool.push_capped("y".into(), tokio::io::empty(), 2).is_ok(), "each key has its own");
+    }
 
     #[tokio::test]
     async fn an_essential_task_that_ends_early_fails_the_daemon_and_one_at_shutdown_doesnt() {

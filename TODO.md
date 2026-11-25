@@ -356,16 +356,18 @@ reproduced or checked against the code. Numbered on from the lists above.
   `outboundOnly` node stopped gossiping).
   Fixed: the dump ignores write errors, the log drops lines it can't write, and a background loop that stops makes the daemon drain and exit with status 1, to be restarted.
 
-- [ ] **55. A higher version signed over an hour earlier splits a signed cluster** after a
+- [x] **55. A higher version signed over an hour earlier splits a signed cluster** after a
   partition heals (side B refuses side A's v12 as signed too early; side A
   ignores B's older v11), until the next change. The warning blames clocks.
   Fix: apply `signed_too_early` only when the signer's certificate has
   expired by now (`src/signing.rs:243`).
+  Fixed: only a config from an expired signer is refused as signed too early; the same-version tie-break puts an expired signer's config last (as running nodes refuse it) instead of comparing signing times.
 
-- [ ] **56. A node with no `knownNodes` counts as caught up at once,** so its offline
+- [x] **56. A node with no `knownNodes` counts as caught up at once,** so its offline
   edit is taken before any peer syncs, then lost with no `.unapplied` copy
   (`src/state.rs` `caught_up`). Fix: drop the "no peers" shortcut, or keep
   the pre-edit text in `file_config` until the edit survives a sync.
+  Fixed: knowing no peers no longer counts as caught up; such a node waits for a peer's sync, or two minutes. (Left: a sync from a peer that is itself behind still counts.)
 
 - [ ] **57. With `requireSignedConfig`, any member can hold the config write lock** with
   large configs carrying junk signatures: `adopt_if_newer` decodes and
@@ -373,18 +375,22 @@ reproduced or checked against the code. Numbered on from the lists above.
   senders). Fix: refuse oversized signed text first; verify outside the
   lock with a per-peer slot; remember the last refused signature.
 
-- [ ] **58. `ca.key` is never checked against `ca.crt`** (`src/pki.rs` `load_ca`). A node
+- [x] **58. `ca.key` is never checked against `ca.crt`** (`src/pki.rs` `load_ca`). A node
   deployed before its certificates are copied in makes its own CA; copying
   the cluster's in afterwards leaves a mismatched key, accepted silently:
   the node runs isolated with nothing logged at warn. Fix: refuse a
   mismatched key; warn when a node with `knownNodes` makes a new CA; log
   repeated handshake failures at warn.
+  Fixed: a `ca.key` that isn't `ca.crt`'s key is refused (so is a `node.key` that isn't `node.crt`'s), saying to remove it; a node making a new CA while its config lists peers warns; a node whose every sync has failed for a minute warns (every ten minutes).
 
-- [ ] **59. The README's `cert issue --out /etc/stouter/tls/` overwrites the CA node's own
-  `node.crt` and `node.key`** with the new node's (its example tlsDir). The
-  CA node then runs as itself with the other node's certificate, and that
-  node gets the same key. Fix: refuse to write over an existing `node.key`
-  (or into the CA's own tlsDir); fix the example.
+- [x] **59. The README's `cert issue --out /etc/stouter/tls/` writes the new node's key
+  into the CA node's own tlsDir** (its example tlsDir), beside `ca.key`;
+  "copy the resulting files" then copies `ca.key` along, making the new node
+  a CA too (able to issue certificates for any name). (First reported as the
+  CA node taking the other node's certificate: it doesn't, as its own lives
+  in memory, made from `ca.key` at each start.) Fix: refuse to write beside
+  a `ca.key` or over another node's certificate; fix the example.
+  Fixed: `cert issue` refuses an `--out` holding `ca.key`, or another node's certificate (the same node's is replaced, as before); the README issues into `host2-tls` and says to copy all but `ca.key`; the "no CA" error says to run it on the CA node instead of starting a daemon (which makes a second CA).
 
 ## Low
 
@@ -393,30 +399,34 @@ reproduced or checked against the code. Numbered on from the lists above.
   with the 8 MiB cap); the plain-connection dispatcher likewise. The
   attacker sends every byte held. Fix: cap a reverse connection's message
   at the tunnel-request size; a deadline once a length prefix arrives.
-- [ ] **61. A relay refuses a burst of tunnels after a quiet spell:** `relayed_here` is
+- [x] **61. A relay refuses a burst of tunnels after a quiet spell:** `relayed_here` is
   refreshed only on registration, so once idle connections registered over
   two minutes ago are used up, the next tunnels are refused at once while
   replacements register. Fix: refresh it when a reverse connection is taken.
+  Fixed: taking a reverse connection counts as relaying lately, so the burst's later tunnels wait for the replacements.
 - [ ] **62. `config rollback` and `service move` accept history entries forged with an expired admin key.**
   Fix: refuse a fetched entry whose signer has expired unless accepted
   explicitly, or it matches the local history.
-- [ ] **63. deploy.sh's pre-check ignores tlsDir:** a missing `node.key` passes `check
+- [x] **63. deploy.sh's pre-check ignores tlsDir:** a missing `node.key` passes `check
   --local` and the new container crash-loops. Fix: mount tlsDir in the
   check, and have `check --local` check the certificate set (and #58).
+  Fixed: `check --local` checks the certificates as the daemon would load them (read only) and warns when it would make a new CA though peers are listed; deploy.sh mounts tlsDir (read only) for the check.
 - [ ] **64. The nonce cache caps a caller at about 143 tunnels/s per node** to policy
   services (10,000 per signer per 70 s), and rescans the cache on every call
   at the cap. Fix: scale the cap, prune incrementally.
-- [ ] **65. The same-version tie-break can cycle between three configs** signed 40
+- [x] **65. The same-version tie-break can cycle between three configs** signed 40
   minutes apart (`src/config.rs` `supersedes`); it settles in a live
   cluster. Fix: a total order (#55 removes most of the need).
+  Fixed with #55: the tie-break compares each config's own properties (signer expired, revocations, changedBy, content), a total order.
 - [ ] **66. The #35 check is skipped on a daemon's word** (`config pull` with a daemon
   saying `require_signed_config: false`). Fix: treat the cluster as signed
   when the local file holds a verified signed config.
 - [ ] **67. Relay retries resend the caller's nonce,** so the NAT'd node refuses the retry
   as a replay and the real cause is lost. Fix: retry only when the first
   send failed.
-- [ ] **68. `requestTimeoutMs: 0` is accepted,** then fails every request and ejects
+- [x] **68. `requestTimeoutMs: 0` is accepted,** then fails every request and ejects
   every node. Fix: a minimum in `config_problems`.
+  Fixed: below 10 ms is a config problem (changes adding it are refused).
 - [ ] **69. Nonces expire by the monotonic clock, freshness by the wall clock,** so a
   clock stepped back allows one replay (code reading only).
 - [ ] **70. Smaller items:** deploy.sh's `-r` help says it updates the config (it never
@@ -427,8 +437,10 @@ reproduced or checked against the code. Numbered on from the lists above.
   that changes nothing bumps the version; `config push` writes over a newer
   config a local daemon persisted; the daemon does blocking file I/O under
   the config lock.
-- [ ] **71. The idle reverse-connection cap can be passed by one** (found running
+  Fixed: deploy.sh uploads only the files git tracks (keys never), and its `-r` help says an existing config is never replaced; `cert issue` without a CA says to run it on the CA node (#59). Open: the `adminCns` wording, no-op `service add`, `config push` over a newer persisted config, blocking file I/O under the config lock.
+- [x] **71. The idle reverse-connection cap can be passed by one** (found running
   `caps.sh`: 1025 kept, once in four runs): `handle_reverse_registration`
   counts the pool, awaits the known-nodes update, then pushes, so
   registrations arriving together all pass at 1023. Fix: check and push
   under one lock (a capped `StreamPool::push`).
+  Fixed: the registration is counted again as it goes into the pool, under the pool's lock.

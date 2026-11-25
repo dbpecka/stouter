@@ -724,6 +724,10 @@ fn dialable(state: &SharedState, addr: &str) -> bool {
 pub async fn run_sync_loop(state: Arc<SharedState>) {
     let mut interval = time::interval(Duration::from_secs(10));
     let mut round: u64 = 0;
+    // When a sync last worked (or the loop started), and when that last
+    // went unsaid for too long: see SYNCS_FAILING_WARN_AFTER.
+    let mut last_synced = time::Instant::now();
+    let mut warned_at: Option<time::Instant> = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
@@ -764,12 +768,17 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
             use rand::seq::IndexedRandom;
             peers.choose_multiple(&mut rand::rng(), BEAT_SOURCES).collect()
         };
-        futures::future::join_all(peers.iter().map(|addr| {
+        let failures = futures::future::join_all(peers.iter().map(|addr| {
             let state = &state;
             let want_beats = beat_sources.contains(addr);
             async move {
                 let start = std::time::Instant::now();
                 let result = time::timeout(Duration::from_secs(10), sync_with_peer(state, addr, want_beats)).await;
+                let failure = match &result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(format!("{addr}: {e:#}")),
+                    Err(_) => Some(format!("{addr}: timed out")),
+                };
                 match &result {
                     Ok(Err(e)) => {
                         metrics::counter!("stouter_gossip_syncs_total", "result" => "error").increment(1);
@@ -791,13 +800,36 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
                 } else {
                     backoff.failed(addr, time::Instant::now());
                 }
+                failure
             }
         }))
         .await;
+        // Every sync failing for a while (each logged only at debug) is
+        // what a node cut off from its cluster looks like: certificates
+        // from another CA, say. Said at warn, now and then.
+        if failures.iter().any(Option::is_none) {
+            last_synced = time::Instant::now();
+            warned_at = None;
+        } else if let Some(Some(last)) = failures.last() {
+            let due = warned_at.is_none_or(|at| at.elapsed() >= SYNCS_FAILING_WARN_EVERY);
+            if last_synced.elapsed() >= SYNCS_FAILING_WARN_AFTER && due {
+                warn!(
+                    "no sync with a peer has worked for {}s (last: {last}); errors such as BadSignature or \
+                     UnknownIssuer mean this node's certificates come from another CA than its peers'",
+                    last_synced.elapsed().as_secs()
+                );
+                warned_at = Some(time::Instant::now());
+            }
+        }
 
         expire_silent_nodes(&state).await;
     }
 }
+
+/// How long every sync may fail before the sync loop says so at warn, and
+/// how often it says it again while they do.
+const SYNCS_FAILING_WARN_AFTER: Duration = Duration::from_secs(60);
+const SYNCS_FAILING_WARN_EVERY: Duration = Duration::from_secs(600);
 
 /// Most nodes held that are known only from unsigned gossip (see
 /// `merge_sync`).
@@ -2272,13 +2304,18 @@ mod tests {
     /// It starts on version 5 (see `edited_while_stopped` in main.rs), and
     /// its poll takes the edit only once caught up with the cluster.
     async fn started_after_an_offline_edit(edit: DynamicConfig) -> (Arc<SharedState>, std::path::PathBuf) {
+        started_after_an_offline_edit_knowing(edit, vec!["10.9.9.9:1".into()]).await
+    }
+
+    /// [`started_after_an_offline_edit`], with these `knownNodes`.
+    async fn started_after_an_offline_edit_knowing(edit: DynamicConfig, known_nodes: Vec<String>) -> (Arc<SharedState>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("stouter_offline_{}_{}", std::process::id(), rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stouter.json");
         let path_s = path.to_str().unwrap().to_string();
         let ran = DynamicConfig { version: 5, ..named_services(&["api"]) };
         crate::history::record(&path_s, &ran);
-        let cfg = Config { node_id: "me".into(), known_nodes: vec!["10.9.9.9:1".into()], dynamic_config: edit, ..Config::default() };
+        let cfg = Config { node_id: "me".into(), known_nodes, dynamic_config: edit, ..Config::default() };
         cfg.save(&path_s).unwrap();
         let state = SharedState::new(Config { dynamic_config: ran, ..cfg }, path_s, CancellationToken::new(), None);
         state.edited_offline.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2331,6 +2368,36 @@ mod tests {
         state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
         poll_for_a_while(&state).await;
         assert_eq!(state.dynamic_config.read().await.version, 5, "refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node with no `knownNodes` (the seed the others list) knows no peer
+    /// when it starts, but they are on their way: its offline edit still
+    /// waits for a sync, so a cluster that moved on keeps it aside.
+    #[tokio::test(start_paused = true)]
+    async fn a_seed_nodes_offline_edit_waits_for_a_sync_too() {
+        let edit = DynamicConfig { version: 5, ..named_services(&["api", "edited"]) };
+        let (state, dir) = started_after_an_offline_edit_knowing(edit.clone(), vec![]).await;
+        poll_for_a_while(&state).await;
+        assert_eq!(state.dynamic_config.read().await.version, 5, "knowing no peer yet is no reason to take it");
+        let v9 = DynamicConfig { version: 9, changed_by: "a".into(), ..named_services(&["api", "from-a"]) };
+        {
+            let mut dc = state.dynamic_config.write().await;
+            assert!(adopt_if_newer(&state, &mut dc, v9, "test"));
+        }
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_for_a_while(&state).await;
+        assert_eq!(state.dynamic_config.read().await.version, 9);
+        let aside = Config::load(&format!("{}.unapplied", state.config_path)).unwrap().dynamic_config;
+        assert_eq!(service_names(&aside), ["api", "edited"], "kept aside, not lost");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Alone for good: taken once the catch-up time is over.
+        let (state, dir) = started_after_an_offline_edit_knowing(edit, vec![]).await;
+        *state.catch_up_until.lock().unwrap() = std::time::Instant::now();
+        poll_for_a_while(&state).await;
+        let dc = state.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, service_names(&dc)), (6, vec!["api".into(), "edited".into()]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2714,7 +2781,7 @@ mod tests {
     /// whichever it had first: the later, as a node holding it refuses the
     /// earlier as signed too early.
     #[tokio::test]
-    async fn a_tie_between_configs_signed_hours_apart_converges() {
+    async fn a_tie_between_configs_signed_hours_apart_converges_on_the_one_revoking_more() {
         let c = signed_cluster();
         let path2 = c.dir.join("n2.json").to_str().unwrap().to_string();
         let cfg2 = Config {
@@ -2740,7 +2807,25 @@ mod tests {
         apply_message(&n2, Message::ConfigUpdate { config: y.clone() }, None).await;
         let (a, b) = (c.node.dynamic_config.read().await.clone(), n2.dynamic_config.read().await.clone());
         assert_eq!(a, b, "one config at version 2 everywhere");
-        assert_eq!(service_names(&a), ["api", "web"], "the later-signed one");
+        // The signer's certificate is valid, so neither is refused as
+        // signed too early: the tie goes to the revocation, as any does.
+        assert_eq!(a.revoked.nodes, ["mallory"], "the one revoking more");
+    }
+
+    /// After a partition heals: side A made v2 and v3 early, side B made its
+    /// own v2 hours later. B's nodes take A's v3, though it was signed well
+    /// before the v2 they hold (the signer's certificate is valid).
+    #[tokio::test]
+    async fn a_higher_version_signed_hours_earlier_is_taken() {
+        let c = signed_cluster();
+        let signer = crate::signing::Signer::from_material(&c.admin).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let side_b = DynamicConfig { version: 2, changed_by: "admin".into(), ..named_services(&["api", "b"]) };
+        let side_a = DynamicConfig { version: 3, changed_by: "admin".into(), ..named_services(&["api", "a", "a2"]) };
+        apply_message(&c.node, Message::ConfigUpdate { config: crate::signing::sign_at(&side_b, &signer, now).unwrap() }, None).await;
+        apply_message(&c.node, Message::ConfigUpdate { config: crate::signing::sign_at(&side_a, &signer, now - 7200).unwrap() }, None).await;
+        let held = c.node.dynamic_config.read().await.clone();
+        assert_eq!((held.version, service_names(&held)), (3, vec!["api".to_string(), "a".into(), "a2".into()]));
     }
 
     #[tokio::test(start_paused = true)]

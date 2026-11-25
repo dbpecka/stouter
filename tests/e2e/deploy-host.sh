@@ -2,9 +2,9 @@
 # deploy-host.sh [user@host]: run deploy.sh against a real host (default:
 # this one, over ssh to localhost), with a cluster name and a tlsDir outside
 # the config directory. Checks that the container runs and answers, that a
-# redeploy replaces the container but keeps the CA, that a config the
-# daemon can't start or stay up with fails the deploy (the first leaving the
-# running container alone), and that it stops cleanly.
+# redeploy replaces the container but keeps the CA, that a config (or set of
+# certificates) the daemon can't start or stay up with fails the deploy (the
+# first leaving the running container alone), and that it stops cleanly.
 #
 # Needs ssh to the host without a password prompt (keys), and sudo and
 # Docker there. deploy.sh builds the image on the host (minutes), unless
@@ -64,9 +64,17 @@ check "the CA survives the new container" test "$(ca_hash)" = "$ca_before"
 # set_config SED: edit the deployed config on the host.
 set_config() { on_host "sed -i $(shq "$1") $REMOTE/config/stouter.json"; }
 
+# Certificates half copied (ca.key gone, say): the daemon couldn't start,
+# so the deploy stops at the same check, the running container left alone.
+id_before=$(container_id)
+on_host "mv $TLS/ca.key $TLS/ca.key.away"
+if deploy -r; then fail "an incomplete set of certificates fails the deploy"; else pass "an incomplete set of certificates fails the deploy"; fi
+check "  saying why" grep -q "not a complete set" "$WORK/deploy.log"
+check "  leaving the running container as it is" test "$(container_id)" = "$id_before"
+on_host "mv $TLS/ca.key.away $TLS/ca.key"
+
 # A config the daemon can't start with: refused before the running container
 # is touched.
-id_before=$(container_id)
 set_config 's/"nodeId": "deployed"/"nodeId": "not:a:name"/'
 if deploy -r; then fail "a config the daemon would refuse fails the deploy"; else pass "a config the daemon would refuse fails the deploy"; fi
 check "  saying why" grep -q "nodeId" "$WORK/deploy.log"

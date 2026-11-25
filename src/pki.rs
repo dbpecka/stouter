@@ -168,7 +168,28 @@ pub fn issue_cert_to_dir_with(tls_dir: &str, node_id: &str, out_dir: &str, lifet
     let ca_key_path  = dir.join("ca.key");
 
     if !ca_cert_path.exists() || !ca_key_path.exists() {
-        bail!("CA not found in {tls_dir}; start the daemon once to generate it");
+        bail!(
+            "{tls_dir} holds no CA (ca.crt and ca.key): run this on the CA node (the one whose tlsDir holds ca.key), \
+             with its config"
+        );
+    }
+    let out = Path::new(out_dir);
+    // Never beside a CA's key (the CA's own tlsDir, say): copying the
+    // files to the node would copy that too, and whoever holds it can issue
+    // certificates for any name.
+    if out.join("ca.key").exists() {
+        bail!(
+            "{out_dir} holds ca.key (a CA's own directory): the files for '{node_id}' would lie beside it, and \
+             copying them could copy it along. Write them to a directory of their own (--out {node_id}-tls), and \
+             copy ca.crt, node.crt and node.key from there"
+        );
+    }
+    // Nor over another node's certificate. Over this node's own is how it
+    // is replaced by hand.
+    if let Ok(existing) = read_cert(&out.join("node.crt").to_string_lossy()) {
+        if let Some(cn) = crate::tls::cert_cn(&existing).filter(|cn| cn != node_id) {
+            bail!("{out_dir} holds the certificate of '{cn}': not writing '{node_id}''s over it; use another directory");
+        }
     }
 
     let (_, ca_cert_rcgen, ca_key) = load_ca(&ca_cert_path, &ca_key_path)?;
@@ -290,6 +311,20 @@ fn load_ca(
 
     let der = pem_to_der(&cert_pem).context("decode CA cert")?;
     let key = KeyPair::from_pem(&key_pem).context("parse CA key")?;
+    // Both from the same CA: a node started with an empty tlsDir makes a
+    // CA of its own, and the cluster's ca.crt copied in afterwards would
+    // otherwise be taken with that key, every certificate made from the
+    // pair refused by peers (and nothing said).
+    if !holds_key_of(&der, &key.public_key_der()) {
+        bail!(
+            "{} isn't the key of {}: they come from different CAs (most likely the cluster's ca.crt was copied over \
+             one this node made itself, started before its certificates were in place). A node joining a cluster \
+             needs ca.crt, node.crt and node.key from `stouter cert issue`, and no ca.key: remove {}",
+            key_path.display(),
+            cert_path.display(),
+            key_path.display()
+        );
+    }
     let params = CertificateParams::from_ca_cert_der(&der).context("parse CA cert params")?;
     let cert = params.self_signed(&key).context("re-create CA cert")?;
 
@@ -485,6 +520,14 @@ fn load_issued(
     let ca_cert_der   = pem_to_der(&ca_pem).context("decode CA cert")?;
     let node_cert_der = pem_to_der(&node_cert_pem).context("decode node cert")?;
     let node_key      = pem_to_private_key(&node_key_pem).context("decode node key")?;
+    let public = KeyPair::from_pem(&node_key_pem).map(|key| key.public_key_der());
+    if public.is_ok_and(|public| !holds_key_of(&node_cert_der, &public)) {
+        bail!(
+            "{} isn't the key of {}: copy both from the same `stouter cert issue`",
+            node_key_path.display(),
+            node_cert_path.display()
+        );
+    }
 
     info!("loaded pre-issued certificate ← {}", node_cert_path.display());
     Ok(PkiMaterial { ca_cert_der, node_cert_der, node_key })
@@ -493,6 +536,27 @@ fn load_issued(
 // ---------------------------------------------------------------------------
 // PEM decode helpers
 // ---------------------------------------------------------------------------
+
+/// Whether certificate `cert` (DER) is for the public key `public` (DER
+/// SubjectPublicKeyInfo).
+fn holds_key_of(cert: &[u8], public: &[u8]) -> bool {
+    x509_parser::parse_x509_certificate(cert).is_ok_and(|(_, cert)| cert.public_key().raw == public)
+}
+
+/// Whether `tls_dir` holds any certificate or key of ours.
+pub fn holds_certificates(tls_dir: &str) -> bool {
+    ["ca.crt", "ca.key", "node.crt", "node.key"].iter().any(|name| Path::new(tls_dir).join(name).exists())
+}
+
+/// What would stop a daemon starting with the certificates in `tls_dir`
+/// (some of the files but not a set, a key that isn't its certificate's),
+/// changing nothing. None at all is fine: the daemon makes a new CA.
+pub fn check_dir(tls_dir: &str, node_id: &str) -> Result<()> {
+    if holds_certificates(tls_dir) {
+        load_dir(tls_dir, node_id, DEFAULT_CERT_LIFETIME)?;
+    }
+    Ok(())
+}
 
 /// The (first) certificate in PEM file `path`.
 pub fn read_cert(path: &str) -> Result<CertificateDer<'static>> {
@@ -645,6 +709,72 @@ mod validity_tests {
         let pem = std::fs::read_to_string(out.join("node.crt")).unwrap();
         let (_, until) = validity(pem_to_der(&pem).unwrap().as_ref());
         assert_eq!(until.unix_timestamp(), ca_until.unix_timestamp());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node started before its certificates were in place made a CA of
+    /// its own; the cluster's files were copied in afterwards. Its ca.key
+    /// and the cluster's ca.crt don't go together: refused, saying why,
+    /// rather than taken (every certificate made from them refused by peers,
+    /// and nothing said).
+    #[test]
+    fn a_key_that_isnt_its_certificates_is_refused() {
+        let dir = temp_dir("mismatch");
+        let (cluster, joining) = (dir.join("cluster"), dir.join("joining"));
+        load_or_create(cluster.to_str().unwrap(), "ca-node").unwrap();
+        load_or_create(joining.to_str().unwrap(), "n2").unwrap(); // its own CA
+        issue_cert_to_dir(cluster.to_str().unwrap(), "n2", dir.join("issued").to_str().unwrap()).unwrap();
+        for file in ["ca.crt", "node.crt", "node.key"] {
+            std::fs::copy(dir.join("issued").join(file), joining.join(file)).unwrap();
+        }
+        let joining_s = joining.to_str().unwrap();
+        let Err(err) = load_or_create(joining_s, "n2") else { panic!("taken") };
+        assert!(format!("{err:#}").contains("isn't the key of"), "{err:#}");
+        assert!(check_dir(joining_s, "n2").is_err(), "and `check --local` says so");
+        // Without the stray ca.key, the issued set is taken.
+        std::fs::remove_file(joining.join("ca.key")).unwrap();
+        assert!(load_or_create(joining_s, "n2").is_ok());
+
+        // An issued certificate with another one's key: refused too.
+        issue_cert_to_dir(cluster.to_str().unwrap(), "n3", dir.join("other").to_str().unwrap()).unwrap();
+        std::fs::copy(dir.join("other").join("node.key"), joining.join("node.key")).unwrap();
+        let Err(err) = load_or_create(joining_s, "n2") else { panic!("taken") };
+        assert!(format!("{err:#}").contains("isn't the key of"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_dir_finds_what_would_stop_the_daemon_and_changes_nothing() {
+        let dir = temp_dir("check_dir");
+        let s = dir.to_str().unwrap();
+        assert!(check_dir(s, "n1").is_ok(), "none at all: the daemon makes a new CA");
+        assert!(!dir.exists(), "and checking made nothing");
+        load_or_create(s, "n1").unwrap();
+        assert!(check_dir(s, "n1").is_ok());
+        std::fs::remove_file(dir.join("ca.key")).unwrap();
+        let err = check_dir(s, "n1").unwrap_err();
+        assert!(format!("{err:#}").contains("not a complete set"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issued_files_never_go_beside_a_cas_key_or_over_another_nodes() {
+        let dir = temp_dir("issue_out");
+        let ca = dir.join("ca");
+        let ca_s = ca.to_str().unwrap();
+        load_or_create(ca_s, "ca-node").unwrap();
+        // The README once said `--out` the tlsDir: on the CA node, its own.
+        let err = issue_cert_to_dir(ca_s, "host2", ca_s).unwrap_err();
+        assert!(format!("{err:#}").contains("holds ca.key"), "{err:#}");
+        assert!(!ca.join("node.key").exists(), "nothing written");
+        // Over another node's certificate: no. Over the same node's (how
+        // one is replaced by hand): yes.
+        let out = dir.join("host2-tls");
+        let out_s = out.to_str().unwrap();
+        issue_cert_to_dir(ca_s, "host2", out_s).unwrap();
+        let err = issue_cert_to_dir(ca_s, "host3", out_s).unwrap_err();
+        assert!(format!("{err:#}").contains("holds the certificate of 'host2'"), "{err:#}");
+        issue_cert_to_dir(ca_s, "host2", out_s).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

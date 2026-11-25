@@ -287,20 +287,26 @@ pub fn expired_signer_refusal(config: &DynamicConfig, who: &str, until: u64) -> 
     )
 }
 
-/// Why `incoming` mustn't replace `held`, if it says it was signed more than
-/// [`SIGNING_CLOCK_SLACK`] before `held` was. A certificate is checked as of
-/// when it signed, so an expired key (from an old backup, say) can still
-/// sign configs dated within its life: this is what keeps those from
-/// replacing anything signed after it expired. Configs with no date
-/// (signed by older versions) aren't compared.
+/// Why `incoming` mustn't replace `held`, if its signer's certificate has
+/// expired and it says it was signed more than [`SIGNING_CLOCK_SLACK`]
+/// before `held` was. A certificate is checked as of when it signed, so an
+/// expired key (from an old backup, say) can still sign configs dated
+/// within its life: this is what keeps those from replacing anything
+/// signed after it expired. A key still valid gains nothing by dating a
+/// config back (it can sign one dated now), so its configs aren't
+/// compared: one made on the other side of a partition, earlier but at a
+/// higher version, must still be taken. Nor are configs with no date
+/// (signed by older versions).
 pub fn signed_too_early(incoming: &DynamicConfig, held: &DynamicConfig) -> Option<String> {
     let (Some(new), Some(old)) = (incoming.signed_at, held.signed_at) else { return None };
+    let (who, until) = expired_signer(incoming)?;
     (new + SIGNING_CLOCK_SLACK < old).then(|| {
         format!(
-            "config version {} was signed at {}, well before the config held here (version {}, signed at {}): \
-             is the signing host's clock right?",
+            "config version {} was signed at {} by '{who}', whose certificate expired {}, well before the config \
+             held here (version {}, signed at {})",
             incoming.version,
             crate::history::format_secs(new),
+            crate::history::format_secs(until),
             held.version,
             crate::history::format_secs(old)
         )
@@ -508,6 +514,12 @@ mod tests {
         // Within the slack, or with either undated (an older version's), it isn't refused.
         assert!(signed_too_early(&backdated, &DynamicConfig { signed_at: Some(issued + 600), ..held.clone() }).is_none());
         assert!(signed_too_early(&backdated, &DynamicConfig { signed_at: None, ..held.clone() }).is_none());
+        // Nor is a config signed hours before the held one by a key still
+        // valid: made on the other side of a partition, at a higher version
+        // (it could have been dated now; nothing is gained dating it back).
+        let (current, _) = setup(&dir, "admin");
+        let other_side = sign_at(&DynamicConfig { version: 9, ..sample() }, &Signer::from_material(&current).unwrap(), issued).unwrap();
+        assert!(signed_too_early(&other_side, &held).is_none());
 
         // Dated in the future (beyond the slack): refused.
         let (fresh, _) = setup(&dir, "admin");

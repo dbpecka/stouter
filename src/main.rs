@@ -461,6 +461,9 @@ async fn main() -> Result<()> {
             let tls_dir = cfg.tls_dir.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("tlsDir must be set in {}; mTLS is required", cli.config)
             })?;
+            if let Some(warning) = new_ca_warning(&cfg, tls_dir) {
+                tracing::warn!("{warning}");
+            }
             let material = pki::load_or_create_with(tls_dir, &cfg.node_id, cfg.cert_lifetime())?;
             let tls_ctx = tls::TlsContext::new(&material)?;
             tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
@@ -592,7 +595,19 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         Some(Commands::Check { local }) => {
             let result = if local {
-                Config::load(&cli.config).and_then(|cfg| cfg.validate_local())
+                // What would stop the daemon starting: its own settings, and
+                // the certificates in its tlsDir (an incomplete set, a key
+                // that isn't its certificate's).
+                Config::load(&cli.config).and_then(|cfg| {
+                    cfg.validate_local()?;
+                    if let Some(dir) = cfg.tls_dir.as_deref() {
+                        pki::check_dir(dir, &cfg.node_id).with_context(|| format!("the certificates in {dir}"))?;
+                        if let Some(warning) = new_ca_warning(&cfg, dir) {
+                            eprintln!("warning: {warning}");
+                        }
+                    }
+                    Ok(())
+                })
             } else {
                 Config::check(&cli.config).map(|_| ())
             };
@@ -1545,6 +1560,22 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// A warning, if the daemon is about to make a new cluster CA (its tlsDir
+/// holds no certificates) though its config lists peers to join: they
+/// trust only the CA they share, so the node would run cut off from them.
+/// Not refused, as the first node of a new cluster may list the others.
+fn new_ca_warning(cfg: &Config, tls_dir: &str) -> Option<String> {
+    (!pki::holds_certificates(tls_dir) && !cfg.known_nodes.is_empty()).then(|| {
+        format!(
+            "{tls_dir} holds no certificates, so the daemon makes a new cluster CA, though knownNodes lists peers: \
+             unless this is the first node of a new cluster, it won't be able to join them. Stop it, put the ca.crt, \
+             node.crt and node.key `stouter cert issue --node {}` made on the CA node in {tls_dir} (and no ca.key), \
+             and start it again",
+            cfg.node_id
+        )
+    })
 }
 
 /// The dynamic config a daemon starts with. With `requireSignedConfig`,
@@ -2619,6 +2650,28 @@ mod tests {
     }
 
     #[test]
+    fn making_a_new_ca_while_listing_peers_is_warned_about() {
+        let dir = std::env::temp_dir().join(format!("stouter_new_ca_{}_{}", std::process::id(), rand::random::<u64>()));
+        let tls = dir.to_str().unwrap();
+        let joining = Config { node_id: "n2".into(), known_nodes: vec!["10.0.0.1:7946".into()], ..Config::default() };
+        let warning = new_ca_warning(&joining, tls).expect("warned");
+        assert!(warning.contains("cert issue --node n2"), "{warning}");
+        // The first node of a cluster, listing no one: nothing to say.
+        assert!(new_ca_warning(&Config { known_nodes: vec![], ..joining.clone() }, tls).is_none());
+        // Certificates in place: nothing made, nothing to say.
+        pki::issue_cert_to_dir(pki_ca(&dir).as_str(), "n2", tls).unwrap();
+        assert!(new_ca_warning(&joining, tls).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CA beside `dir`, for issuing into it.
+    fn pki_ca(dir: &std::path::Path) -> String {
+        let ca = dir.with_extension("ca");
+        pki::load_or_create(ca.to_str().unwrap(), "ca-node").unwrap();
+        ca.to_str().unwrap().to_string()
+    }
+
+    #[test]
     fn same_settings_ignores_version_author_and_signature() {
         let a: config::DynamicConfig = serde_json::from_value(serde_json::json!({
             "version": 3, "changedBy": "admin-1",
@@ -3083,10 +3136,14 @@ mod tests {
             cfg.save(path).unwrap();
         };
 
-        // Nothing listening: the file.
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
-        config_for(&free);
+        // Nothing listening: the file. (A port held, bound but not
+        // listening, so connecting is refused; a port merely let go could
+        // go to another test running at the same time.)
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        config_for(&held.local_addr().unwrap().to_string());
         assert_eq!(change_target(None, path, None).await.unwrap(), None);
+        drop(held);
 
         // A daemon that refuses this CLI's certificate (another cluster's,
         // or an expired one): an error, not an edit behind its back.

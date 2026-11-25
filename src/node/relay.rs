@@ -140,8 +140,13 @@ pub async fn handle_reverse_registration(
     }
 
     // --- Store in reverse pool ---
+    // Counted again as it goes in: the count above was taken before the
+    // wait for the known-nodes update, and registrations arriving together
+    // would otherwise all pass it.
     state.note_relayed_here(&node_id);
-    state.reverse_pool.push(node_id, stream);
+    if let Err((_, idle)) = state.reverse_pool.push_capped(node_id.clone(), stream, MAX_IDLE_REVERSE_PER_NODE) {
+        bail!("node {node_id} already holds {idle} idle reverse connections here (limit {MAX_IDLE_REVERSE_PER_NODE})");
+    }
 
     Ok(())
 }
@@ -204,6 +209,11 @@ where
         let Some(mut stream) = state.reverse_pool.take(node_id, POOL_WAIT_TIMEOUT.min(left)).await else {
             break;
         };
+        // In use, so relayed here lately, however long ago it registered:
+        // the tunnels of a burst after a quiet spell that find the pool
+        // empty wait for the replacements now on their way, rather than
+        // being refused at once.
+        state.note_relayed_here(node_id);
         let left = deadline.saturating_duration_since(tokio::time::Instant::now()).max(Duration::from_millis(100));
         let attempt = async {
             gossip::send_message(&mut stream, &msg)
@@ -354,6 +364,35 @@ mod tests {
         )
         .await;
         assert!(waited.is_err(), "still waiting for a reverse connection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// x's idle reverse connections registered minutes ago (nothing used
+    /// them). A burst takes them all; the tunnels after wait for the
+    /// replacements x is registering, rather than being refused at once.
+    #[tokio::test]
+    async fn a_burst_after_a_quiet_spell_waits_for_the_replacements() {
+        let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let x = tls_state(&dir, "x");
+        let (mut client, server_end) = mesh_pair(&x, &relay).await;
+        relay.reverse_pool.push("x".into(), server_end);
+        relay.age_relayed_here("x");
+        // x answers the tunnel sent down it, and keeps it open.
+        let answered = tokio::spawn(async move {
+            gossip::recv_message(&mut client).await.unwrap();
+            client.write_all(&[0x00]).await.unwrap();
+            client
+        });
+        let (first, _first_ours) = tokio::io::duplex(4096);
+        let relay_first = relay.clone();
+        tokio::spawn(async move { relay_tunnel(first, "x", "svc", now_ms(), None, None, &relay_first).await });
+        let _held = answered.await.unwrap();
+        assert_eq!(relay.reverse_pool.count("x"), 0, "the burst took the only idle one");
+
+        let (next, _next_ours) = tokio::io::duplex(4096);
+        let waited = tokio::time::timeout(Duration::from_millis(300), relay_tunnel(next, "x", "svc", now_ms(), None, None, &relay)).await;
+        assert!(waited.is_err(), "waiting for a replacement, not refused: {waited:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

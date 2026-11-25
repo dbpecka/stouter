@@ -9,7 +9,8 @@ usage() {
   echo "  -c  config file to upload"
   echo "  -n  cluster name (default: 'default'). Lets multiple stouter clusters"
   echo "      coexist on one host with separate container, config, and build dir."
-  echo "  -r  restart only (skip build, just update config and restart container)"
+  echo "  -r  restart only: skip the build, upload the config only if the host has"
+  echo "      none (an existing one is never replaced), and restart the container"
   echo "  -v, --verbose  print debug logs"
   exit 1
 }
@@ -108,16 +109,28 @@ if [[ "$RESTART_ONLY" == false ]]; then
   remote_sudo "mkdir -p $RD/build && chown \"\$SUDO_UID:\$SUDO_GID\" $RD/build"
   debug "Cleaning remote build directory"
   remote_sudo "rm -rf $RD/build/*"
-  debug "Running scp (excluding target/, .git/, .idea/, *.json)"
+  # Only the files git tracks, as they are in the working tree (`git add`
+  # a new one to deploy it): never whatever else is in the directory, such
+  # as the keys and certificates `stouter init` and `stouter cert issue`
+  # write to the current directory by default.
+  STAGE=$(mktemp -d "${TMPDIR:-/tmp}/stouter-deploy.XXXXXX")
+  trap 'rm -rf "$STAGE"' EXIT
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    debug "Staging the files git tracks"
+    TREE=$(git stash create 2>/dev/null || true)
+    git archive --format=tar "${TREE:-HEAD}" | tar -xf - -C "$STAGE"
+  else
+    echo "warning: not a git checkout: uploading the directory, without keys, certificates, configs or state" >&2
+    while IFS= read -r source; do cp -R "$source" "$STAGE/"; done < <(find . -maxdepth 1 \
+      ! -name '.' ! -name 'target' ! -name '.git' ! -name '.idea' ! -name 'tls' ! -name 'tlsDir' \
+      ! -name '*.json' ! -name '*.key' ! -name '*.crt' ! -name '*.pem' \
+      ! -name '*.history' ! -name '*.state' ! -name '*.unapplied*' ! -name '*.bak*' \
+      -print)
+  fi
   # A loop rather than `mapfile`, which macOS's bash (3.2) doesn't have.
   SOURCES=()
-  while IFS= read -r source; do SOURCES+=("$source"); done < <(find . -maxdepth 1 \
-    ! -name '.' \
-    ! -name 'target' \
-    ! -name '.git' \
-    ! -name '.idea' \
-    ! -name '*.json' \
-    -print)
+  while IFS= read -r source; do SOURCES+=("$source"); done < <(find "$STAGE" -mindepth 1 -maxdepth 1 -print)
+  debug "Running scp"
   scp -r "${SOURCES[@]}" "$REMOTE_HOST:$REMOTE_DIR/build/"
   debug "SCP complete"
 fi
@@ -163,9 +176,17 @@ if ! CHECK_HELP=$(remote_sudo "docker run --rm $IMAGE_TAG check --help" 2>&1); t
 fi
 if [[ "$CHECK_HELP" == *--local* ]]; then
   echo "==> Checking the config with the new image"
+  # With its tlsDir too (read-only), as the daemon will have it: an
+  # incomplete set of certificates would stop it as surely as a bad config.
   if ! remote_sudo "
     D=$RD
-    docker run --rm --network none -v \"\$D/config:\$D/config:ro\" $IMAGE_TAG --config \"\$D/config/stouter.json\" check --local
+    set -- -v \"\$D/config:\$D/config:ro\"
+    TLS_DIR=\$(sed -n 's/.*\"tlsDir\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"\$D/config/stouter.json\" | head -n 1)
+    case \"\$TLS_DIR\" in
+      \"\$D/config\"/*) ;;
+      /*) if [ -d \"\$TLS_DIR\" ]; then set -- \"\$@\" -v \"\$TLS_DIR:\$TLS_DIR:ro\"; fi ;;
+    esac
+    docker run --rm --network none \"\$@\" $IMAGE_TAG --config \"\$D/config/stouter.json\" check --local
   "; then
     echo "error: the new daemon would not start with $REMOTE_DIR/config/stouter.json (see above): the running container is left as it is" >&2
     exit 1

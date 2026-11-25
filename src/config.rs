@@ -15,6 +15,10 @@ pub enum Mode {
     NodeSubscribe,
 }
 
+/// Least `requestTimeoutMs` a service may have: a new tunnel's setup is
+/// bounded by it too, and takes a few round trips.
+pub const MIN_REQUEST_TIMEOUT_MS: u64 = 10;
+
 /// A single service exposed by a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +41,8 @@ pub struct Service {
     /// when every instance says `http`.
     #[serde(default, skip_serializing_if = "Protocol::is_tcp")]
     pub protocol: Protocol,
-    /// HTTP only: time allowed for this instance to send response headers.
+    /// HTTP only: time allowed for this instance to send response headers
+    /// (at least [`MIN_REQUEST_TIMEOUT_MS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
     /// Path the hosting node GETs to health-check this instance; any non-2xx
@@ -468,12 +473,12 @@ impl DynamicConfig {
     /// config to an admin) can't settle the tie by dropping it, whoever made
     /// it: of two configs, the one revoking more wins, on every node.
     ///
-    /// Before all that, two configs signed more than
-    /// [`crate::signing::SIGNING_CLOCK_SLACK`] apart are settled by when:
-    /// the later wins. Nodes refuse a config signed that long before the one
-    /// they hold (see [`crate::signing::signed_too_early`]), so if the
-    /// earlier one won, the nodes holding the later would never take it and
-    /// the cluster would stay split.
+    /// Before all that, a config whose signer's certificate has expired
+    /// loses to one whose signer's hasn't: a running node refuses the first
+    /// (see `crate::signing::admit`), so if it won, the nodes holding the
+    /// other would never take it and the cluster would stay split. Each
+    /// step compares the two configs alone, so the order is total: whatever
+    /// order nodes meet three configs in, they settle on the same one.
     ///
     /// Without the tie-break, two nodes changing the config at once both
     /// make version N+1, each node keeps whichever arrived first, and the
@@ -491,15 +496,10 @@ impl DynamicConfig {
         if self == current {
             return false;
         }
-        let signed_at = |dc: &DynamicConfig| dc.signature.as_ref().and(dc.signed_at);
-        if let (Some(ours), Some(theirs)) = (signed_at(self), signed_at(current)) {
-            if ours.abs_diff(theirs) > crate::signing::SIGNING_CLOCK_SLACK {
-                return ours > theirs;
-            }
-        }
         let key = |dc: &DynamicConfig| {
             let bytes = serde_json::to_vec(dc).unwrap_or_default();
-            (dc.revoked.nodes.len() + dc.revoked.certs.len(), dc.changed_by.clone(), bytes.len(), bytes)
+            let signer_valid = crate::signing::expired_signer(dc).is_none();
+            (signer_valid, dc.revoked.nodes.len() + dc.revoked.certs.len(), dc.changed_by.clone(), bytes.len(), bytes)
         };
         key(self) > key(current)
     }
@@ -549,6 +549,14 @@ impl DynamicConfig {
                     if let Err(e) = validate_health_path(path) {
                         report(format!("service '{}/{}' on node '{}': {e}", group.name, svc.name, svc.node_id));
                     }
+                }
+                // Each new tunnel's setup gets this long too: less than a
+                // round trip, and every request fails, every node ejected.
+                if svc.request_timeout_ms.is_some_and(|ms| ms < MIN_REQUEST_TIMEOUT_MS) {
+                    report(format!(
+                        "service '{}/{}' on node '{}': requestTimeoutMs must be at least {MIN_REQUEST_TIMEOUT_MS}",
+                        group.name, svc.name, svc.node_id
+                    ));
                 }
                 for domain in &svc.domains {
                     if domain.trim().is_empty() {
@@ -2012,6 +2020,17 @@ mod tests {
     }
 
     #[test]
+    fn a_request_timeout_too_short_for_any_request_is_a_problem() {
+        let with = |ms: u64| {
+            let svc = Service { request_timeout_ms: Some(ms), ..instance("api", "n1", &[]) };
+            group_of(vec![svc]).dynamic_config.problems()
+        };
+        assert!(with(0).iter().any(|p| p.contains("requestTimeoutMs must be at least 10")), "{:?}", with(0));
+        assert!(with(MIN_REQUEST_TIMEOUT_MS - 1).iter().any(|p| p.contains("requestTimeoutMs")));
+        assert!(with(MIN_REQUEST_TIMEOUT_MS).is_empty(), "{:?}", with(MIN_REQUEST_TIMEOUT_MS));
+    }
+
+    #[test]
     fn routes_require_existing_http_service() {
         let mut dc = DynamicConfig::default();
         dc.upsert_service("g", instance("tcp-svc", "n1", &[])).unwrap();
@@ -2228,13 +2247,24 @@ mod tests {
     /// a tie, whatever else: nodes holding it would refuse the earlier one
     /// as signed too early, so it winning would leave the cluster split.
     #[test]
-    fn a_tie_between_configs_signed_hours_apart_goes_to_the_later() {
-        let signature = ConfigSignature { config_json: String::new(), signer_cert: String::new(), signature: String::new() };
-        let at = |signed_at: u64, revoke: bool| {
+    fn a_tie_goes_against_an_expired_signer_then_to_more_revocations() {
+        // A signer certificate, expired or not (only its validity and CN
+        // are read here).
+        let cert = |expired: bool| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+            params.distinguished_name.push(rcgen::DnType::CommonName, "admin");
+            let now = time::OffsetDateTime::now_utc();
+            let day = time::Duration::days(1);
+            (params.not_before, params.not_after) = if expired { (now - day * 2, now - day) } else { (now - day, now + day) };
+            params.self_signed(&key).unwrap().der().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let at = |signed_at: u64, revoke: bool, expired: bool| {
+            let signature = ConfigSignature { config_json: String::new(), signer_cert: cert(expired), signature: String::new() };
             let mut dc = DynamicConfig {
                 version: 10,
                 signed_at: Some(signed_at),
-                signature: Some(signature.clone()),
+                signature: Some(signature),
                 changed_by: "a".into(),
                 ..DynamicConfig::default()
             };
@@ -2243,16 +2273,21 @@ mod tests {
             }
             dc
         };
-        let slack = crate::signing::SIGNING_CLOCK_SLACK;
-        let (earlier, later) = (at(1_000_000, true), at(1_000_000 + slack + 1, false));
-        assert!(later.supersedes(&earlier) && !earlier.supersedes(&later));
-        // Within the slack, revocations first, as before.
-        let (earlier, later) = (at(1_000_000, true), at(1_000_000 + slack, false));
+        let hours = |n: u64| 1_000_000 + n * 3600;
+        // Signed hours apart, both signers valid: revocations, as for any
+        // tie (nodes take either, so whichever wins, all settle on it).
+        let (earlier, later) = (at(hours(0), true, false), at(hours(3), false, false));
         assert!(earlier.supersedes(&later) && !later.supersedes(&earlier));
-        // Only signed configs: an unsigned one's signedAt is a leftover.
-        let unsigned = |dc: DynamicConfig| DynamicConfig { signature: None, ..dc };
-        let (earlier, later) = (unsigned(at(1_000_000, true)), unsigned(at(1_000_000 + slack + 1, false)));
-        assert!(earlier.supersedes(&later) && !later.supersedes(&earlier));
+        // Whatever else, one whose signer expired loses (running nodes
+        // refuse it): it may not win where the other can't be replaced.
+        let (expired, valid) = (at(hours(0), true, true), at(hours(3), false, false));
+        assert!(valid.supersedes(&expired) && !expired.supersedes(&valid));
+        // Three configs at one version settle on one, met in any order.
+        let three = [at(hours(0), false, false), at(hours(1), true, false), at(hours(2), false, true)];
+        for (i, a) in three.iter().enumerate() {
+            let beaten = three.iter().filter(|b| a.supersedes(b)).count();
+            assert_eq!(beaten, [1, 2, 0][i], "config {i}");
+        }
     }
 
     #[test]
