@@ -3398,6 +3398,17 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(35)).await;
         assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0, "not every round");
         tokio::time::sleep(Duration::from_secs(60)).await;
+        // Paused time jumps to the next timer whenever the runtime idles,
+        // even with a dial still in flight on a real socket (seen on macOS):
+        // give the accept up to two seconds of real time, with the runtime
+        // kept busy so the clock stays put.
+        for _ in 0..2000 {
+            if dials.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
         assert!(dials.load(std::sync::atomic::Ordering::SeqCst) >= 1, "retried within about a minute");
         sync.abort();
     }
