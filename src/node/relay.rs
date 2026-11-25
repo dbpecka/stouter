@@ -184,6 +184,7 @@ where
     }
 
     // The caller's signature goes on as it came: the NAT'd node checks it.
+    let msg_is_signed = caller.is_some();
     let msg = Message::TunnelRequest {
         node_id: node_id.to_string(),
         service_name: service_name.to_string(),
@@ -193,8 +194,12 @@ where
 
     // Forward the request down a reverse connection and read the NAT'd
     // node's status byte. A connection can die after the pool's liveness
-    // check (or be half-dead behind a NAT), so on failure try another: no
-    // client data has been sent yet, so retrying is safe.
+    // check, so if it fails try another: no client data has been sent yet.
+    // But not after a request went out and got no answer in time: the NAT'd
+    // node may have it (still connecting to its service, say), and having
+    // noted its signed nonce, would refuse the same request again as a
+    // replay, which is all the caller would then hear. The caller tries
+    // the node's next relay instead, with a request signed afresh.
     let mut last_err: Option<anyhow::Error> = None;
     let mut ready = None;
     // All attempts within one deadline, short of the subscriber's own (15s):
@@ -232,6 +237,10 @@ where
                 break;
             }
             Ok(Err(e)) => last_err = Some(e),
+            Err(_) if msg_is_signed => {
+                last_err = Some(anyhow::anyhow!("no answer on a reverse connection within {}s", STATUS_TIMEOUT.as_secs()));
+                break;
+            }
             Err(_) => last_err = Some(anyhow::anyhow!("no answer on reverse connection")),
         }
         debug!("reverse connection for node {node_id} unusable, trying another");
@@ -336,6 +345,49 @@ mod tests {
         let why = crate::node::tunnel::read_tunnel_error(&mut ours).await.unwrap();
         assert!(why.contains("node x"), "{why}");
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signed request that went out and got no answer in time isn't sent
+    /// again down another reverse connection: the NAT'd node may have it,
+    /// and would refuse it again as a replay. One that couldn't be sent at
+    /// all (a dead connection) is.
+    #[tokio::test]
+    async fn a_signed_request_is_sent_again_only_if_it_never_went() {
+        let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let x = tls_state(&dir, "x");
+        let sub = crate::signing::Signer::from_material(&crate::pki::load_or_create(dir.to_str().unwrap(), "sub").unwrap()).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (client, server_end) = mesh_pair(&x, &relay).await;
+            relay.reverse_pool.push("x".into(), server_end);
+            held.push(client);
+        }
+        tokio::time::pause();
+        let ts = now_ms();
+        let caller = crate::signing::sign_tunnel_request(&sub, "x", "svc", ts).unwrap();
+        let (subscriber, _ours) = tokio::io::duplex(4096);
+        let err = relay_tunnel(subscriber, "x", "svc", ts, Some(caller), None, &relay).await.unwrap_err();
+        assert!(err.to_string().contains("no answer on a reverse connection"), "{err}");
+        assert_eq!(relay.reverse_pool.count("x"), 1, "the other connection wasn't used");
+
+        // A connection that's gone: the request goes down the next one.
+        held.remove(0);
+        drop(held);
+        let (client, server_end) = mesh_pair(&x, &relay).await;
+        let answered = tokio::spawn(async move {
+            let mut client = client;
+            gossip::recv_message(&mut client).await.unwrap();
+            client.write_all(&[0x00]).await.unwrap();
+            client
+        });
+        relay.reverse_pool.push("x".into(), server_end);
+        let caller = crate::signing::sign_tunnel_request(&sub, "x", "svc", ts).unwrap();
+        let (subscriber, _ours) = tokio::io::duplex(4096);
+        let relay2 = relay.clone();
+        tokio::spawn(async move { relay_tunnel(subscriber, "x", "svc", ts, Some(caller), None, &relay2).await });
+        let _client = tokio::time::timeout(Duration::from_secs(30), answered).await.expect("sent down the live one").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

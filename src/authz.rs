@@ -17,7 +17,6 @@
 //! can tamper with or cut off the tunnels that go through it.)
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 
 use crate::config::{DynamicConfig, SignedCaller};
 use crate::state::SharedState;
@@ -78,7 +77,7 @@ pub fn authorize(
             // known to be allowed, below: a refused caller would otherwise
             // fill the cache, locking allowed ones out.
             return if signer == own || may_reach(state, service, &signer) {
-                if state.tunnel_nonces.lock().unwrap().note(&signer, signed.nonce) {
+                if state.tunnel_nonces.lock().unwrap().note(&signer, signed.nonce, timestamp_ms) {
                     Ok(())
                 } else {
                     Err(format!("tunnel request to '{service}' from '{signer}' was already used (or it sent too many)"))
@@ -109,58 +108,109 @@ fn refuse(service: &str, who: &str) -> Result<(), String> {
     Err(format!("node '{who}' may not reach service '{service}' (policy)"))
 }
 
-/// How long a signed request's nonce is remembered: past the time its
-/// timestamp is accepted for (30 seconds either side).
-const NONCE_TTL: Duration = Duration::from_secs(70);
+/// How long after its timestamp a signed request's nonce is remembered:
+/// for as long as the request could still pass the freshness check (its
+/// timestamp within 30 seconds of now), and a second more. By the wall
+/// clock, as that check is: a clock stepped back can't bring back a
+/// request whose nonce was let go.
+const NONCE_KEPT_MS: u64 = 31_000;
 
 /// Most nonces remembered. Each comes from a request a cluster member
-/// signed, so only a member flooding its own requests fills it; past it,
-/// signed requests are refused until older nonces expire.
-const MAX_NONCES: usize = 100_000;
+/// signed (and this node verified), so only an allowed member flooding its
+/// own requests fills it; past it, signed requests are refused until older
+/// nonces expire. About 32 bytes each.
+const MAX_NONCES: usize = 500_000;
 
 /// Most nonces remembered for one signer: a tenth of the cache, so one
 /// allowed caller flooding its own requests can't crowd out the others.
+/// Requests are fresh for about a minute, so this is some 800 new tunnels a
+/// second from one caller to this node.
 const MAX_NONCES_PER_SIGNER: usize = MAX_NONCES / 10;
 
+/// How often every signer's expired nonces are let go (each signer's are
+/// also when it sends its next request).
+const PRUNE_EVERY_MS: u64 = 1_000;
+
 /// Recently seen nonces of signed tunnel requests, by signer.
+#[derive(Default)]
 pub struct NonceCache {
-    seen: HashMap<(String, u64), Instant>,
-    /// How many of `seen` each signer has.
-    per_signer: HashMap<String, usize>,
-    pruned: Instant,
+    signers: HashMap<std::sync::Arc<str>, SignerNonces>,
+    /// Nonces held, across signers.
+    total: usize,
+    /// When every signer's were last pruned (Unix ms).
+    pruned_ms: u64,
 }
 
-impl Default for NonceCache {
-    fn default() -> Self {
-        Self { seen: HashMap::new(), per_signer: HashMap::new(), pruned: Instant::now() }
+/// One signer's remembered nonces.
+#[derive(Default)]
+struct SignerNonces {
+    seen: HashSet<u64>,
+    /// The same nonces, with when each may be let go (Unix ms), oldest
+    /// first, near enough: a request delayed in transit may expire before
+    /// one ahead of it, and then waits for it (kept a little longer, never
+    /// less).
+    expiry: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl SignerNonces {
+    /// Let go of nonces expired by `now_ms`; how many.
+    fn prune(&mut self, now_ms: u64) -> usize {
+        let mut gone = 0;
+        while let Some(&(until, nonce)) = self.expiry.front() {
+            if until >= now_ms {
+                break;
+            }
+            self.expiry.pop_front();
+            self.seen.remove(&nonce);
+            gone += 1;
+        }
+        gone
     }
 }
 
 impl NonceCache {
-    /// Remember `signer`'s `nonce`; false if it was already seen (a replay)
-    /// or there is no room (for anyone, or for this signer).
-    fn note(&mut self, signer: &str, nonce: u64) -> bool {
-        let now = Instant::now();
-        let mine = self.per_signer.get(signer).copied().unwrap_or(0);
-        if now.duration_since(self.pruned) >= Duration::from_secs(1)
-            || self.seen.len() >= MAX_NONCES
-            || mine >= MAX_NONCES_PER_SIGNER
-        {
-            self.seen.retain(|_, at| now.duration_since(*at) < NONCE_TTL);
-            self.per_signer.clear();
-            for (who, _) in self.seen.keys() {
-                *self.per_signer.entry(who.clone()).or_insert(0) += 1;
+    /// Remember `signer`'s `nonce`, from a request signed with timestamp
+    /// `timestamp_ms`; false if it was already seen (a replay) or there is
+    /// no room (for anyone, or for this signer).
+    pub fn note(&mut self, signer: &str, nonce: u64, timestamp_ms: u64) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        self.note_at(signer, nonce, timestamp_ms, now_ms)
+    }
+
+    fn note_at(&mut self, signer: &str, nonce: u64, timestamp_ms: u64, now_ms: u64) -> bool {
+        // Every signer's now and then (one that went quiet holds nothing
+        // for long); this signer's every time. Never a scan of the lot.
+        if now_ms.abs_diff(self.pruned_ms) >= PRUNE_EVERY_MS || self.total >= MAX_NONCES {
+            let mut gone = 0;
+            self.signers.retain(|_, nonces| {
+                gone += nonces.prune(now_ms);
+                !nonces.seen.is_empty()
+            });
+            self.total -= gone;
+            self.pruned_ms = now_ms;
+        }
+        if let Some(nonces) = self.signers.get_mut(signer) {
+            self.total -= nonces.prune(now_ms);
+            if nonces.seen.contains(&nonce) {
+                return false;
             }
-            self.pruned = now;
         }
-        if self.seen.len() >= MAX_NONCES || self.per_signer.get(signer).copied().unwrap_or(0) >= MAX_NONCES_PER_SIGNER {
+        let mine = self.signers.get(signer).map_or(0, |nonces| nonces.seen.len());
+        if self.total >= MAX_NONCES || mine >= MAX_NONCES_PER_SIGNER {
             return false;
         }
-        if self.seen.insert((signer.to_string(), nonce), now).is_some() {
-            return false;
-        }
-        *self.per_signer.entry(signer.to_string()).or_insert(0) += 1;
+        let nonces = self.signers.entry(std::sync::Arc::from(signer)).or_default();
+        nonces.seen.insert(nonce);
+        nonces.expiry.push_back((timestamp_ms.saturating_add(NONCE_KEPT_MS), nonce));
+        self.total += 1;
         true
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.total == 0
     }
 }
 
@@ -243,28 +293,53 @@ mod tests {
 
     #[test]
     fn replays_are_remembered_only_so_long_and_so_many() {
+        let now = 1_700_000_000_000;
         let mut cache = NonceCache::default();
-        assert!(cache.note("a", 1));
-        assert!(!cache.note("a", 1));
-        assert!(cache.note("b", 1), "nonces are per signer");
-        // Expired ones are forgotten.
-        cache.seen.values_mut().for_each(|at| *at -= NONCE_TTL);
-        cache.pruned -= Duration::from_secs(2);
-        assert!(cache.note("a", 1));
+        assert!(cache.note_at("a", 1, now, now));
+        assert!(!cache.note_at("a", 1, now, now));
+        assert!(cache.note_at("b", 1, now, now), "nonces are per signer");
+        // Kept while the request could still pass the freshness check
+        // (within 30 s of its timestamp), let go after.
+        assert!(!cache.note_at("a", 1, now, now + 30_000));
+        assert!(cache.note_at("a", 1, now, now + NONCE_KEPT_MS + 1));
+        // By the wall clock: a clock stepped back (by a minute, say) brings
+        // nothing back. A request from before the step is still within 30 s
+        // of the corrected clock, and its nonce is still held.
+        let mut cache = NonceCache::default();
+        assert!(cache.note_at("a", 7, now, now));
+        assert!(!cache.note_at("a", 7, now, now + 70_000 - 60_000), "stepped back: still a replay");
+
         // Full: refused rather than forgetting a fresh one.
-        cache.seen.clear();
+        let mut cache = NonceCache::default();
         for i in 0..MAX_NONCES as u64 {
-            cache.seen.insert(("f".into(), i), Instant::now());
+            assert!(cache.note_at(&format!("s{}", i % 20), i, now, now));
         }
-        assert!(!cache.note("a", 2));
+        assert!(!cache.note_at("a", 2, now, now));
+        // Once they expire, there is room again, without a scan per call.
+        assert!(cache.note_at("a", 2, now + 60_000, now + 60_000));
+        assert_eq!(cache.total, 1);
 
         // One signer gets at most its share, and others still have room.
         let mut cache = NonceCache::default();
         for i in 0..MAX_NONCES_PER_SIGNER as u64 {
-            assert!(cache.note("flood", i));
+            assert!(cache.note_at("flood", i, now, now));
         }
-        assert!(!cache.note("flood", u64::MAX), "its share is used up");
-        assert!(cache.note("other", 1));
+        assert!(!cache.note_at("flood", u64::MAX, now, now), "its share is used up");
+        assert!(cache.note_at("other", 1, now, now));
+    }
+
+    /// A busy allowed caller: hundreds of new tunnels a second, for minutes,
+    /// all taken (the old cache refused past about 143 a second).
+    #[test]
+    fn a_busy_caller_is_not_refused() {
+        let start = 1_700_000_000_000u64;
+        let mut cache = NonceCache::default();
+        let mut nonce = 0;
+        for ms in (0..180_000).step_by(2) {
+            nonce += 1;
+            assert!(cache.note_at("busy", nonce, start + ms, start + ms), "refused at {ms} ms");
+        }
+        assert!(cache.total <= 16_000, "{}", cache.total);
     }
 
     /// A caller the policy refuses leaves no nonce behind: otherwise it could
@@ -279,7 +354,7 @@ mod tests {
             let req = sign_tunnel_request(&b, "x", "db", ts).unwrap();
             assert!(authorize(&x, "db", ts, Some(&req), Via::Relay).is_err());
         }
-        assert!(x.tunnel_nonces.lock().unwrap().seen.is_empty());
+        assert!(x.tunnel_nonces.lock().unwrap().is_empty());
         let ts = now_ms();
         let req = sign_tunnel_request(&signer("a"), "x", "db", ts).unwrap();
         assert!(authorize(&x, "db", ts, Some(&req), Via::Relay).is_ok());

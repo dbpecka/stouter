@@ -369,12 +369,12 @@ reproduced or checked against the code. Numbered on from the lists above.
   the pre-edit text in `file_config` until the edit survives a sync.
   Fixed: knowing no peers no longer counts as caught up; such a node waits for a peer's sync, or two minutes. (Left: a sync from a peer that is itself behind still counts.)
 
-- [ ] **57. With `requireSignedConfig`, any member can hold the config write lock** with
+- [x] **57. With `requireSignedConfig`, any member can hold the config write lock** with
   large configs carrying junk signatures: `adopt_if_newer` decodes and
   verifies under `dynamic_config.write()` (a reader waited about 0.5 s with 8
   senders). Fix: refuse oversized signed text first; verify outside the
   lock with a per-peer slot; remember the last refused signature.
-
+  Fixed: a peer's signed config is checked outside the config lock (on a blocking thread, one per peer at a time); one larger than a config may be is refused unread, and one refused in the last ten minutes isn't checked again. A reader waited under 50 ms with 8 senders (194 ms before).
 - [x] **58. `ca.key` is never checked against `ca.crt`** (`src/pki.rs` `load_ca`). A node
   deployed before its certificates are copied in makes its own CA; copying
   the cluster's in afterwards leaves a mismatched key, accepted silently:
@@ -394,41 +394,47 @@ reproduced or checked against the code. Numbered on from the lists above.
 
 ## Low
 
-- [ ] **60. A relay can make a NAT'd node hold up to 8 MiB per reverse connection,**
+- [x] **60. A relay can make a NAT'd node hold up to 8 MiB per reverse connection,**
   with no deadline (`src/node/reverse.rs` reads the relay's first message
   with the 8 MiB cap); the plain-connection dispatcher likewise. The
   attacker sends every byte held. Fix: cap a reverse connection's message
   at the tunnel-request size; a deadline once a length prefix arrives.
+  Fixed: a reverse connection's message is capped at 16 KiB and must arrive within 10 s once begun; any connection's first message must follow its length within 30 s.
 - [x] **61. A relay refuses a burst of tunnels after a quiet spell:** `relayed_here` is
   refreshed only on registration, so once idle connections registered over
   two minutes ago are used up, the next tunnels are refused at once while
   replacements register. Fix: refresh it when a reverse connection is taken.
   Fixed: taking a reverse connection counts as relaying lately, so the burst's later tunnels wait for the replacements.
-- [ ] **62. `config rollback` and `service move` accept history entries forged with an expired admin key.**
+- [x] **62. `config rollback` and `service move` accept history entries forged with an expired admin key.**
   Fix: refuse a fetched entry whose signer has expired unless accepted
   explicitly, or it matches the local history.
+  Fixed: a daemon's history entry (rollback) or source config (`service move`) signed by an expired certificate is refused, unless this host's history has the entry, or `--accept-expired-signer`.
 - [x] **63. deploy.sh's pre-check ignores tlsDir:** a missing `node.key` passes `check
   --local` and the new container crash-loops. Fix: mount tlsDir in the
   check, and have `check --local` check the certificate set (and #58).
   Fixed: `check --local` checks the certificates as the daemon would load them (read only) and warns when it would make a new CA though peers are listed; deploy.sh mounts tlsDir (read only) for the check.
-- [ ] **64. The nonce cache caps a caller at about 143 tunnels/s per node** to policy
+- [x] **64. The nonce cache caps a caller at about 143 tunnels/s per node** to policy
   services (10,000 per signer per 70 s), and rescans the cache on every call
   at the cap. Fix: scale the cap, prune incrementally.
+  Fixed: the cache keeps each signer's nonces in expiry order and lets go of expired ones as it goes (no rescans); a caller may have 50,000 (some 800 new tunnels a second to one node), 500,000 in all.
 - [x] **65. The same-version tie-break can cycle between three configs** signed 40
   minutes apart (`src/config.rs` `supersedes`); it settles in a live
   cluster. Fix: a total order (#55 removes most of the need).
   Fixed with #55: the tie-break compares each config's own properties (signer expired, revocations, changedBy, content), a total order.
-- [ ] **66. The #35 check is skipped on a daemon's word** (`config pull` with a daemon
+- [x] **66. The #35 check is skipped on a daemon's word** (`config pull` with a daemon
   saying `require_signed_config: false`). Fix: treat the cluster as signed
   when the local file holds a verified signed config.
-- [ ] **67. Relay retries resend the caller's nonce,** so the NAT'd node refuses the retry
+  Fixed: `config pull` treats the cluster as signed when the file holds a verified signed config, whatever the daemon says.
+- [x] **67. Relay retries resend the caller's nonce,** so the NAT'd node refuses the retry
   as a replay and the real cause is lost. Fix: retry only when the first
   send failed.
+  Fixed: a signed request is sent down another reverse connection only if it couldn't be sent, or the connection closed before answering; after a timeout the relay reports it, and the subscriber tries the next relay with a request signed afresh.
 - [x] **68. `requestTimeoutMs: 0` is accepted,** then fails every request and ejects
   every node. Fix: a minimum in `config_problems`.
   Fixed: below 10 ms is a config problem (changes adding it are refused).
-- [ ] **69. Nonces expire by the monotonic clock, freshness by the wall clock,** so a
+- [x] **69. Nonces expire by the monotonic clock, freshness by the wall clock,** so a
   clock stepped back allows one replay (code reading only).
+  Fixed: nonces are kept until their request's timestamp no longer passes the freshness check, by the wall clock.
 - [ ] **70. Smaller items:** deploy.sh's `-r` help says it updates the config (it never
   replaces one); `cert issue` without a CA says "start the daemon once"
   (which makes a second CA); the README says empty `adminCns` disables
@@ -437,7 +443,7 @@ reproduced or checked against the code. Numbered on from the lists above.
   that changes nothing bumps the version; `config push` writes over a newer
   config a local daemon persisted; the daemon does blocking file I/O under
   the config lock.
-  Fixed: deploy.sh uploads only the files git tracks (keys never), and its `-r` help says an existing config is never replaced; `cert issue` without a CA says to run it on the CA node (#59). Open: the `adminCns` wording, no-op `service add`, `config push` over a newer persisted config, blocking file I/O under the config lock.
+  Fixed: deploy.sh uploads only the files git tracks (keys never), and its `-r` help says an existing config is never replaced; `cert issue` without a CA says to run it on the CA node (#59). The `adminCns` wording is right now; a `service add` that changes nothing is refused (and a refused change exits with the same status through a daemon or in the file); `config push` leaves a newer config a local daemon saved meanwhile. Open: blocking file I/O under the config lock.
 - [x] **71. The idle reverse-connection cap can be passed by one** (found running
   `caps.sh`: 1025 kept, once in four runs): `handle_reverse_registration`
   counts the pool, awaits the known-nodes update, then pushes, so

@@ -34,12 +34,12 @@ const SATURATED_FOR: Duration = Duration::from_secs(2);
 /// Largest first message on a mux stream: a tunnel request, a few KiB even
 /// signed (the caller's certificate travels with it). Plain connections
 /// allow 8 MiB, as a sync can be that large; a stream never carries one.
-const MAX_TUNNEL_REQUEST_BYTES: u32 = 16 * 1024;
+pub(crate) const MAX_TUNNEL_REQUEST_BYTES: u32 = 16 * 1024;
 
 /// How long a mux stream may take to send its tunnel request. The side
 /// opening it sends the request at once, so a stream still silent after
 /// this is stalled on purpose, or dead.
-const TUNNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TUNNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Most mux streams one peer may have waiting for their tunnel to be set up,
 /// across all its sessions: from when a stream opens until its tunnel

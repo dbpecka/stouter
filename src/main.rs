@@ -129,6 +129,11 @@ enum ConfigAction {
         /// (defaults to this host's daemon, else the config file).
         #[arg(long)]
         remote: Option<String>,
+        /// Take it even though the certificate that signed it has expired
+        /// (its key could have signed it after the fact): only if you know
+        /// it was signed in time.
+        #[arg(long)]
+        accept_expired_signer: bool,
     },
     /// Write the cluster's current dynamic config into the local config
     /// file, keeping its other settings: where to start an edit to push.
@@ -362,6 +367,11 @@ enum ServiceAction {
         /// the destination cluster's `adminCns`.
         #[arg(long = "to-cert-dir")]
         to_cert_dir: Option<String>,
+        /// Take the source cluster's config even though the certificate
+        /// that signed it has expired (its key could have signed it after
+        /// the fact): only if you know it was signed in time.
+        #[arg(long)]
+        accept_expired_signer: bool,
     },
     /// Rename a service within a group
     Rename {
@@ -769,7 +779,7 @@ async fn main() -> Result<()> {
                     local_port,
                 };
                 let before = cfg.dynamic_config.clone();
-                let version = cfg.dynamic_config.upsert_service(&group_name, service).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let version = cfg.dynamic_config.upsert_service(&group_name, service).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = local_tls(&cfg)?;
@@ -870,7 +880,7 @@ async fn main() -> Result<()> {
                 let version = cfg
                     .dynamic_config
                     .rename_service(&group_name, &node_id, &from, &to)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = local_tls(&cfg)?;
@@ -927,7 +937,7 @@ async fn main() -> Result<()> {
                 let version = cfg
                     .dynamic_config
                     .remove_service(&group_name, &node_id, &name)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
 
                 let tls_ctx = local_tls(&cfg)?;
@@ -977,7 +987,7 @@ async fn main() -> Result<()> {
                 let version = cfg
                     .dynamic_config
                     .set_routes(&service, routes)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
                 broadcast_config(&cfg, &cli.config).await?;
                 version
@@ -1033,6 +1043,7 @@ async fn main() -> Result<()> {
                     to,
                     from_cert_dir,
                     to_cert_dir,
+                    accept_expired_signer,
                 },
         }) => {
             let cfg = Config::load_or_default(&cli.config)?;
@@ -1048,6 +1059,11 @@ async fn main() -> Result<()> {
 
             // 1. Read the service from the source cluster.
             let src_dc = fetch_trusted_config(&from, &cfg, from_certs).await?;
+            // What it says goes into the destination cluster, signed there:
+            // not from a key past its life unless the admin says so.
+            if !accept_expired_signer {
+                refuse_expired_signer(&src_dc, &format!("the config on {from}"))?;
+            }
             let src_svc = src_dc
                 .service_groups
                 .iter()
@@ -1266,8 +1282,13 @@ async fn main() -> Result<()> {
             println!("Pushed the config in {} to {target} (version {version})", cli.config);
             // The file now holds what the cluster has, so the next edit
             // starts from (and is checked against) this version. Re-read,
-            // in case a local daemon rewrote the file meanwhile.
+            // in case a local daemon rewrote the file meanwhile: one it
+            // wrote a newer config into (it took a later change already) is
+            // left as it is.
             let saved = Config::load(&cli.config).and_then(|mut file| {
+                if file.dynamic_config.version > signed.version {
+                    return Ok(());
+                }
                 file.dynamic_config = signed;
                 file.save(&cli.config)
             });
@@ -1287,23 +1308,7 @@ async fn main() -> Result<()> {
             let material = load_cli_material(&cfg, cli.cert_dir.as_deref())?;
             let tls_ctx = cli_tls_context(&cfg, &material)?;
             let daemon = fetch_daemon_config(&target, &tls_ctx).await?;
-            let current = if !signed_cluster(&cfg, daemon.require_signed_config) {
-                daemon.dynamic_config
-            } else if daemon.dynamic_config.signature.is_none() {
-                refuse_unsigned_over_signed(&target, &cfg, &cli.config, &material, &tls_ctx)?;
-                eprintln!(
-                    "warning: the config on {target} isn't admin-signed yet; review it before you sign it with \
-                     `stouter config push`"
-                );
-                daemon.dynamic_config
-            } else {
-                // Only what an admin signed: the file is what `config push`
-                // signs next.
-                let verified = trusted_config(&daemon.dynamic_config, &cfg, &material, &tls_ctx)
-                    .with_context(|| format!("won't write the config from {target} to {}", cli.config))?;
-                refuse_against_local(&verified, &target, &cfg, &material, &tls_ctx, accept_expired_signer)?;
-                verified
-            };
+            let current = config_to_pull(daemon, &target, &cfg, &cli.config, &material, &tls_ctx, accept_expired_signer)?;
             let version = current.version;
             if !cfg.dynamic_config.same_settings(&current) {
                 // It may hold edits not pushed yet: keep them (never over
@@ -1365,7 +1370,7 @@ async fn main() -> Result<()> {
             } else {
                 let mut cfg = Config::load(&cli.config)?;
                 let before = cfg.dynamic_config.clone();
-                let version = op.apply(&mut cfg.dynamic_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let version = op.apply(&mut cfg.dynamic_config).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
                 broadcast_config(&cfg, &cli.config).await?;
                 version
@@ -1420,7 +1425,7 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------------
         // config rollback
         // -----------------------------------------------------------------
-        Some(Commands::Config { action: ConfigAction::Rollback { to, remote } }) => {
+        Some(Commands::Config { action: ConfigAction::Rollback { to, remote, accept_expired_signer } }) => {
             let local = Config::load_or_default(&cli.config)?;
             let target = change_target(remote, &cli.config, cli.cert_dir.as_deref()).await?;
             // The version to restore: from the daemon's history, or the file's.
@@ -1461,13 +1466,26 @@ async fn main() -> Result<()> {
             if earlier.version != to {
                 anyhow::bail!("the history's version {to} is really version {}: not putting it back", earlier.version);
             }
+            // A daemon's history entry signed with a key whose certificate
+            // has since expired could have been signed by that key after the
+            // fact, dated back: not put back (and signed again, now, by this
+            // admin) unless this host's own history has it too, or the admin
+            // says so.
+            if let Some(addr) = target.as_deref().filter(|_| !accept_expired_signer) {
+                let known_here = history::load(&cli.config)
+                    .iter()
+                    .any(|e| e.config.as_ref().is_some_and(|c| c.version == earlier.version && c.same_settings(&earlier)));
+                if !known_here {
+                    refuse_expired_signer(&earlier, &format!("version {to} in the history of {addr}"))?;
+                }
+            }
             let op = AdminOp::Restore { config: earlier };
             let version = if let Some(addr) = &target {
                 run_admin_rpc(addr, op, &local, &cli.config, cli.cert_dir.as_deref()).await?
             } else {
                 let mut cfg = Config::load(&cli.config)?;
                 let before = cfg.dynamic_config.clone();
-                let version = op.apply(&mut cfg.dynamic_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let version = op.apply(&mut cfg.dynamic_config).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
                 broadcast_config(&cfg, &cli.config).await?;
                 version
@@ -1497,7 +1515,7 @@ async fn main() -> Result<()> {
             } else {
                 let mut cfg = Config::load(&cli.config)?;
                 let before = cfg.dynamic_config.clone();
-                let version = op.apply(&mut cfg.dynamic_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let version = op.apply(&mut cfg.dynamic_config).unwrap_or_else(|e| refused_change(&e));
                 save_local_change(&mut cfg, &before, &cli.config, cli.cert_dir.as_deref())?;
                 broadcast_config(&cfg, &cli.config).await?;
                 (version, Some(cfg.dynamic_config))
@@ -1936,6 +1954,41 @@ fn refuse_against_local(
     Ok(())
 }
 
+/// What `config pull` writes to the file at `path`, of what `daemon` (at
+/// `target`) serves. In a signed cluster, only what an admin signed, and
+/// nothing an earlier signed config in the file contradicts. Signed means
+/// the CLI's config says so, or the daemon does, or the file already holds
+/// a config an admin signed: a daemon saying configs needn't be signed
+/// would otherwise have its word written over that, unverified, and the
+/// file's revocations (which the CLI trusts) with it.
+fn config_to_pull(
+    daemon: DaemonConfig,
+    target: &str,
+    cfg: &Config,
+    path: &str,
+    material: &pki::PkiMaterial,
+    tls_ctx: &tls::TlsContext,
+    accept_expired_signer: bool,
+) -> Result<config::DynamicConfig> {
+    let file_signed = cfg.dynamic_config.signature.is_some() && trusted_config(&cfg.dynamic_config, cfg, material, tls_ctx).is_ok();
+    if !signed_cluster(cfg, daemon.require_signed_config) && !file_signed {
+        return Ok(daemon.dynamic_config);
+    }
+    if daemon.dynamic_config.signature.is_none() {
+        refuse_unsigned_over_signed(target, cfg, path, material, tls_ctx)?;
+        eprintln!(
+            "warning: the config on {target} isn't admin-signed yet; review it before you sign it with \
+             `stouter config push`"
+        );
+        return Ok(daemon.dynamic_config);
+    }
+    // Only what an admin signed: the file is what `config push` signs next.
+    let verified = trusted_config(&daemon.dynamic_config, cfg, material, tls_ctx)
+        .with_context(|| format!("won't write the config from {target} to {path}"))?;
+    refuse_against_local(&verified, target, cfg, material, tls_ctx, accept_expired_signer)?;
+    Ok(verified)
+}
+
 /// Refuse to pull `target`'s unsigned config over a file holding an
 /// admin-signed one. Fine before the first signed change; but over a signed
 /// file, the file's config (and its revocations, which the CLI trusts)
@@ -1951,7 +2004,8 @@ fn refuse_unsigned_over_signed(
     if trusted_config(&cfg.dynamic_config, cfg, material, tls_ctx).is_ok() {
         anyhow::bail!(
             "the config on {target} isn't admin-signed, but the one in {path} is: not writing it over that (that \
-             node is behind the cluster's signed configs, or not telling the truth)"
+             node is behind the cluster's signed configs, or not telling the truth). If this cluster doesn't \
+             require signed configs and the unsigned one is right, move {path} aside first"
         );
     }
     Ok(())
@@ -2061,6 +2115,23 @@ fn keep_pushed(config_path: &str, pushed: &config::DynamicConfig, material: &pki
 /// Like `try_admin_rpc`, but on `AdminResult::Err` exits the process with a
 /// code derived from `AdminErrCode` so single-step callers don't need to
 /// handle it.
+/// Exit, saying why, as for a change a daemon refused (see
+/// [`run_admin_rpc`]): the same status whether the change was to be made
+/// through a daemon or in the file.
+fn refused_change(e: &config::MutateErr) -> ! {
+    eprintln!("error: {e}");
+    std::process::exit(exit_code_for(AdminErrCode::from(e)))
+}
+
+/// The exit status for a refused change.
+fn exit_code_for(code: AdminErrCode) -> i32 {
+    match code {
+        AdminErrCode::Unauthorized => 3,
+        AdminErrCode::Validation | AdminErrCode::NotFound | AdminErrCode::Conflict => 2,
+        AdminErrCode::Internal => 1,
+    }
+}
+
 async fn run_admin_rpc(
     target: &str,
     op: AdminOp,
@@ -2072,12 +2143,7 @@ async fn run_admin_rpc(
         Ok(new_version) => Ok(new_version),
         Err((code, message)) => {
             eprintln!("error: {message}");
-            let exit_code = match code {
-                AdminErrCode::Unauthorized => 3,
-                AdminErrCode::Validation | AdminErrCode::NotFound | AdminErrCode::Conflict => 2,
-                AdminErrCode::Internal => 1,
-            };
-            std::process::exit(exit_code);
+            std::process::exit(exit_code_for(code));
         }
     }
 }
@@ -2174,6 +2240,20 @@ fn refuse_revoking_own_cert(cfg: &Config, cert_dir: Option<&str>, nodes: &[Strin
 /// the CLI take (and an admin then sign) whatever it serves.
 fn signed_cluster(cfg: &Config, daemon_says: bool) -> bool {
     cfg.require_signed_config || daemon_says
+}
+
+/// Refuse `dc` (`what`, for the message) if the certificate that signed it
+/// has expired: its key could have signed it after the fact, dated back
+/// into its life. `--accept-expired-signer` takes it anyway.
+fn refuse_expired_signer(dc: &config::DynamicConfig, what: &str) -> Result<()> {
+    if let Some((who, until)) = signing::expired_signer(dc) {
+        anyhow::bail!(
+            "{what} was signed by '{who}', whose certificate expired {}: that key could have signed it after the \
+             fact. Pass --accept-expired-signer only if you know it was signed in time",
+            history::format_secs(until)
+        );
+    }
+    Ok(())
 }
 
 /// A remote daemon's config, as far as the CLI can trust it (see
@@ -2649,6 +2729,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The CLI's config doesn't set requireSignedConfig (a workstation), and
+    /// a daemon says configs needn't be signed: its word isn't written,
+    /// unverified, over a file holding a config an admin signed.
+    #[test]
+    fn a_pull_over_a_signed_file_is_checked_whatever_the_daemon_says() {
+        let (dir, certs) = cluster_certs(&["alice", "m"]);
+        let alice = signing::Signer::from_material(&certs["alice"]).unwrap();
+        let mut v10 = config::DynamicConfig { version: 10, ..api_on_port(3000) };
+        v10.revoked.nodes.push("x".into());
+        let v10 = signing::sign(&v10, &alice).unwrap();
+        let cfg = Config { admin_cns: vec!["alice".into()], dynamic_config: v10, ..Config::default() };
+        let tls_ctx = cli_tls_context(&cfg, &certs["alice"]).unwrap();
+        let says_unsigned = |dc: config::DynamicConfig| DaemonConfig { dynamic_config: dc, require_signed_config: false };
+        let pull = |served| config_to_pull(says_unsigned(served), "m", &cfg, "f.json", &certs["alice"], &tls_ctx, false);
+
+        // Unsigned, dropping the revocation: refused.
+        let err = pull(config::DynamicConfig { version: 11, ..api_on_port(6666) }).unwrap_err();
+        assert!(format!("{err:#}").contains("isn't admin-signed, but the one in f.json is"), "{err:#}");
+        // Signed by someone who isn't an admin: refused.
+        let mallory = signing::Signer::from_material(&certs["m"]).unwrap();
+        let forged = signing::sign(&config::DynamicConfig { version: 11, ..api_on_port(6666) }, &mallory).unwrap();
+        assert!(pull(forged).is_err());
+        // An admin's newer one: taken.
+        let v11 = signing::sign(&config::DynamicConfig { version: 11, ..api_on_port(3001) }, &alice).unwrap();
+        assert_eq!(pull(v11).unwrap().version, 11);
+
+        // A file never signed: the daemon's word, as before.
+        let unsigned_file = Config { dynamic_config: api_on_port(3000), ..cfg.clone() };
+        let served = config::DynamicConfig { version: 11, ..api_on_port(6666) };
+        let pulled = config_to_pull(says_unsigned(served), "m", &unsigned_file, "f.json", &certs["alice"], &tls_ctx, false);
+        assert_eq!(pulled.unwrap().version, 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn making_a_new_ca_while_listing_peers_is_warned_about() {
         let dir = std::env::temp_dir().join(format!("stouter_new_ca_{}_{}", std::process::id(), rand::random::<u64>()));
@@ -3097,6 +3211,11 @@ mod tests {
         let err = try_admin_rpc(&lying_newer, op(), &alice_cfg, "", alice_dir.to_str()).await.expect_err("refused");
         assert!(format!("{err:#}").contains("whose certificate expired"), "{err:#}");
         assert!(pushed.lock().unwrap().is_empty() && pushed_newer.lock().unwrap().is_empty(), "nothing signed");
+        // Rollback and service move: a forged history entry, or source
+        // config, from that key is refused too (unless accepted).
+        let err = refuse_expired_signer(&forge(5), "version 5 in the history of m").unwrap_err();
+        assert!(format!("{err:#}").contains("signed by 'bob', whose certificate expired"), "{err:#}");
+        assert!(refuse_expired_signer(&alice_cfg.dynamic_config, "alice's").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

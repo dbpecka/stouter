@@ -100,11 +100,33 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Mes
 /// [`recv_message`] for a message of at most `limit` bytes: one longer is
 /// refused on its length prefix, before any of it is read.
 pub(crate) async fn recv_message_limited<R: AsyncReadExt + Unpin>(stream: &mut R, limit: u32) -> Result<Message> {
+    recv_message_within(stream, limit, None).await
+}
+
+/// [`recv_message_limited`], the message's body (once its length has
+/// arrived) within `body_within`, if given. The wait for the length is
+/// unbounded (an idle connection is fine); the body isn't: a peer can't
+/// hold a message of up to `limit` bytes here half sent for ever.
+pub(crate) async fn recv_message_within<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    limit: u32,
+    body_within: Option<Duration>,
+) -> Result<Message> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
         .await
         .context("read length prefix")?;
+    match body_within {
+        Some(within) => time::timeout(within, recv_body(stream, len_buf, limit))
+            .await
+            .map_err(|_| anyhow::anyhow!("message body not sent within {}s", within.as_secs()))?,
+        None => recv_body(stream, len_buf, limit).await,
+    }
+}
+
+/// The rest of a message whose length prefix was `len_buf`.
+async fn recv_body<R: AsyncReadExt + Unpin>(stream: &mut R, len_buf: [u8; 4], limit: u32) -> Result<Message> {
     let len = u32::from_be_bytes(len_buf);
 
     if len > limit {
@@ -149,7 +171,7 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
         return;
     };
     let first = tokio::select! {
-        result = recv_message(&mut stream) => result,
+        result = recv_message_within(&mut stream, MAX_MSG_BYTES, Some(FIRST_MESSAGE_BODY_WITHIN)) => result,
         _ = state.shutdown.cancelled() => return,
     };
     drop(idle);
@@ -251,6 +273,12 @@ pub async fn dispatch_connection(mut stream: MeshStream, peer_addr: String, stat
 // ---------------------------------------------------------------------------
 // Gossip message handling
 // ---------------------------------------------------------------------------
+
+/// How long the body of a connection's first message may take, once its
+/// length has arrived: a sync (the largest, up to 8 MiB) is given up on by
+/// its sender after 10 seconds, and an admin request by the CLI after 30.
+/// Past it, the connection, and what it sent, is let go.
+const FIRST_MESSAGE_BODY_WITHIN: Duration = Duration::from_secs(30);
 
 /// How long a sync connection is kept open for the peer's next sync (sent
 /// every 10 seconds).
@@ -1125,10 +1153,7 @@ async fn merge_sync(
 ) {
     // `None`: the sender left its config out, as no newer than ours.
     let updated = match config {
-        Some(config) => {
-            let mut dc = state.dynamic_config.write().await;
-            adopt_if_newer(state, &mut dc, config, "dynamic config updated")
-        }
+        Some(config) => adopt_from_peer(state, config, "dynamic config updated", source.cn).await,
         None => false,
     };
 
@@ -1332,6 +1357,108 @@ fn adopt_if_newer(
             false
         }
     }
+}
+
+/// [`adopt_if_newer`] for a config a peer sent. With `requireSignedConfig`,
+/// its signature is checked without holding the config's lock: decoding and
+/// verifying a large signed config takes tens of milliseconds, and every
+/// reader of the config (each `httpListen` request, every sync, status)
+/// waited behind it, so any member could stall a node by sending bogus ones.
+/// So, outside the lock: one too large to be the cluster's is refused
+/// unread, one refused lately isn't checked again for a while, and a peer
+/// has one checked at a time (more are dropped: it offers them again next
+/// sync). Only the cheap checks, and adopting, are under the lock.
+async fn adopt_from_peer(
+    state: &Arc<SharedState>,
+    incoming: crate::config::DynamicConfig,
+    what: &str,
+    peer: Option<&str>,
+) -> bool {
+    if !state.config.require_signed_config {
+        let mut dc = state.dynamic_config.write().await;
+        return adopt_if_newer(state, &mut dc, incoming, what);
+    }
+    if !incoming.supersedes(&*state.dynamic_config.read().await) {
+        return false;
+    }
+    let version = incoming.version;
+    let verified = match verify_unlocked(state, incoming, peer).await {
+        Some(Ok(config)) => config,
+        Some(Err(e)) => {
+            crate::signing::log_refusal(state, version, &e);
+            return false;
+        }
+        None => return false,
+    };
+    let mut dc = state.dynamic_config.write().await;
+    match crate::signing::admit_verified(state, verified, &dc) {
+        Ok(config) if config.supersedes(&dc) => {
+            log_adoption(&dc, &config, what);
+            *dc = config;
+            persist_state_with(state, &dc);
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            crate::signing::log_refusal(state, version, &e);
+            false
+        }
+    }
+}
+
+/// How long a refused signed config isn't checked again.
+const REFUSED_CONFIG_FOR: Duration = Duration::from_secs(600);
+
+/// Refused signed configs remembered (see [`adopt_from_peer`]).
+const REFUSED_CONFIGS_KEPT: usize = 64;
+
+/// Signed configs one peer may have checked at once (see
+/// [`adopt_from_peer`]).
+const MAX_CONFIG_CHECKS_PER_PEER: usize = 1;
+
+/// `incoming` decoded from what an admin signed and checked (see
+/// `signing::verify`), on a blocking thread, holding no lock. `None` if it
+/// wasn't checked: refused lately, or `peer` already has one being checked.
+async fn verify_unlocked(
+    state: &Arc<SharedState>,
+    incoming: crate::config::DynamicConfig,
+    peer: Option<&str>,
+) -> Option<anyhow::Result<crate::config::DynamicConfig>> {
+    use std::hash::BuildHasher;
+    let Some(sig) = incoming.signature.as_ref() else {
+        return Some(Err(anyhow::anyhow!("config version {} is not signed", incoming.version)));
+    };
+    if sig.config_json.len() > crate::config::MAX_CONFIG_BYTES {
+        return Some(Err(anyhow::anyhow!(
+            "config version {} is signed over {} bytes, more than a config may be ({})",
+            incoming.version,
+            sig.config_json.len(),
+            crate::config::MAX_CONFIG_BYTES
+        )));
+    }
+    let key = state.refused_hasher.hash_one((&sig.config_json, &sig.signer_cert, &sig.signature));
+    {
+        let mut refused = state.refused_configs.lock().unwrap();
+        refused.retain(|(_, at)| at.elapsed() < REFUSED_CONFIG_FOR);
+        if refused.iter().any(|(k, _)| *k == key) {
+            debug!("ignoring config version {}: refused lately", incoming.version);
+            return None;
+        }
+    }
+    let _turn = state.try_peer_slot("config-check", peer.unwrap_or_default(), MAX_CONFIG_CHECKS_PER_PEER)?;
+    let tls = state.tls.clone()?;
+    let admins = state.config.admin_cns.clone();
+    let checked = tokio::task::spawn_blocking(move || crate::signing::verify(&incoming, &tls, &admins).map(|(config, _)| config))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("signature check failed: {e}")));
+    if checked.is_err() {
+        let mut refused = state.refused_configs.lock().unwrap();
+        if refused.len() >= REFUSED_CONFIGS_KEPT {
+            refused.pop_front();
+        }
+        refused.push_back((key, std::time::Instant::now()));
+    }
+    Some(checked)
 }
 
 /// Log that `incoming` is replacing `current`.
@@ -1783,10 +1910,7 @@ fn merge_health(existing: Option<&mut NodeInfo>, incoming: &NodeInfo) {
 async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&str>) {
     match msg {
         Message::ConfigUpdate { config } => {
-            let updated = {
-                let mut dc = state.dynamic_config.write().await;
-                adopt_if_newer(state, &mut dc, config, "config update received")
-            };
+            let updated = adopt_from_peer(state, config, "config update received", peer_cn).await;
             if updated {
                 state.rebuild_service_index().await;
                 print_dynamic_config(state).await;
@@ -2645,6 +2769,56 @@ mod tests {
 
     fn signed_by(m: &crate::pki::PkiMaterial, dc: &DynamicConfig) -> DynamicConfig {
         crate::signing::sign(dc, &crate::signing::Signer::from_material(m).unwrap()).unwrap()
+    }
+
+    /// Configs claiming a newer version, large, with junk signatures (a
+    /// member stalling the node): checked without the config's lock, so its
+    /// readers don't wait behind them; one refused isn't checked again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bogus_signed_configs_dont_hold_up_the_configs_readers() {
+        let c = signed_cluster();
+        let bogus = |n: usize| {
+            let mut dc = DynamicConfig { version: 2, ..named_services(&["api"]) };
+            dc.service_groups[0].services[0].meta.insert("pad".into(), format!("{n}{}", "x".repeat(1_500_000)));
+            let config_json = serde_json::to_string(&dc).unwrap();
+            dc.signature = Some(crate::config::ConfigSignature { config_json, signer_cert: "00".into(), signature: "00".into() });
+            dc
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut senders = Vec::new();
+        for i in 0..8 {
+            let (node, stop) = (c.node.clone(), stop.clone());
+            let peer = format!("m{i}");
+            senders.push(tokio::spawn(async move {
+                let mut n = i * 1000;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n += 1;
+                    apply_message(&node, Message::ConfigUpdate { config: bogus(n) }, Some(&peer)).await;
+                }
+            }));
+        }
+        let mut slowest = Duration::ZERO;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            let asked = std::time::Instant::now();
+            drop(c.node.dynamic_config.read().await);
+            slowest = slowest.max(asked.elapsed());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for sender in senders {
+            sender.await.unwrap();
+        }
+        assert!(slowest < Duration::from_millis(50), "a reader waited {slowest:?}");
+        assert_eq!(c.node.dynamic_config.read().await.version, 1, "none taken");
+
+        // The same one again isn't checked again.
+        let again = bogus(0);
+        apply_message(&c.node, Message::ConfigUpdate { config: again.clone() }, Some("m")).await;
+        let refused = c.node.refused_configs.lock().unwrap().len();
+        apply_message(&c.node, Message::ConfigUpdate { config: again }, Some("m")).await;
+        assert_eq!(c.node.refused_configs.lock().unwrap().len(), refused, "remembered, not checked again");
+        let _ = std::fs::remove_dir_all(&c.dir);
     }
 
     #[tokio::test]

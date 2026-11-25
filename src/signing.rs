@@ -240,6 +240,14 @@ pub fn admit(state: &SharedState, incoming: DynamicConfig, held: &DynamicConfig)
     }
     let tls = state.tls.as_deref().ok_or_else(|| anyhow!("no TLS context to check signatures with"))?;
     let config = verify(&incoming, tls, &state.config.admin_cns)?.0;
+    admit_verified(state, config, held)
+}
+
+/// The rest of [`admit`] (with `requireSignedConfig`), for a `config`
+/// [`verify`] has already decoded and checked: the cheap part, against the
+/// config `held` now. So a node can verify a signature (the costly part)
+/// without holding its config's lock, then decide under it.
+pub fn admit_verified(state: &SharedState, config: DynamicConfig, held: &DynamicConfig) -> Result<DynamicConfig> {
     if let Some(why) = signed_too_early(&config, held).or_else(|| crate::config::too_far_ahead(&config, held)) {
         bail!("{why}");
     }

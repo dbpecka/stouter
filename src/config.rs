@@ -666,6 +666,13 @@ impl DynamicConfig {
                 .iter_mut()
                 .find(|s| s.name == service.name && s.node_id == service.node_id)
             {
+                // The same again changes nothing: no new version for it.
+                if *existing == service {
+                    return Err(MutateErr::Invalid(format!(
+                        "service '{group}/{}' on node '{}' is already there as given: nothing to change",
+                        service.name, service.node_id
+                    )));
+                }
                 *existing = service;
             } else {
                 g.services.push(service);
@@ -2017,6 +2024,17 @@ mod tests {
         let problems = dc.problems();
         assert_eq!(problems.iter().filter(|p| p.contains("empty domain")).count(), 2, "{problems:?}");
         assert!(!problems.iter().any(|p| p.contains("claimed by both")), "empties don't clash: {problems:?}");
+    }
+
+    #[test]
+    fn adding_a_service_exactly_as_it_is_changes_nothing() {
+        let mut dc = DynamicConfig::default();
+        let v = dc.upsert_service("g", instance("api", "n1", &["a.example"])).unwrap();
+        let err = dc.upsert_service("g", instance("api", "n1", &["a.example"])).unwrap_err();
+        assert!(matches!(&err, MutateErr::Invalid(why) if why.contains("nothing to change")), "{err}");
+        assert_eq!(dc.version, v, "no new version");
+        // A change to it is one.
+        assert_eq!(dc.upsert_service("g", instance("api", "n1", &["b.example"])).unwrap(), v + 1);
     }
 
     #[test]

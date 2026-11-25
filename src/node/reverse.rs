@@ -196,9 +196,16 @@ async fn open_reverse_connection(state: &Arc<SharedState>, relay_addr: &str, sto
     debug!("reverse connection established to {relay_addr}");
 
     // Wait for a tunnel dispatch from the relay. Idle until then, so at
-    // shutdown the connection is simply closed.
+    // shutdown the connection is simply closed. Only ever a tunnel request
+    // comes this way: as small as on a mux stream, and once begun, sent in
+    // time. A relay can't make this node hold megabytes on each of its
+    // reverse connections.
     let msg = tokio::select! {
-        msg = gossip::recv_message(&mut stream) => msg?,
+        msg = gossip::recv_message_within(
+            &mut stream,
+            crate::mux::MAX_TUNNEL_REQUEST_BYTES,
+            Some(crate::mux::TUNNEL_REQUEST_TIMEOUT),
+        ) => msg?,
         _ = stop.cancelled() => return Ok(()),
     };
     match msg {
@@ -308,5 +315,59 @@ mod tests {
         // 600 registrations over 10 relays: about 60 each.
         assert_eq!(load.len(), 10, "every relay gets some: {load:?}");
         assert!(load.values().all(|&n| (30..=90).contains(&n)), "{load:?}");
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+    use crate::state::test_support::tls_state;
+    use tokio::io::AsyncWriteExt;
+
+    /// A relay this node picked sends, on a reverse connection, the start
+    /// of a message of nearly 8 MiB: refused on its length, at once, not
+    /// read and held (a tunnel request is a few KiB).
+    #[tokio::test]
+    async fn a_relay_cant_make_a_natd_node_hold_a_large_message() {
+        let dir = std::env::temp_dir().join(format!("stouter_reverse_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let x = tls_state(&dir, "x");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let held = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = relay.tls_accept(tcp).await.unwrap();
+            gossip::recv_message(&mut stream).await.unwrap(); // the registration
+            stream.write_all(&(7u32 << 20).to_be_bytes()).await.unwrap();
+            let _ = stream.write_all(&vec![0x90; 1 << 20]).await;
+            let _ = stream.flush().await;
+            stream
+        });
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), open_reverse_connection(&x, &addr, &CancellationToken::new()))
+            .await
+            .expect("not left waiting")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("too large"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A message begun but never finished is given up on once its time is
+    /// up; an idle connection (nothing begun) waits as long as it likes.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_begun_must_be_finished_in_time() {
+        let (mut ours, mut theirs) = tokio::io::duplex(1024);
+        let waiting = tokio::spawn(async move {
+            gossip::recv_message_within(&mut ours, 16 * 1024, Some(Duration::from_secs(10))).await
+        });
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(!waiting.is_finished(), "idle is fine");
+        theirs.write_all(&100u32.to_be_bytes()).await.unwrap();
+        theirs.write_all(&[0x80; 10]).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        let err = waiting.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("not sent within"), "{err}");
     }
 }

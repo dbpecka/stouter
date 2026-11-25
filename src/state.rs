@@ -483,6 +483,12 @@ pub struct SharedState {
     pub policies: ArcSwap<crate::authz::Policies>,
     /// Nonces of signed tunnel requests seen lately, against replays.
     pub tunnel_nonces: Mutex<crate::authz::NonceCache>,
+    /// Signed configs lately refused, by a hash of their signed text and
+    /// signature, with when (see `gossip::adopt_from_peer`): a peer offering
+    /// one again isn't checked again for a while.
+    pub(crate) refused_configs: Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>,
+    /// Keys for those hashes, this process's own.
+    pub(crate) refused_hasher: std::collections::hash_map::RandomState,
     /// The cluster CA, when this node holds its key: it issues renewed
     /// certificates (see `crate::renew`).
     pub issuer: std::sync::OnceLock<crate::pki::Issuer>,
@@ -602,6 +608,8 @@ impl SharedState {
             gossip_conns: Mutex::new(HashMap::new()),
             policies: ArcSwap::from_pointee(policies),
             tunnel_nonces: Mutex::new(crate::authz::NonceCache::default()),
+            refused_configs: Mutex::new(std::collections::VecDeque::new()),
+            refused_hasher: std::collections::hash_map::RandomState::new(),
             issuer: std::sync::OnceLock::new(),
             renewals: Mutex::new(HashMap::new()),
             own_addrs: Mutex::new(std::collections::HashSet::new()),
