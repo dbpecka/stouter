@@ -2294,10 +2294,17 @@ async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Opti
         Ok(Ok(_)) => {}
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
         Ok(Err(e)) => anyhow::bail!("can't tell whether this host's daemon is running: connecting to {target}: {e}"),
-        Err(_) => anyhow::bail!(
-            "can't tell whether this host's daemon is running: {target} didn't accept a connection within {}s",
-            LOCAL_DAEMON_CONNECT_TIMEOUT.as_secs()
-        ),
+        // Nothing accepted the connection, so no daemon is listening there:
+        // some systems (macOS, for a port bound but not listening) drop
+        // the attempt rather than refuse it.
+        Err(_) => {
+            eprintln!(
+                "note: nothing accepted a connection to {target} within {}s: taking it that no daemon is running \
+                 here, and changing {config_path}",
+                LOCAL_DAEMON_CONNECT_TIMEOUT.as_secs()
+            );
+            return Ok(None);
+        }
     }
     let not_made = || format!("a daemon is running at {target} (the bind in {config_path}); the change was not made");
     let tls_ctx = build_cli_tls(&cfg, cert_dir).with_context(not_made)?;
@@ -2322,9 +2329,11 @@ async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Opti
     }
 }
 
-/// How long connecting to this host's daemon may take before the CLI gives
-/// up (an unanswered port is refused at once; this is a port that drops).
-const LOCAL_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long connecting to this host's daemon may take before the CLI takes
+/// it that none is running (a port nothing listens on is mostly refused at
+/// once; this is one where the attempt is dropped, or Windows, which tries
+/// again for a second or two before saying it was refused).
+const LOCAL_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long this host's daemon may take to say who it is.
 const LOCAL_DAEMON_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3255,13 +3264,16 @@ mod tests {
             cfg.save(path).unwrap();
         };
 
-        // Nothing listening: the file. (A port held, bound but not
-        // listening, so connecting is refused; a port merely let go could
-        // go to another test running at the same time.)
+        // Nothing listening: the file. Refused, or (macOS, where another
+        // test may hold the port bound but not listening) dropped: nothing
+        // accepted it either way.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        config_for(&free);
+        assert_eq!(change_target(None, path, None).await.unwrap(), None);
         let held = tokio::net::TcpSocket::new_v4().unwrap();
         held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         config_for(&held.local_addr().unwrap().to_string());
-        assert_eq!(change_target(None, path, None).await.unwrap(), None);
+        assert_eq!(change_target(None, path, None).await.unwrap(), None, "bound, not listening");
         drop(held);
 
         // A daemon that refuses this CLI's certificate (another cluster's,
