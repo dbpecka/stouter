@@ -1,0 +1,30 @@
+# End to end: deploy.sh against a real host, and `docker stop` with stouter
+# as PID 1. The "host" is this step's own container: it runs its own Docker
+# daemon (so the paths deploy.sh mounts are the ones it wrote) and sshd, and
+# deploy.sh reaches it over ssh to localhost, as it would a remote host.
+# Privileged, so the repo must be trusted for it in Woodpecker.
+when:
+  - event: push
+    branch: main
+  - event: [pull_request, manual]
+
+steps:
+  - name: deploy-and-docker-stop
+    image: docker:29-dind
+    privileged: true
+    commands:
+      - apk add --no-cache bash coreutils git openssh sudo tar > /dev/null
+      # Docker, with its storage in the image's /var/lib/docker volume.
+      - (dockerd-entrypoint.sh dockerd > /tmp/dockerd.log 2>&1 &)
+      - for i in $(seq 60); do docker info > /dev/null 2>&1 && break; sleep 1; done
+      - docker info > /dev/null || { cat /tmp/dockerd.log; exit 1; }
+      # ssh from this container to itself, as to a remote host.
+      - ssh-keygen -A && /usr/sbin/sshd
+      - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      - ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+      - cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+      - ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2> /dev/null
+      - ssh -o BatchMode=yes localhost true
+      # Builds stouter:latest on the "host" from the Dockerfile.
+      - tests/e2e/deploy-host.sh
+      - tests/e2e/docker-stop.sh

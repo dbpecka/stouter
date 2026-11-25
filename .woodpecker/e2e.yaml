@@ -1,0 +1,55 @@
+# End to end: caps, multi-host, revocation, policies, history, renewal.
+# Built once; each script runs in its own container (its own loopback, so
+# they run side by side without their ports meeting).
+when:
+  - event: push
+    branch: main
+  - event: [pull_request, manual]
+
+steps:
+  - name: build
+    image: rust:1-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo build --locked
+
+  - name: caps
+    image: rust:1-bookworm
+    depends_on: [build]
+    commands:
+      - tests/e2e/caps.sh target/debug/stouter
+
+  - name: revoke
+    image: rust:1-bookworm
+    depends_on: [build]
+    commands:
+      - tests/e2e/revoke.sh target/debug/stouter
+
+  - name: policy
+    image: rust:1-bookworm
+    depends_on: [build]
+    commands:
+      - tests/e2e/policy.sh target/debug/stouter
+
+  - name: history
+    image: rust:1-bookworm
+    depends_on: [build]
+    commands:
+      - tests/e2e/history.sh target/debug/stouter
+
+  - name: renew
+    image: rust:1-bookworm
+    depends_on: [build]
+    commands:
+      - tests/e2e/renew.sh target/debug/stouter
+
+  # Wildcard-bound nodes on separate hosts: network namespaces, so root in
+  # a privileged container (the repo must be trusted for it in Woodpecker).
+  - name: multihost
+    image: rust:1-bookworm
+    privileged: true
+    depends_on: [build]
+    commands:
+      - apt-get update -qq && apt-get install -y -qq --no-install-recommends iproute2 iptables > /dev/null
+      - tests/e2e/multihost.sh target/debug/stouter

@@ -1,0 +1,25 @@
+# Clippy and the tests (Linux), on every pull request and every push to main.
+# The macOS and Windows tests stay on GitHub Actions (.github/workflows/ci.yml).
+when:
+  - event: push
+    branch: main
+  - event: [pull_request, manual]
+
+steps:
+  - name: clippy
+    image: rust:1-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      # In the workspace, so the test step reuses the downloaded crates.
+      - export CARGO_HOME=$PWD/.cargo-home
+      - rustup component add clippy
+      - cargo clippy --locked --all-targets -- -D warnings
+
+  - name: test
+    image: rust:1-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - export CARGO_HOME=$PWD/.cargo-home
+      - cargo test --locked

@@ -1,0 +1,13 @@
+# The Rust the Docker image builds with (see the Dockerfile).
+when:
+  - event: push
+    branch: main
+  - event: [pull_request, manual]
+
+steps:
+  - name: builds-with-rust-1.88
+    image: rust:1.88-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+    commands:
+      - cargo check --locked --all-targets
