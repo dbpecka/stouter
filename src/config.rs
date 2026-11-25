@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -1320,6 +1321,11 @@ pub struct Config {
     /// the daemon warns of them, and `stouter check` fails on them.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_json::Value>,
+    /// The directory of the file this config was loaded from, which a
+    /// relative `tlsDir` is taken from (see [`Config::tls_path`]). Not a
+    /// setting: never written.
+    #[serde(skip)]
+    pub file_dir: Option<std::path::PathBuf>,
 }
 
 /// Where and how much to export as OpenTelemetry spans.
@@ -1395,6 +1401,7 @@ impl Default for Config {
             http_listen: None,
             require_signed_config: false,
             unknown: BTreeMap::new(),
+            file_dir: None,
         }
     }
 }
@@ -1403,8 +1410,24 @@ impl Config {
     /// Load configuration from a JSON file at `path`.
     pub fn load(path: &str) -> Result<Self> {
         let data = std::fs::read_to_string(path).with_context(|| format!("failed to read config file '{path}'"))?;
-        let config: Self = serde_json::from_str(&data).with_context(|| format!("invalid JSON in '{path}'"))?;
+        let mut config: Self = serde_json::from_str(&data).with_context(|| format!("invalid JSON in '{path}'"))?;
+        let parent = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        config.file_dir = Some(std::path::absolute(parent).unwrap_or_else(|_| parent.to_path_buf()));
         Ok(config)
+    }
+
+    /// The directory `tlsDir` names: a relative one is taken from the
+    /// config file's directory, not the working directory, so a daemon
+    /// or CLI run from elsewhere finds the same certificates (rather than
+    /// making a new CA there). `None` if `tlsDir` isn't set.
+    pub fn tls_path(&self) -> Option<String> {
+        let dir = self.tls_dir.as_deref()?;
+        match &self.file_dir {
+            Some(base) if !dir.trim().is_empty() && Path::new(dir).is_relative() => {
+                Some(base.join(dir).to_string_lossy().into_owned())
+            }
+            _ => Some(dir.to_owned()),
+        }
     }
 
     /// Load `path`, or the default config if there is no such file. A file
@@ -2990,6 +3013,27 @@ mod tests {
         assert_eq!(loaded.dynamic_config.service_groups[0].services[0].meta["traefik.scheme"], "h2c");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A relative tlsDir is the config file's directory's, wherever the
+    /// daemon runs from; saving the config keeps it relative.
+    #[test]
+    fn a_relative_tls_dir_is_taken_from_the_config_files_directory() {
+        let dir = std::env::temp_dir().join(format!("stouter_tlsdir_{}_{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stouter.json");
+        let path = path.to_str().unwrap();
+        named().save(path).unwrap(); // tlsDir "tls"
+        let loaded = Config::load(path).unwrap();
+        assert_eq!(loaded.tls_path().unwrap(), dir.join("tls").to_str().unwrap());
+        loaded.save(path).unwrap();
+        assert_eq!(Config::load(path).unwrap().tls_dir.as_deref(), Some("tls"), "written as it was");
+        // An absolute one is as written; a config not from a file, too.
+        let elsewhere = std::env::temp_dir().join("stouter-tls");
+        let absolute = Config { tls_dir: Some(elsewhere.to_str().unwrap().into()), ..loaded };
+        assert_eq!(absolute.tls_path().unwrap(), elsewhere.to_str().unwrap());
+        assert_eq!(named().tls_path().unwrap(), "tls");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

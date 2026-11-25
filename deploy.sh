@@ -182,7 +182,7 @@ if [[ "$CHECK_HELP" == *--local* ]]; then
     set -- -v \"\$D/config:\$D/config:ro\"
     TLS_DIR=\$(sed -n 's/.*\"tlsDir\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"\$D/config/stouter.json\" | head -n 1)
     case \"\$TLS_DIR\" in
-      \"\$D/config\"/*) ;;
+      \"\$D/config\" | \"\$D/config\"/*) ;;
       /*) if [ -d \"\$TLS_DIR\" ]; then set -- \"\$@\" -v \"\$TLS_DIR:\$TLS_DIR:ro\"; fi ;;
     esac
     docker run --rm --network none \"\$@\" $IMAGE_TAG --config \"\$D/config/stouter.json\" check --local
@@ -214,9 +214,9 @@ remote_sudo "
   TLS_DIR=\$(sed -n 's/.*\"tlsDir\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"\$D/config/stouter.json\" | head -n 1)
   case \"\$TLS_DIR\" in
     '') echo \"warning: the config sets no tlsDir: the daemon will not start\" >&2 ;;
-    \"\$D/config\"/*) ;;
+    \"\$D/config\" | \"\$D/config\"/*) ;;
     /*) mkdir -p \"\$TLS_DIR\" && set -- \"\$@\" -v \"\$TLS_DIR:\$TLS_DIR\" ;;
-    *) echo \"warning: tlsDir '\$TLS_DIR' is relative, so it is inside the container and lost when it is replaced\" >&2 ;;
+    .. | ../* | */.. | */../*) echo \"warning: tlsDir '\$TLS_DIR' leaves the config directory, so it is inside the container and lost when it is replaced\" >&2 ;;
   esac
   docker run -d \
     --name $CONTAINER_NAME \

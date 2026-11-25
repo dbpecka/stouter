@@ -590,19 +590,22 @@ is fixed with #85.
   the refused-config cache answers re-offers before the catch-up check, so a
   first peer that can't help (history starting later, unreachable) blocks the
   others until the entry expires. The README says once a minute per peer.
-- [ ] **91. With `requireSignedConfig`, the daemon starts on an unsigned hand edit**
+- [x] **91. With `requireSignedConfig`, the daemon starts on an unsigned hand edit**
   (`startup_config` falls back to the file as is), though the README says a
   hand edit isn't taken. Fix: start on the history's signed entry when the
   file doesn't verify.
-- [ ] **92. A relative `tlsDir` is resolved against the working directory,** not the
+  Fixed: a file that doesn't verify gives way to the newest history entry that does, with a warning; with none (a cluster before its first signed change) the file is kept, as before.
+- [x] **92. A relative `tlsDir` is resolved against the working directory,** not the
   config file's: a daemon started elsewhere makes a new CA there (warned
   only when peers are listed).
-- [ ] **93. Small items:** a ~600-deep nested first message overflows a worker's
+  Fixed: `Config::tls_path` takes a relative `tlsDir` from the config file's directory, for the daemon, renewal and every CLI command; the file keeps it as written. deploy.sh and docker-create.sh no longer warn of a relative one (it is in the mounted config directory) unless it climbs out with `..`.
+- [x] **93. Small items:** a ~600-deep nested first message overflows a worker's
   stack in debug builds (release copes to rmp's 1024; set a lower decode
   depth); `index_config` stores the service index before the policies;
   deploy.sh and docker-create.sh mount the config directory twice when
   `tlsDir` is that directory (Docker 29.9 accepts it); stray line breaks in
   the README's relay sentence.
+  Fixed: messages are decoded at most 64 levels deep (a test overflowed the stack without it); the index ordering with #85; the scripts take `tlsDir` equal to the config directory as inside it; the README's line breaks.
 
 Unconfirmed (code reading): a partial length prefix holds a connection slot
 (bounded per peer); subscribers keep warm connections to nodes hosting only

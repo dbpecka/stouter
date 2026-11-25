@@ -60,7 +60,7 @@ Create a `stouter.json` file:
 | `maxTunnelsPerPeer` | Most tunnels one peer may have open through this node at once (default 4096): raise it for a subscriber holding more open connections to this node's services |
 | `reversePoolSize` | Number of idle reverse connections an `outboundOnly` node keeps at each of its 3 relays (default 64, at most 1024: relays refuse more from one node) |
 | `knownNodes` | Bootstrap peer addresses for initial gossip |
-| `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
+| `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key`. A relative path is taken from the config file's directory |
 | `adminCns` | Certificate common names allowed to issue remote admin RPCs (`--remote` mutations). Empty (default): only the node's own certificate may (the CLI on its host), no one else's |
 | `apiPort` | Port on `127.0.0.1` (default 5381) for the subscribe-mode REST API, or in `node` mode for `/metrics` alone. Set per-cluster when running multiple instances on one host. |
 | `requireSignedConfig` | Accept a config change only if a certificate in `adminCns` signed it (see [Signed config changes](#signed-config-changes)). Default `false`. |
@@ -457,10 +457,8 @@ the daemon (`--remote`) or the local file like `service` commands. With
   for as long as its timestamp would still pass (by the wall clock, as
   that check is), and a request older than that by the clock's highest
   reading so far is refused, so a clock stepped back brings none back. (A
-  relay
-  still carries the
-  tunnel's bytes, as it always has: it can tamper with or cut off the
-  tunnels that go through it.)
+  relay still carries the tunnel's bytes, as it always has: it can tamper
+  with or cut off the tunnels that go through it.)
 - A policy change reaches tunnels already open, as a revocation does: the
   hosting node closes those the new policy doesn't allow (pooled HTTP
   connections, TCP and mux tunnels alike), logging each.
@@ -498,9 +496,10 @@ Keep `tlsDir` on a mounted volume (inside the config directory, or mounted
 itself): in the container's own filesystem, the CA node's CA would be
 replaced with the container, and no other node would trust the new one.
 `deploy.sh` and `docker-create.sh [config dir]` mount the config's `tlsDir`
-when it lies outside the config
-directory. It also takes only cluster names of letters, digits, `-` and `_`
-(they become remote paths), but not `build` or `config` (the default
+when it lies outside the config directory (a relative `tlsDir` is taken
+from the config file's directory). It also takes only cluster names of
+letters, digits, `-` and `_` (they become remote paths), but not `build`
+or `config` (the default
 cluster's own directories), and uploads the repository it is in, wherever
 it's run from: only the files git tracks, as they are in the working tree
 (`git add` a new file to deploy it), so keys, certificates and configs left

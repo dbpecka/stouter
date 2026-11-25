@@ -146,8 +146,21 @@ async fn recv_body<R: AsyncReadExt + Unpin>(stream: &mut R, len_buf: [u8; 4], li
         bail!("read payload: connection closed after {} of {len} bytes", payload.len());
     }
 
-    let msg: Message = rmp_serde::from_slice(&payload).context("deserialize Message")?;
-    Ok(msg)
+    decode_message(&payload)
+}
+
+/// Deepest nesting a received message may have. Every message stouter
+/// sends nests a few levels (a config, a few more); decoding recurses per
+/// level, so a peer's message nested hundreds deep would overflow a
+/// worker's stack (in debug builds; release copes up to rmp's own 1024).
+const MAX_DECODE_DEPTH: usize = 64;
+
+/// A message's payload, decoded. See [`MAX_DECODE_DEPTH`].
+fn decode_message(payload: &[u8]) -> Result<Message> {
+    use serde::Deserialize;
+    let mut de = rmp_serde::Deserializer::from_read_ref(payload);
+    de.set_max_depth(MAX_DECODE_DEPTH);
+    Message::deserialize(&mut de).context("deserialize Message")
 }
 
 // ---------------------------------------------------------------------------
@@ -2479,6 +2492,32 @@ mod tests {
     use super::*;
     use crate::config::{Config, DynamicConfig, ServiceHealth};
     use tokio_util::sync::CancellationToken;
+
+    /// A message nested deeper than any stouter sends is refused rather
+    /// than decoded level by level until the stack runs out.
+    #[test]
+    fn a_deeply_nested_message_is_refused_not_a_stack_overflow() {
+        // {"type": "nodeJoin", "id": "a", "addr": "b", "x": [[[...]]]}: the
+        // unknown field's value is decoded, recursively, before it's dropped.
+        let nested = |depth: usize| {
+            let mut bytes = vec![0x84, 0xa4];
+            bytes.extend_from_slice(b"type");
+            bytes.push(0xa8);
+            bytes.extend_from_slice(b"nodeJoin");
+            bytes.extend_from_slice(&[0xa2, b'i', b'd', 0xa1, b'a', 0xa4, b'a', b'd', b'd', b'r', 0xa1, b'b']);
+            bytes.extend_from_slice(&[0xa1, b'x']);
+            bytes.extend(std::iter::repeat_n(0x91, depth));
+            bytes.push(0xc0);
+            bytes
+        };
+        let Message::NodeJoin { id, addr } = decode_message(&nested(8)).unwrap() else { panic!("not a NodeJoin") };
+        assert_eq!((id.as_str(), addr.as_str()), ("a", "b"));
+        let err = decode_message(&nested(100_000)).unwrap_err();
+        assert!(format!("{err:#}").contains("depth"), "{err:#}");
+        // What stouter itself sends still decodes.
+        let sync = Message::ConfigUpdate { config: DynamicConfig::default() };
+        assert!(matches!(decode_message(&encode_message(&sync).unwrap()).unwrap(), Message::ConfigUpdate { .. }));
+    }
 
     fn node(id: &str, version: u64, unhealthy: &[&str]) -> NodeInfo {
         NodeInfo {

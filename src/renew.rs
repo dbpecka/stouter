@@ -180,9 +180,9 @@ pub async fn renew(state: &Arc<SharedState>) -> Result<i64> {
     // Saved before it is used, so what is in use is what the next start
     // loads; a save that fails leaves the renewal due, to be tried again.
     if persist {
-        if let (Some(dir), Some(tls)) = (state.config.tls_dir.as_deref(), state.tls.as_deref()) {
+        if let (Some(dir), Some(tls)) = (state.config.tls_path(), state.tls.as_deref()) {
             tls.check_identity(&cert, &key)?;
-            crate::pki::save_renewed(dir, &cert, &key)
+            crate::pki::save_renewed(&dir, &cert, &key)
                 .with_context(|| format!("couldn't save the renewed certificate to {dir}"))?;
         }
     }
@@ -252,7 +252,7 @@ pub fn switch_to(state: &SharedState, cert: CertificateDer<'static>, key: &Priva
 /// Switch to the certificate in `tlsDir` if it was replaced by hand (a node
 /// that doesn't hold the CA's key; the CA node's lives in memory).
 fn take_up_copied_cert(state: &SharedState) -> Result<()> {
-    let (Some(dir), Some(tls)) = (state.config.tls_dir.as_deref(), state.tls.as_deref()) else { return Ok(()) };
+    let (Some(dir), Some(tls)) = (state.config.tls_path(), state.tls.as_deref()) else { return Ok(()) };
     if state.issuer.get().is_some() {
         return Ok(());
     }
@@ -269,7 +269,7 @@ fn take_up_copied_cert(state: &SharedState) -> Result<()> {
     if !newer {
         return Ok(());
     }
-    let material = crate::pki::load_existing(dir, &state.config.node_id)?;
+    let material = crate::pki::load_existing(&dir, &state.config.node_id)?;
     if crate::tls::cert_cn(&material.node_cert_der).as_deref() != Some(state.config.node_id.as_str()) {
         bail!("{dir}/node.crt isn't for '{}'", state.config.node_id);
     }

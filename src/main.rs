@@ -484,9 +484,10 @@ async fn main() -> Result<()> {
             }
             let shutdown = CancellationToken::new();
 
-            let tls_dir = cfg.tls_dir.as_deref().ok_or_else(|| {
+            let tls_dir = cfg.tls_path().ok_or_else(|| {
                 anyhow::anyhow!("tlsDir must be set in {}; mTLS is required", cli.config)
             })?;
+            let tls_dir = tls_dir.as_str();
             if let Some(warning) = new_ca_warning(&cfg, tls_dir) {
                 tracing::warn!("{warning}");
             }
@@ -495,7 +496,8 @@ async fn main() -> Result<()> {
             tls_ctx.check_own_cert(&cfg.node_id).with_context(|| format!("the certificates in {tls_dir}"))?;
             tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
 
-            cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config);
+            let history = history::load(&cli.config);
+            cfg.dynamic_config = startup_config(&cfg, &tls_ctx, &cli.config, &history);
             // Edited while the daemon was stopped: start on what it last
             // ran, and take the edit as the config poll takes any (checked,
             // as a new version), once caught up with the cluster.
@@ -507,7 +509,7 @@ async fn main() -> Result<()> {
             let edited_offline = if first_start_alone {
                 None
             } else {
-                edited_while_stopped(&cfg, &history::load(&cli.config))
+                edited_while_stopped(&cfg, &history)
             };
             if let Some(ran) = &edited_offline {
                 tracing::info!(
@@ -636,7 +638,7 @@ async fn main() -> Result<()> {
                 // that isn't its certificate's).
                 Config::load(&cli.config).and_then(|cfg| {
                     cfg.validate_local()?;
-                    if let Some(dir) = cfg.tls_dir.as_deref() {
+                    if let Some(dir) = cfg.tls_path().as_deref() {
                         pki::check_dir(dir, &cfg.node_id).with_context(|| format!("the certificates in {dir}"))?;
                         if let Some(warning) = new_ca_warning(&cfg, dir) {
                             eprintln!("warning: {warning}");
@@ -1313,10 +1315,10 @@ async fn main() -> Result<()> {
             action: CertAction::Issue { node, out },
         }) => {
             let cfg = Config::load(&cli.config)?;
-            let tls_dir = cfg.tls_dir.as_deref().ok_or_else(|| {
+            let tls_dir = cfg.tls_path().ok_or_else(|| {
                 anyhow::anyhow!("tlsDir is not set in {}", cli.config)
             })?;
-            pki::issue_cert_to_dir_with(tls_dir, &node, &out, cfg.cert_lifetime())?;
+            pki::issue_cert_to_dir_with(&tls_dir, &node, &out, cfg.cert_lifetime())?;
             let cert = pki::read_cert(&format!("{out}/node.crt"))?;
             println!("Certificate for '{}' written to {}/", node, out);
             println!("SHA-256 fingerprint: {}", tls::fingerprint_hex(cert.as_ref()));
@@ -1581,9 +1583,17 @@ fn new_ca_warning(cfg: &Config, tls_dir: &str) -> Option<String> {
 /// what an admin signed: the signed text, not whatever the file says around
 /// the signature. Otherwise an edit to a signed config would be in force
 /// here, and served to the CLI as the config to make (and sign) the next
-/// change on. A config with no valid signature is kept, with a warning:
-/// a cluster has one until its first signed change.
-fn startup_config(cfg: &Config, tls_ctx: &tls::TlsContext, path: &str) -> config::DynamicConfig {
+/// change on. A file that doesn't verify (a hand edit that dropped or broke
+/// the signature) gives way to the newest signed config in the history:
+/// what this node last ran as an admin signed it. With none there (a
+/// cluster before its first signed change), the file is kept, with a
+/// warning.
+fn startup_config(
+    cfg: &Config,
+    tls_ctx: &tls::TlsContext,
+    path: &str,
+    history: &[history::HistoryEntry],
+) -> config::DynamicConfig {
     if !cfg.require_signed_config {
         return cfg.dynamic_config.clone();
     }
@@ -1599,6 +1609,17 @@ fn startup_config(cfg: &Config, tls_ctx: &tls::TlsContext, path: &str) -> config
             signed
         }
         Err(e) => {
+            let last_signed = history.iter().rev().filter_map(|entry| entry.config.as_ref()).find_map(|dc| {
+                signing::verify(dc, tls_ctx, &cfg.admin_cns).ok().map(|(signed, _)| signed)
+            });
+            if let Some(signed) = last_signed {
+                tracing::warn!(
+                    "{path}: ignoring a config that isn't admin-signed ({e:#}) and running version {} as last \
+                     signed (its history); apply an edit with `stouter config push` (requireSignedConfig)",
+                    signed.version
+                );
+                return signed;
+            }
             tracing::warn!(
                 "starting with a config that isn't admin-signed ({e:#}); peers requiring signatures won't accept it \
                  until an admin pushes a signed change"
@@ -1765,7 +1786,8 @@ async fn graceful_drain(state: std::sync::Arc<SharedState>) {
 /// The CLI's own TLS identity: from `--cert-dir`, else the local config's
 /// `tlsDir`. Also what it signs config changes with.
 fn load_cli_material(cfg: &Config, cert_dir: Option<&str>) -> Result<pki::PkiMaterial> {
-    let (dir, from) = match (cert_dir, cfg.tls_dir.as_deref()) {
+    let tls_dir = cfg.tls_path();
+    let (dir, from) = match (cert_dir, tls_dir.as_deref()) {
         (Some(dir), _) => (dir, "--cert-dir"),
         (None, Some(dir)) => (dir, "tlsDir in the local config"),
         (None, None) => anyhow::bail!("TLS material not available: pass --cert-dir or set tlsDir in the local config"),
@@ -1792,7 +1814,7 @@ fn cli_tls_context(cfg: &Config, material: &pki::PkiMaterial) -> Result<tls::Tls
     // with another cluster's --cert-dir), its names would wrongly refuse
     // that cluster's nodes and admins. Applied unless the local tlsDir's
     // CA is known to be another one.
-    let local_ca = cfg.tls_dir.as_deref().and_then(|dir| pki::read_cert(&format!("{dir}/ca.crt")).ok());
+    let local_ca = cfg.tls_path().and_then(|dir| pki::read_cert(&format!("{dir}/ca.crt")).ok());
     if local_ca.is_none_or(|ca| ca == material.ca_cert_der) {
         tls_ctx.revocations().set(&cfg.dynamic_config.revoked);
     }
@@ -2622,8 +2644,8 @@ fn save_local_change(
 /// ran): the daemon tells them itself when it starts. Never creates a CA, as one made
 /// here would become the daemon's, cut off from the cluster's.
 fn local_tls(cfg: &Config) -> Result<Option<tls::TlsContext>> {
-    let Some(dir) = cfg.tls_dir.as_deref() else { return Ok(None) };
-    match pki::load_existing(dir, &cfg.node_id) {
+    let Some(dir) = cfg.tls_path() else { return Ok(None) };
+    match pki::load_existing(&dir, &cfg.node_id) {
         Ok(material) => Ok(Some(tls::TlsContext::new(&material)?)),
         Err(e) => {
             eprintln!("note: not telling peers now ({e:#}); the daemon will when it starts");
@@ -2708,13 +2730,25 @@ mod tests {
             dynamic_config: edited.clone(),
             ..Config::default()
         };
-        assert_eq!(port_of(&startup_config(&cfg, &tls_ctx, "stouter.json")), 3000, "the edit is not in force");
+        assert_eq!(port_of(&startup_config(&cfg, &tls_ctx, "stouter.json", &[])), 3000, "the edit is not in force");
         // Unsigned (a cluster before its first signed change): kept.
         let unsigned = Config { dynamic_config: api_on_port(5000), ..cfg.clone() };
-        assert_eq!(port_of(&startup_config(&unsigned, &tls_ctx, "stouter.json")), 5000);
+        assert_eq!(port_of(&startup_config(&unsigned, &tls_ctx, "stouter.json", &[])), 5000);
+        // Unsigned, with a signed config in the history (a hand edit that
+        // dropped the signature): the newest signed one, not the edit.
+        let entry = |dc: &config::DynamicConfig| history::HistoryEntry {
+            version: dc.version,
+            changed_by: String::new(),
+            at_ms: 0,
+            signed_by: None,
+            changes: vec![],
+            config: Some(dc.clone()),
+        };
+        let history = [entry(&signed), entry(&api_on_port(4000))];
+        assert_eq!(port_of(&startup_config(&unsigned, &tls_ctx, "stouter.json", &history)), 3000);
         // Without requireSignedConfig the file is the config.
         let open = Config { require_signed_config: false, ..cfg };
-        assert_eq!(port_of(&startup_config(&open, &tls_ctx, "stouter.json")), 6666);
+        assert_eq!(port_of(&startup_config(&open, &tls_ctx, "stouter.json", &history)), 6666);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
