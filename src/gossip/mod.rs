@@ -525,6 +525,7 @@ async fn handle_status_request(mut stream: MeshStream, state: Arc<SharedState>) 
         require_signed_config: state.config.require_signed_config,
         cert_expires: state.tls.as_ref().and_then(|tls| crate::pki::validity(tls.own_cert().as_ref())).map(|(_, until)| until),
         issues_certs: state.issuer.get().is_some(),
+        departed: state.departed_ids(),
     };
 
     if let Err(e) = send_message(&mut stream, &response).await {
@@ -834,8 +835,15 @@ pub async fn run_sync_loop(state: Arc<SharedState>) {
         .await;
         // Every sync failing for a while (each logged only at debug) is
         // what a node cut off from its cluster looks like: certificates
-        // from another CA, say. Said at warn, now and then.
-        if failures.iter().any(Option::is_none) {
+        // from another CA, say. Said at warn, now and then. Not while peers
+        // sync with it (reachable one way only), nor counting a stretch with
+        // no peer to try.
+        let merged_lately = state
+            .last_merged
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < SYNCS_FAILING_WARN_AFTER);
+        if failures.is_empty() || failures.iter().any(Option::is_none) || merged_lately {
             last_synced = time::Instant::now();
             warned_at = None;
         } else if let Some(Some(last)) = failures.last() {
@@ -1100,18 +1108,40 @@ fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfi
     // (Not when the file already says what's being written, as when an edit
     // made there was just pushed and comes back signed.)
     if known.as_ref().is_some_and(|known| *known != on_disk) && on_disk != new && !cfg.dynamic_config.same_settings(dc) {
-        let aside = crate::config::unused_path(&format!("{path}.unapplied"));
-        match crate::config::write_atomic(std::path::Path::new(&aside), text.as_bytes()) {
-            Ok(()) => warn!(
-                "{path} had an edit not applied here (version {}); it is saved in {aside}, and {path} now holds \
-                 version {} from the cluster: make the edit again on top of that{}",
-                cfg.dynamic_config.version,
-                dc.version,
-                if state.config.require_signed_config { " and push it (`stouter config push`)" } else { "" }
-            ),
-            Err(e) => {
-                error!("{path} had an edit not applied here, and it can't be saved to {aside}: {e}; not writing over it");
+        // What the edit changed, against what this node last knew the file
+        // said: already in `dc` (the cluster took it, from the CLI's
+        // broadcast or a push, and built on it), there is nothing to keep.
+        // Not in it, but touching nothing `dc` changed, it is made again on
+        // top of `dc` (unsigned clusters: a signed one needs an admin to
+        // sign it), for the config poll to take as a new version with the
+        // usual checks. Only an edit that meets a change of the cluster's
+        // is set aside.
+        let base = known.as_deref().and_then(|text| serde_json::from_str::<crate::config::DynamicConfig>(text).ok());
+        match base.and_then(|base| dc.rebase_edit(&base, &cfg.dynamic_config)) {
+            Some(merged) if merged.same_settings(dc) => {
+                info!("{path}: the edit to it (version {}) is in version {} already", cfg.dynamic_config.version, dc.version);
+            }
+            Some(merged) if !state.config.require_signed_config => {
+                info!(
+                    "{path}: the edit to it (version {}) is made again on top of version {} from the cluster, to be \
+                     taken as a new version",
+                    cfg.dynamic_config.version, dc.version
+                );
+                let merged = crate::config::DynamicConfig { signature: None, signed_at: None, ..merged };
+                cfg.dynamic_config = merged;
+                match cfg.save(path) {
+                    Ok(()) => {
+                        *known = Some(new);
+                        crate::history::record(path, dc);
+                    }
+                    Err(e) => error!("failed to persist state to {path}: {e}"),
+                }
                 return;
+            }
+            _ => {
+                if !set_aside_unapplied(state, path, &text, &cfg.dynamic_config, dc) {
+                    return;
+                }
             }
         }
     }
@@ -1122,6 +1152,35 @@ fn persist_state_with(state: &Arc<SharedState>, dc: &crate::config::DynamicConfi
             crate::history::record(path, dc);
         }
         Err(e) => error!("failed to persist state to {path}: {e}"),
+    }
+}
+
+/// Keep `text` (the config file, holding an edit this node can't apply on
+/// top of `dc`) as `<path>.unapplied`, and say so. False if it couldn't be
+/// kept: then the file mustn't be written over.
+fn set_aside_unapplied(
+    state: &SharedState,
+    path: &str,
+    text: &str,
+    edited: &crate::config::DynamicConfig,
+    dc: &crate::config::DynamicConfig,
+) -> bool {
+    let aside = crate::config::unused_path(&format!("{path}.unapplied"));
+    match crate::config::write_atomic(std::path::Path::new(&aside), text.as_bytes()) {
+        Ok(()) => {
+            warn!(
+                "{path} had an edit not applied here (version {}); it is saved in {aside}, and {path} now holds \
+                 version {} from the cluster: make the edit again on top of that{}",
+                edited.version,
+                dc.version,
+                if state.config.require_signed_config { " and push it (`stouter config push`)" } else { "" }
+            );
+            true
+        }
+        Err(e) => {
+            error!("{path} had an edit not applied here, and it can't be saved to {aside}: {e}; not writing over it");
+            false
+        }
     }
 }
 
@@ -1152,9 +1211,15 @@ async fn merge_sync(
     source: &SyncSource<'_>,
 ) {
     // `None`: the sender left its config out, as no newer than ours.
-    let updated = match config {
-        Some(config) => adopt_from_peer(state, config, "dynamic config updated", source.cn).await,
-        None => false,
+    // A config this sync couldn't have checked (the peer had another being
+    // checked) leaves this node not knowing whether it is caught up.
+    let (updated, unchecked) = match config {
+        Some(config) => match adopt_from_peer(state, config, "dynamic config updated", source.cn).await {
+            Adoption::Adopted => (true, false),
+            Adoption::NotAdopted => (false, false),
+            Adoption::Unchecked => (false, true),
+        },
+        None => (false, false),
     };
 
     if updated {
@@ -1327,7 +1392,10 @@ async fn merge_sync(
         }
         changed
     }).await;
-    state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+    *state.last_merged.lock().unwrap() = Some(std::time::Instant::now());
+    if !unchecked {
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Replace `dc` with `incoming` if it supersedes it and this node may adopt
@@ -1373,22 +1441,22 @@ async fn adopt_from_peer(
     incoming: crate::config::DynamicConfig,
     what: &str,
     peer: Option<&str>,
-) -> bool {
+) -> Adoption {
     if !state.config.require_signed_config {
         let mut dc = state.dynamic_config.write().await;
-        return adopt_if_newer(state, &mut dc, incoming, what);
+        return if adopt_if_newer(state, &mut dc, incoming, what) { Adoption::Adopted } else { Adoption::NotAdopted };
     }
     if !incoming.supersedes(&*state.dynamic_config.read().await) {
-        return false;
+        return Adoption::NotAdopted;
     }
     let version = incoming.version;
     let verified = match verify_unlocked(state, incoming, peer).await {
         Some(Ok(config)) => config,
         Some(Err(e)) => {
             crate::signing::log_refusal(state, version, &e);
-            return false;
+            return Adoption::NotAdopted;
         }
-        None => return false,
+        None => return Adoption::Unchecked,
     };
     let mut dc = state.dynamic_config.write().await;
     match crate::signing::admit_verified(state, verified, &dc) {
@@ -1396,14 +1464,24 @@ async fn adopt_from_peer(
             log_adoption(&dc, &config, what);
             *dc = config;
             persist_state_with(state, &dc);
-            true
+            Adoption::Adopted
         }
-        Ok(_) => false,
+        Ok(_) => Adoption::NotAdopted,
         Err(e) => {
             crate::signing::log_refusal(state, version, &e);
-            false
+            Adoption::NotAdopted
         }
     }
+}
+
+/// What became of a config a peer sent (see [`adopt_from_peer`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Adoption {
+    Adopted,
+    NotAdopted,
+    /// Not checked (one refused lately is `NotAdopted`): the peer had
+    /// another being checked. It offers it again next sync.
+    Unchecked,
 }
 
 /// How long a refused signed config isn't checked again.
@@ -1910,7 +1988,7 @@ fn merge_health(existing: Option<&mut NodeInfo>, incoming: &NodeInfo) {
 async fn apply_message(state: &Arc<SharedState>, msg: Message, peer_cn: Option<&str>) {
     match msg {
         Message::ConfigUpdate { config } => {
-            let updated = adopt_from_peer(state, config, "config update received", peer_cn).await;
+            let updated = adopt_from_peer(state, config, "config update received", peer_cn).await == Adoption::Adopted;
             if updated {
                 state.rebuild_service_index().await;
                 print_dynamic_config(state).await;
@@ -2470,19 +2548,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // The cluster moved on while it was stopped: its config arrives
-        // first, and the edit is kept aside, not dropped or sent out.
+        // first, and the edit (touching nothing the cluster changed) is
+        // made again on top of it, as the next version.
         let (state, dir) = started_after_an_offline_edit(edit.clone()).await;
         let v9 = DynamicConfig { version: 9, changed_by: "a".into(), ..named_services(&["api", "from-a"]) };
         {
             let mut dc = state.dynamic_config.write().await;
-            assert!(adopt_if_newer(&state, &mut dc, v9, "test"));
+            assert!(adopt_if_newer(&state, &mut dc, v9.clone(), "test"));
         }
         state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
         poll_for_a_while(&state).await;
         let dc = state.dynamic_config.read().await.clone();
-        assert_eq!((dc.version, service_names(&dc)), (9, vec!["api".into(), "from-a".into()]));
+        assert_eq!((dc.version, service_names(&dc)), (10, vec!["api".into(), "from-a".into(), "edited".into()]));
+        assert!(!std::path::Path::new(&format!("{}.unapplied", state.config_path)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // One that meets a change of the cluster's (both changed api) is
+        // kept aside instead, not dropped or sent out.
+        let mut clashing = edit.clone();
+        clashing.service_groups[0].services[0].node_port = 7001;
+        let (state, dir) = started_after_an_offline_edit(clashing).await;
+        let mut v9_moved = v9.clone();
+        v9_moved.service_groups[0].services[0].node_port = 7002;
+        {
+            let mut dc = state.dynamic_config.write().await;
+            assert!(adopt_if_newer(&state, &mut dc, v9_moved, "test"));
+        }
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_for_a_while(&state).await;
+        let dc = state.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, dc.service_groups[0].services[0].node_port), (9, 7002));
         let aside = Config::load(&format!("{}.unapplied", state.config_path)).unwrap().dynamic_config;
-        assert_eq!(service_names(&aside), ["api", "edited"]);
+        assert_eq!(aside.service_groups[0].services[0].node_port, 7001);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Already in the cluster's config (the CLI's broadcast got there,
+        // and the cluster built on it): nothing to keep or make again.
+        let (state, dir) = started_after_an_offline_edit(edit.clone()).await;
+        let v9_with = DynamicConfig { version: 9, changed_by: "a".into(), ..named_services(&["api", "edited", "from-a"]) };
+        {
+            let mut dc = state.dynamic_config.write().await;
+            assert!(adopt_if_newer(&state, &mut dc, v9_with, "test"));
+        }
+        state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        poll_for_a_while(&state).await;
+        assert_eq!(state.dynamic_config.read().await.version, 9, "no new version");
+        assert!(!std::path::Path::new(&format!("{}.unapplied", state.config_path)).exists(), "no spurious copy");
         let _ = std::fs::remove_dir_all(&dir);
 
         // An edit that breaks the config gets the checks any edit gets.
@@ -2511,9 +2622,8 @@ mod tests {
         }
         state.synced.store(true, std::sync::atomic::Ordering::Relaxed);
         poll_for_a_while(&state).await;
-        assert_eq!(state.dynamic_config.read().await.version, 9);
-        let aside = Config::load(&format!("{}.unapplied", state.config_path)).unwrap().dynamic_config;
-        assert_eq!(service_names(&aside), ["api", "edited"], "kept aside, not lost");
+        let dc = state.dynamic_config.read().await.clone();
+        assert_eq!((dc.version, service_names(&dc)), (10, vec!["api".into(), "from-a".into(), "edited".into()]), "made again on top");
         let _ = std::fs::remove_dir_all(&dir);
 
         // Alone for good: taken once the catch-up time is over.
@@ -3370,22 +3480,34 @@ mod tests {
         assert!(!aside.exists());
 
         // Someone edits the file (by hand, or a CLI on a stale copy), and a
-        // newer config arrives before it's applied: it's kept, not lost.
+        // newer config arrives before it's applied, one that didn't change
+        // what the edit did: the edit is made again on top of it, for the
+        // poll to take.
         let mut edited = crate::config::Config::load(&path_str).unwrap();
         edited.dynamic_config.service_groups[0].services[0].node_port = 4444;
         edited.save(&path_str).unwrap();
         persist_state_with(&state, &config_at(7, 3000));
-        assert_eq!(file_port(), 3000, "the file holds the cluster's config");
+        assert_eq!(file_port(), 4444, "the edit, on top of version 7");
+        assert_eq!(crate::config::Config::load(&path_str).unwrap().dynamic_config.version, 7);
+        assert!(!aside.exists());
+        persist_state_with(&state, &config_at(7, 4444)); // the poll took it
+
+        // One that did change it: kept aside, not lost.
+        let mut edited = crate::config::Config::load(&path_str).unwrap();
+        edited.dynamic_config.service_groups[0].services[0].node_port = 5555;
+        edited.save(&path_str).unwrap();
+        persist_state_with(&state, &config_at(8, 3001));
+        assert_eq!(file_port(), 3001, "the file holds the cluster's config");
         let kept = crate::config::Config::load(aside.to_str().unwrap()).unwrap();
-        assert_eq!(kept.dynamic_config.service_groups[0].services[0].node_port, 4444, "and the edit is kept aside");
+        assert_eq!(kept.dynamic_config.service_groups[0].services[0].node_port, 5555, "and the edit is kept aside");
         std::fs::remove_file(&aside).unwrap();
 
         // A file that already says what's being written (the CLI saved the
         // config it pushed) is no edit to keep.
         let mut same = crate::config::Config::load(&path_str).unwrap();
-        same.dynamic_config = config_at(8, 3000);
+        same.dynamic_config = config_at(9, 3000);
         same.save(&path_str).unwrap();
-        persist_state_with(&state, &config_at(8, 3000));
+        persist_state_with(&state, &config_at(9, 3000));
         assert!(!aside.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

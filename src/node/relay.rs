@@ -191,17 +191,30 @@ where
         timestamp_ms,
         caller,
     };
+    // The NAT'd node reads at most a tunnel request's worth from a reverse
+    // connection (and drops the connection over it): one larger, refused
+    // here, would cost it a connection on each try, and its worker a wait.
+    let size = gossip::encode_message(&msg)?.len();
+    if size > crate::mux::MAX_TUNNEL_REQUEST_BYTES as usize {
+        let msg = format!(
+            "tunnel request of {size} bytes, over the {}-byte limit for one sent through a relay",
+            crate::mux::MAX_TUNNEL_REQUEST_BYTES
+        );
+        crate::node::tunnel::send_tunnel_error(&mut subscriber, &msg).await;
+        bail!("{msg}");
+    }
 
     // Forward the request down a reverse connection and read the NAT'd
     // node's status byte. A connection can die after the pool's liveness
-    // check, so if it fails try another: no client data has been sent yet.
-    // But not after a request went out and got no answer in time: the NAT'd
-    // node may have it (still connecting to its service, say), and having
-    // noted its signed nonce, would refuse the same request again as a
-    // replay, which is all the caller would then hear. The caller tries
-    // the node's next relay instead, with a request signed afresh.
+    // check (or be half dead behind a NAT, taking the request and never
+    // answering), so if it fails try another: no client data has been sent
+    // yet. After a request went out and got no answer in time, the NAT'd
+    // node may have it after all (still connecting to its service, say),
+    // and having noted its signed nonce, refuses it again as a replay: then
+    // the caller hears of the first attempt's timeout, not of that.
     let mut last_err: Option<anyhow::Error> = None;
     let mut ready = None;
+    let mut timed_out = false;
     // All attempts within one deadline, short of the subscriber's own (15s):
     // otherwise its tunnel setup gives up first and never hears why.
     let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
@@ -237,11 +250,10 @@ where
                 break;
             }
             Ok(Err(e)) => last_err = Some(e),
-            Err(_) if msg_is_signed => {
+            Err(_) => {
                 last_err = Some(anyhow::anyhow!("no answer on a reverse connection within {}s", STATUS_TIMEOUT.as_secs()));
-                break;
+                timed_out = true;
             }
-            Err(_) => last_err = Some(anyhow::anyhow!("no answer on reverse connection")),
         }
         debug!("reverse connection for node {node_id} unusable, trying another");
     }
@@ -253,6 +265,23 @@ where
         crate::node::tunnel::send_tunnel_error(&mut subscriber, &msg).await;
         bail!("{msg}");
     };
+    // A retry after a timeout, refused as a replay: the first attempt got
+    // there after all, and it is its timeout the caller should hear of.
+    let mut message = None;
+    if status[0] != 0x00 {
+        let said = crate::node::tunnel::read_tunnel_error(&mut reverse_stream)
+            .await
+            .unwrap_or_else(|e| format!("(the NAT'd node's error was unreadable: {e:#})"));
+        let replay = msg_is_signed && timed_out && said.contains("was already used");
+        message = Some(if replay {
+            format!(
+                "no answer from node {node_id} within {}s (its service may be slow to accept)",
+                STATUS_TIMEOUT.as_secs()
+            )
+        } else {
+            said
+        });
+    }
 
     subscriber
         .write_all(&status)
@@ -263,12 +292,9 @@ where
         .await
         .context("flush tunnel status to subscriber")?;
 
-    if status[0] != 0x00 {
-        // Forward the error message (bounded in size and time: see
+    if let Some(message) = message {
+        // Forward the error message (read bounded in size and time: see
         // `read_tunnel_error`).
-        let message = crate::node::tunnel::read_tunnel_error(&mut reverse_stream)
-            .await
-            .unwrap_or_else(|e| format!("(the NAT'd node's error was unreadable: {e:#})"));
         let bytes = message.as_bytes();
         subscriber
             .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -348,46 +374,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A signed request that went out and got no answer in time isn't sent
-    /// again down another reverse connection: the NAT'd node may have it,
-    /// and would refuse it again as a replay. One that couldn't be sent at
-    /// all (a dead connection) is.
+    /// A signed request that went out and got no answer in time (a reverse
+    /// connection half dead behind a NAT) goes down the next one, which
+    /// answers. If the NAT'd node had it after all and refuses the retry as
+    /// a replay, the caller hears of the timeout, not of that.
     #[tokio::test]
-    async fn a_signed_request_is_sent_again_only_if_it_never_went() {
+    async fn a_signed_request_unanswered_is_tried_again_and_a_replay_isnt_what_the_caller_hears() {
         let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
         let relay = tls_state(&dir, "relay");
         let x = tls_state(&dir, "x");
         let sub = crate::signing::Signer::from_material(&crate::pki::load_or_create(dir.to_str().unwrap(), "sub").unwrap()).unwrap();
+        // The first connection takes the request and never answers; the
+        // second answers with `second`.
+        async fn pair(relay: &Arc<SharedState>, x: &Arc<SharedState>, second: &'static [u8]) -> (crate::tls::MeshStream, tokio::task::JoinHandle<crate::tls::MeshStream>) {
+            // The pool hands out the last in first: the silent one.
+            let (answering, server_end) = mesh_pair(x, relay).await;
+            relay.reverse_pool.push("x".into(), server_end);
+            let (silent, server_end) = mesh_pair(x, relay).await;
+            relay.reverse_pool.push("x".into(), server_end);
+            let answered = tokio::spawn(async move {
+                let mut answering = answering;
+                gossip::recv_message(&mut answering).await.unwrap();
+                answering.write_all(second).await.unwrap();
+                answering.flush().await.unwrap();
+                answering
+            });
+            (silent, answered)
+        }
+        let ts = now_ms();
+
+        // (Real time: a paused clock would run past the 5 s while the
+        // answer is on its way over a real socket.)
+        let (_silent, answered) = pair(&relay, &x, &[0x00]).await;
+        let caller = crate::signing::sign_tunnel_request(&sub, "x", "svc", ts).unwrap();
+        let (subscriber, mut ours) = tokio::io::duplex(4096);
+        let relay2 = relay.clone();
+        tokio::spawn(async move { relay_tunnel(subscriber, "x", "svc", ts, Some(caller), None, &relay2).await });
+        let mut status = [0u8; 1];
+        ours.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x00], "the second connection carried it");
+        drop(answered);
+
+        let replay_error = b"\x01\x00\x00\x00\x1bwas already used (a replay)";
+        let (_silent, _answered) = pair(&relay, &x, replay_error).await;
+        let caller = crate::signing::sign_tunnel_request(&sub, "x", "svc", ts).unwrap();
+        let (subscriber, mut ours) = tokio::io::duplex(4096);
+        let err = relay_tunnel(subscriber, "x", "svc", ts, Some(caller), None, &relay).await.unwrap_err();
+        assert!(err.to_string().contains("no answer from node x within 5s"), "{err}");
+        ours.read_exact(&mut status).await.unwrap();
+        let heard = crate::node::tunnel::read_tunnel_error(&mut ours).await.unwrap();
+        assert!(!heard.contains("already used") && heard.contains("no answer"), "{heard}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request too large for the NAT'd node to read is refused here,
+    /// before any of its reverse connections is taken (each would be
+    /// dropped by it, its worker made to wait).
+    #[tokio::test]
+    async fn an_oversized_request_uses_up_no_reverse_connection() {
+        let dir = std::env::temp_dir().join(format!("stouter_relay_{}_{}", std::process::id(), rand::random::<u64>()));
+        let relay = tls_state(&dir, "relay");
+        let x = tls_state(&dir, "x");
         let mut held = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (client, server_end) = mesh_pair(&x, &relay).await;
             relay.reverse_pool.push("x".into(), server_end);
             held.push(client);
         }
-        tokio::time::pause();
-        let ts = now_ms();
-        let caller = crate::signing::sign_tunnel_request(&sub, "x", "svc", ts).unwrap();
-        let (subscriber, _ours) = tokio::io::duplex(4096);
-        let err = relay_tunnel(subscriber, "x", "svc", ts, Some(caller), None, &relay).await.unwrap_err();
-        assert!(err.to_string().contains("no answer on a reverse connection"), "{err}");
-        assert_eq!(relay.reverse_pool.count("x"), 1, "the other connection wasn't used");
-
-        // A connection that's gone: the request goes down the next one.
-        held.remove(0);
-        drop(held);
-        let (client, server_end) = mesh_pair(&x, &relay).await;
-        let answered = tokio::spawn(async move {
-            let mut client = client;
-            gossip::recv_message(&mut client).await.unwrap();
-            client.write_all(&[0x00]).await.unwrap();
-            client
-        });
-        relay.reverse_pool.push("x".into(), server_end);
-        let caller = crate::signing::sign_tunnel_request(&sub, "x", "svc", ts).unwrap();
-        let (subscriber, _ours) = tokio::io::duplex(4096);
-        let relay2 = relay.clone();
-        tokio::spawn(async move { relay_tunnel(subscriber, "x", "svc", ts, Some(caller), None, &relay2).await });
-        let _client = tokio::time::timeout(Duration::from_secs(30), answered).await.expect("sent down the live one").unwrap();
+        let (subscriber, mut ours) = tokio::io::duplex(65536);
+        let big = "s".repeat(20_000);
+        let err = relay_tunnel(subscriber, "x", &big, now_ms(), None, None, &relay).await.unwrap_err();
+        assert!(err.to_string().contains("over the 16384-byte limit"), "{err}");
+        assert_eq!(relay.reverse_pool.count("x"), 3, "none taken");
+        let mut status = [0u8; 1];
+        ours.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [0x01]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -240,7 +240,12 @@ pub async fn handle_mux_session(stream: MeshStream, state: Arc<SharedState>) {
                     Ok(slot) => slot,
                     Err(why) => {
                         gossip::warn_rarely(&LAST_LIMIT_WARNING, format_args!("refusing a mux stream: {why}"));
-                        drop(yamux_stream);
+                        // Saying why (in its own task, bounded: the peer
+                        // may not read), rather than only resetting it.
+                        tokio::spawn(async move {
+                            let mut stream = yamux_stream.compat();
+                            let _ = tokio::time::timeout(Duration::from_secs(5), send_tunnel_error(&mut stream, &why)).await;
+                        });
                         continue;
                     }
                 };

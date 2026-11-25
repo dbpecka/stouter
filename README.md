@@ -57,6 +57,7 @@ Create a `stouter.json` file:
 | `advertiseAddr` | Address peers use to reach this node. Without it, with a wildcard `bind` (`0.0.0.0` or `[::]`), peers use the address they reach the node at, and pass that on to nodes that hear of it through them: those use it until the node contacts them itself (they only count it as live once its own certificate answers there). Set it when that address isn't one every peer can reach. |
 | `nodeId` | Unique identifier for this node |
 | `outboundOnly` | Set `true` for nodes behind NAT — disables listener, uses reverse connections |
+| `maxTunnelsPerPeer` | Most tunnels one peer may have open through this node at once (default 4096): raise it for a subscriber holding more open connections to this node's services |
 | `reversePoolSize` | Number of idle reverse connections an `outboundOnly` node keeps at each of its 3 relays (default 64, at most 1024: relays refuse more from one node) |
 | `knownNodes` | Bootstrap peer addresses for initial gossip |
 | `tlsDir` | Directory for `ca.crt`, `ca.key`, `node.crt`, `node.key` |
@@ -89,13 +90,20 @@ it the next version (it checks the file every 10 seconds). One made while
 the daemon was stopped (the file says something else than the last version
 in its config history) waits until the daemon has caught up with the
 cluster after starting (a first sync, or two minutes; a node with no
-`knownNodes` waits for its peers to sync with it too): if the cluster moved
-on meanwhile, the newer config comes first and the edit is kept as
-`<config>.unapplied`, to make again on top of it. A change the CLI makes
+`knownNodes` waits for its peers to sync with it too, unless it has never
+run: then it is a new cluster's first node, and takes it at once). If the
+cluster moved on meanwhile, the newer config comes first, and the edit is
+compared with it, piece by piece (each service instance, each service's
+routes and policy, each revocation): already in it (the cluster took it,
+from the CLI or a push), there is nothing to do; touching nothing the
+cluster changed, it is made again on top of the newer config and taken as
+the next version; only an edit that meets a change of the cluster's is
+kept as `<config>.unapplied`, to make again by hand. A change the CLI makes
 while the daemon is stopped (`service add`, say, on a new node not yet
-started) is such an edit too. With `requireSignedConfig`, only a signed
-change (the CLI's, with an admin certificate) is taken; a hand edit isn't
-taken at all.
+started, which is how one joins with its services) is such an edit too.
+With `requireSignedConfig`, only a signed change (the CLI's, with an admin
+certificate) is taken, and an edit not in the newer config is kept aside
+(it needs an admin to sign it again); a hand edit isn't taken at all.
 
 CLI commands that change the local file (`init`, `service add` without
 `--remote`, and so on) refuse a file they can't parse instead of starting
@@ -212,7 +220,7 @@ Services are organized into groups. Each service entry maps a name to a local po
 
 `stouter service add|rename|remove` and `stouter route set|clear`, local or `--remote`, refuse a change that would break the config, such as claiming another service's domain, or removing or renaming a service that still has routes (clear them first). A problem the config already had doesn't block unrelated changes.
 
-Without `--remote`, these commands make the change through this host's daemon when it is running (`outboundOnly` ones have no listener to ask), as if `--remote` named it: editing the file behind a running daemon's back could undo a change the daemon took in at the same moment. They edit the file only when nothing is listening at the config's `bind` (the connection is refused, or nothing accepts it within 3 seconds), refusing if the file changed while they ran; the daemon takes the change when it starts (see [Configuration](#configuration)). A daemon that is listening but refuses the CLI's certificate (another cluster's, or expired) or doesn't answer is an error, and nothing is changed. The daemon accepts these changes from its own certificate; with `requireSignedConfig` they must still be signed by an admin. `--node` defaults to this host's node, or with `--remote`, to the node at that address.
+Without `--remote`, these commands make the change through this host's daemon when it is running (`outboundOnly` ones have no listener to ask), as if `--remote` named it: editing the file behind a running daemon's back could undo a change the daemon took in at the same moment. They edit the file only when nothing is listening at the config's `bind` (the connection is refused, or nothing accepts it within 3 seconds), refusing if the file changed while they ran; the daemon takes the change when it starts (see [Configuration](#configuration)). Something listening there that doesn't take the change (a daemon refusing the CLI's certificate, another cluster's or expired, or another program on that port) or doesn't answer is an error, and nothing is changed; `--file-only` changes the file all the same (with the daemon stopped). The daemon accepts these changes from its own certificate; with `requireSignedConfig` they must still be signed by an admin. `--node` defaults to this host's node, or with `--remote`, to the node at that address.
 
 CLI commands print their results on stdout, and only those: their log lines (warnings and errors; more with `RUST_LOG=info`) go to stderr. A command whose output is cut short (`stouter config history | head`) ends as Unix tools do, by SIGPIPE (status 141), with nothing on stderr; a daemon closing the connection on it is an error, reported (status 1). The daemon logs to stdout from `info` up (`RUST_LOG` sets the level), in colour only on a terminal.
 
@@ -432,7 +440,9 @@ the daemon (`--remote`) or the local file like `service` commands. With
   remembered for that, each caller with a share of the room: some 800 new
   tunnels a second from one caller to one node). A request is remembered
   for as long as its timestamp would still pass (by the wall clock, as
-  that check is), so a clock stepped back brings none back. (A relay
+  that check is), and a request older than that by the clock's highest
+  reading so far is refused, so a clock stepped back brings none back. (A
+  relay
   still carries the
   tunnel's bytes, as it always has: it can tamper with or cut off the
   tunnels that go through it.)
@@ -477,7 +487,8 @@ cluster's own directories), and uploads the repository it is in, wherever
 it's run from: only the files git tracks, as they are in the working tree
 (`git add` a new file to deploy it), so keys, certificates and configs left
 in the directory (`init` and `cert issue` write there by default) never
-leave the machine.
+leave the machine. Outside a git checkout, only what the image is built
+from (`Cargo.toml`, `Cargo.lock`, `Dockerfile`, `src/`).
 
 Before replacing the running container, `deploy.sh` checks the host's
 config and the certificates in its `tlsDir` with the new image (`stouter
@@ -570,9 +581,11 @@ On receiving a config:
   nodes) are settled the same way everywhere, so the cluster can't stay
   split: the one revoking more certificates wins (so a change made without
   having seen a revocation can't undo it), then by the `changedBy` node that
-  made each, then by content. Before all that, a config whose signer's
-  certificate has expired loses to one whose signer's hasn't, as running
-  nodes refuse it. Every node that drops a revocation this way logs a warning
+  made each, then by content. Before all that, one arriving from a signer
+  whose certificate has expired never wins, as running nodes refuse it;
+  the one a node holds isn't demoted when its own signer's certificate
+  expires later (or a member replaying the other could undo its
+  revocations). Every node that drops a revocation this way logs a warning
   naming it. Nodes running an earlier version settle ties without either
   rule, so in a mixed cluster such a tie can stay split until the next
   change. Between one
@@ -663,7 +676,8 @@ Limits, so one peer can't exhaust a node:
   request and sync reads: one larger than a config may be is refused
   unread, one refused in the last ten minutes isn't checked again, and a
   peer has one checked at a time.
-- One peer may have at most 4096 tunnels open through a node at once, on
+- One peer may have at most 4096 tunnels open through a node at once
+  (`maxTunnelsPerPeer` changes that, per node), on
   plain connections and mux streams alike, served there or relayed, for as
   long as each is open: a connected tunnel still holds buffers, and data up
   to its window, whether or not anything reads it. A node can't have a
@@ -860,7 +874,7 @@ NAT'd node                  Relay node
     │◄─────────── data ──────────│  (bidirectional proxy)
 ```
 
-The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay of X's ranking highest for the pair (rendezvous hashing again, on the subscriber's, X's and the relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, and a subscriber's tunnels to many NAT'd nodes sharing relays spread over them too, instead of all going through one. If a tunnel through that relay fails (or gets no answer within 5 seconds, when its host stopped answering), the subscriber tries X's next relay in the same setup, so a relay going down doesn't fail X's tunnels for the half minute until gossip marks it stale. With a shorter time for the whole setup (an HTTP service's `requestTimeoutMs`), each relay left gets an equal share of it, so the next one still gets its turn; and a relay that didn't answer in time is tried after X's others for 20 seconds. If a reverse connection turns out to be dead (the request can't be sent, or it closes before answering), the relay tries another (up to 3) before failing the tunnel; not one that took the request and didn't answer in 5 seconds, as the NAT'd node may have it and would refuse it again as a replay (the subscriber tries the next relay, with its request signed afresh), all within 12 seconds, so the subscriber (which waits 15) hears why. An `outboundOnly` subscriber in `subscribe` mode hosts nothing, so it keeps no reverse connections. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
+The NAT'd node replenishes its pool immediately after each use, maintaining `reversePoolSize` idle connections per relay at all times. It keeps its relays as long as they stay live, so the set (which it signs into its record) doesn't change as nodes come and go; one that stops answering for 30 seconds is replaced. New relays are picked by rendezvous hashing of the two node ids, which spreads NAT'd nodes evenly over the cluster: each node's idle reverse connections stay about the same as the cluster grows, instead of growing with it. A relay only accepts a registration for node X from a certificate for X, and subscribers send X's tunnels only through relays X lists in its signed record, so no other node can take X's traffic. Each subscriber uses the live relay of X's ranking highest for the pair (rendezvous hashing again, on the subscriber's, X's and the relay's ids), so subscribers spread over X's relays and use the reverse connections X keeps at each, and a subscriber's tunnels to many NAT'd nodes sharing relays spread over them too, instead of all going through one. If a tunnel through that relay fails (or gets no answer within 5 seconds, when its host stopped answering), the subscriber tries X's next relay in the same setup, so a relay going down doesn't fail X's tunnels for the half minute until gossip marks it stale. With a shorter time for the whole setup (an HTTP service's `requestTimeoutMs`), each relay left gets an equal share of it, so the next one still gets its turn; and a relay that didn't answer in time is tried after X's others for 20 seconds. If a reverse connection turns out to be dead (the request can't be sent, or it closes before answering), the relay tries another (up to 3) before failing the tunnel; also one that took the request and didn't answer in 5 seconds (half dead behind a NAT); if the NAT'd node had it after all and refuses the retry as a replay, the subscriber hears of the timeout. A request larger than a NAT'd node reads from a reverse connection (16 KiB) is refused at the relay, all within 12 seconds, so the subscriber (which waits 15) hears why. An `outboundOnly` subscriber in `subscribe` mode hosts nothing, so it keeps no reverse connections. Workers back off exponentially when a relay can't be reached, and stop when it is no longer one of the node's relays.
 
 ### Multiplexing (Yamux)
 

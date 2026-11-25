@@ -55,20 +55,21 @@ pub(crate) async fn read_tunnel_error<R: AsyncRead + Unpin>(stream: &mut R) -> R
     .map_err(|_| anyhow::anyhow!("tunnel error message not sent in time"))?
 }
 
-/// Most tunnels one peer may have open through this node at once: on plain
-/// connections and mux streams alike, served here or relayed, for as long
-/// as each is open. Each holds memory (buffers, and data up to its window)
-/// and, relayed, a connection to the NAT'd node, whether or not anything
-/// reads it: uncapped, one member could make a node hold gigabytes. Far
-/// more than a subscriber keeps open to one node.
+/// Most tunnels one peer may have open through this node at once, unless
+/// the config's `maxTunnelsPerPeer` says otherwise: on plain connections
+/// and mux streams alike, served here or relayed, for as long as each is
+/// open. Each holds memory (buffers, and data up to its window) and,
+/// relayed, a connection to the NAT'd node, whether or not anything reads
+/// it: uncapped, one member could make a node hold gigabytes.
 pub(crate) const MAX_TUNNELS_PER_PEER: usize = 4096;
 
 /// A place among `peer`'s open tunnels (see [`MAX_TUNNELS_PER_PEER`]),
 /// held for the tunnel's whole life; or why there is none.
 pub(crate) fn tunnel_slot(state: &Arc<SharedState>, peer: &str) -> std::result::Result<crate::state::PeerSlot, String> {
-    state
-        .try_peer_slot("tunnel", peer, MAX_TUNNELS_PER_PEER)
-        .ok_or_else(|| format!("'{peer}' already has {MAX_TUNNELS_PER_PEER} tunnels open through this node"))
+    let limit = state.config.max_tunnels_per_peer.unwrap_or(MAX_TUNNELS_PER_PEER);
+    state.try_peer_slot("tunnel", peer, limit).ok_or_else(|| {
+        format!("'{peer}' already has {limit} tunnels open through this node (its maxTunnelsPerPeer)")
+    })
 }
 
 /// Why a tunnel to `target` that `caller` asks this node to relay is
@@ -227,6 +228,18 @@ const LOCAL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tunnel_cap_can_be_set_per_node() {
+        let cfg = crate::config::Config { max_tunnels_per_peer: Some(2), ..Default::default() };
+        let state = SharedState::new(cfg, String::new(), tokio_util::sync::CancellationToken::new(), None);
+        let held = [tunnel_slot(&state, "p").unwrap(), tunnel_slot(&state, "p").unwrap()];
+        let Err(why) = tunnel_slot(&state, "p") else { panic!("over the cap") };
+        assert!(why.contains("already has 2 tunnels"), "{why}");
+        assert!(tunnel_slot(&state, "q").is_ok(), "per peer");
+        drop(held);
+        assert!(tunnel_slot(&state, "p").is_ok());
+    }
 
     #[tokio::test]
     async fn a_peer_cant_make_us_allocate_what_it_likes_for_an_error() {

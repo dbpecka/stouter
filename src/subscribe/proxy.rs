@@ -227,7 +227,12 @@ pub(super) fn service_backends(service_name: &str, state: &SharedState) -> Vec<B
                 node,
                 weight: svc.weight,
                 max_connections: svc.max_connections,
-                request_timeout: svc.request_timeout_ms.map(Duration::from_millis),
+                // Below the minimum (a config from before there was one) is
+                // taken as the minimum: at 0, every request would fail and
+                // every instance be ejected.
+                request_timeout: svc
+                    .request_timeout_ms
+                    .map(|ms| Duration::from_millis(ms.max(crate::config::MIN_REQUEST_TIMEOUT_MS))),
                 labels: svc.labels.clone(),
             })
         })
@@ -724,6 +729,19 @@ mod tests {
         // An older, unsigned NAT'd node: its gossiped relay, as before.
         let old = NodeInfo { id: "o".into(), relay: Some("m:1".into()), ..Default::default() };
         assert_eq!(tunnel_route(&old, &state), Some(("m:1".into(), Some("m".into()))));
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_under_the_minimum_is_taken_as_the_minimum() {
+        let dc: DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "serviceGroups": [{"name": "g", "services": [{"name": "web", "nodeId": "me", "nodePort": 1, "requestTimeoutMs": 0}]}],
+        }))
+        .unwrap();
+        let cfg = Config { node_id: "me".into(), mode: crate::config::Mode::NodeSubscribe, dynamic_config: dc, ..Config::default() };
+        let state = SharedState::new(cfg, String::new(), CancellationToken::new(), None);
+        let backends = service_backends("web", &state);
+        assert_eq!(backends[0].request_timeout, Some(Duration::from_millis(crate::config::MIN_REQUEST_TIMEOUT_MS)));
     }
 
     #[tokio::test]

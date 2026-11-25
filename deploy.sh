@@ -120,12 +120,11 @@ if [[ "$RESTART_ONLY" == false ]]; then
     TREE=$(git stash create 2>/dev/null || true)
     git archive --format=tar "${TREE:-HEAD}" | tar -xf - -C "$STAGE"
   else
-    echo "warning: not a git checkout: uploading the directory, without keys, certificates, configs or state" >&2
-    while IFS= read -r source; do cp -R "$source" "$STAGE/"; done < <(find . -maxdepth 1 \
-      ! -name '.' ! -name 'target' ! -name '.git' ! -name '.idea' ! -name 'tls' ! -name 'tlsDir' \
-      ! -name '*.json' ! -name '*.key' ! -name '*.crt' ! -name '*.pem' \
-      ! -name '*.history' ! -name '*.state' ! -name '*.unapplied*' ! -name '*.bak*' \
-      -print)
+    # Only what the image is built from (see the Dockerfile): anything
+    # else here, a directory of certificates included, stays here.
+    echo "warning: not a git checkout: uploading only what the image is built from (Cargo.toml, Cargo.lock, Dockerfile, src/)" >&2
+    cp Cargo.toml Cargo.lock Dockerfile "$STAGE/"
+    cp -R src "$STAGE/src"
   fi
   # A loop rather than `mapfile`, which macOS's bash (3.2) doesn't have.
   SOURCES=()

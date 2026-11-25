@@ -487,6 +487,8 @@ pub struct SharedState {
     /// signature, with when (see `gossip::adopt_from_peer`): a peer offering
     /// one again isn't checked again for a while.
     pub(crate) refused_configs: Mutex<std::collections::VecDeque<(u64, std::time::Instant)>>,
+    /// When a sync with a peer, either way, was last merged here.
+    pub(crate) last_merged: Mutex<Option<std::time::Instant>>,
     /// Keys for those hashes, this process's own.
     pub(crate) refused_hasher: std::collections::hash_map::RandomState,
     /// The cluster CA, when this node holds its key: it issues renewed
@@ -609,6 +611,7 @@ impl SharedState {
             policies: ArcSwap::from_pointee(policies),
             tunnel_nonces: Mutex::new(crate::authz::NonceCache::default()),
             refused_configs: Mutex::new(std::collections::VecDeque::new()),
+            last_merged: Mutex::new(None),
             refused_hasher: std::collections::hash_map::RandomState::new(),
             issuer: std::sync::OnceLock::new(),
             renewals: Mutex::new(HashMap::new()),
@@ -925,8 +928,6 @@ impl SharedState {
         forgotten.values().map(|(addr, _)| addr.clone()).collect()
     }
 
-    /// Take one of `peer`'s at most `limit` connections of `kind`, or `None`
-    /// if it already holds them all.
     /// Run `task`, one of the loops the daemon can't do without (gossip,
     /// the config poll, health checks, ...), which only ever end at
     /// shutdown. If it ends before then (a panic: tokio would otherwise
@@ -959,6 +960,8 @@ impl SharedState {
         });
     }
 
+    /// Take one of `peer`'s at most `limit` connections of `kind`, or `None`
+    /// if it already holds them all.
     pub fn try_peer_slot(self: &Arc<Self>, kind: &'static str, peer: &str, limit: usize) -> Option<PeerSlot> {
         let key = (kind, peer.to_string());
         let mut slots = self.peer_slots.lock().unwrap();
@@ -1006,6 +1009,12 @@ impl SharedState {
         let mut relayed = self.relayed_here.lock().unwrap();
         relayed.retain(|_, at| at.elapsed() < RELAYED_HERE_LATELY);
         relayed.insert(node.to_string(), std::time::Instant::now());
+    }
+
+    /// The nodes that left lately (their tombstones not yet expired).
+    pub fn departed_ids(&self) -> Vec<String> {
+        let departed = self.departed.lock().unwrap();
+        departed.iter().filter(|(_, t)| t.at.elapsed() < TOMBSTONE_TTL).map(|(id, _)| id.clone()).collect()
     }
 
     /// Make `node`'s last reverse connection here older than "lately".

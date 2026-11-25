@@ -111,9 +111,14 @@ fn refuse(service: &str, who: &str) -> Result<(), String> {
 /// How long after its timestamp a signed request's nonce is remembered:
 /// for as long as the request could still pass the freshness check (its
 /// timestamp within 30 seconds of now), and a second more. By the wall
-/// clock, as that check is: a clock stepped back can't bring back a
-/// request whose nonce was let go.
+/// clock, as that check is, and its highest reading so far (see
+/// [`NonceCache::high_water_ms`]), so a clock stepped back can't bring back
+/// a request whose nonce was let go.
 const NONCE_KEPT_MS: u64 = 31_000;
+
+/// How old a request may be, by the clock's highest reading so far: the
+/// freshness check's 30 seconds.
+const FRESH_FOR_MS: u64 = 30_000;
 
 /// Most nonces remembered. Each comes from a request a cluster member
 /// signed (and this node verified), so only an allowed member flooding its
@@ -139,6 +144,11 @@ pub struct NonceCache {
     total: usize,
     /// When every signer's were last pruned (Unix ms).
     pruned_ms: u64,
+    /// The wall clock's highest reading so far (Unix ms). A request older
+    /// than the freshness check allows by it is refused, whatever the clock
+    /// says now: its nonce may be gone, and a clock stepped back would
+    /// otherwise let it be replayed.
+    high_water_ms: u64,
 }
 
 /// One signer's remembered nonces.
@@ -180,6 +190,11 @@ impl NonceCache {
     }
 
     fn note_at(&mut self, signer: &str, nonce: u64, timestamp_ms: u64, now_ms: u64) -> bool {
+        self.high_water_ms = self.high_water_ms.max(now_ms);
+        let now_ms = self.high_water_ms;
+        if timestamp_ms.saturating_add(FRESH_FOR_MS) < now_ms {
+            return false;
+        }
         // Every signer's now and then (one that went quiet holds nothing
         // for long); this signer's every time. Never a scan of the lot.
         if now_ms.abs_diff(self.pruned_ms) >= PRUNE_EVERY_MS || self.total >= MAX_NONCES {
@@ -301,13 +316,24 @@ mod tests {
         // Kept while the request could still pass the freshness check
         // (within 30 s of its timestamp), let go after.
         assert!(!cache.note_at("a", 1, now, now + 30_000));
-        assert!(cache.note_at("a", 1, now, now + NONCE_KEPT_MS + 1));
+        // Let go after, when the request could no longer pass anyway.
+        assert!(cache.note_at("c", 1, now + NONCE_KEPT_MS + 1_001, now + NONCE_KEPT_MS + 1_001));
+        assert_eq!(cache.total, 1, "a's and b's let go");
+        assert!(!cache.note_at("a", 1, now, now + NONCE_KEPT_MS + 1_001), "too old by then");
         // By the wall clock: a clock stepped back (by a minute, say) brings
         // nothing back. A request from before the step is still within 30 s
         // of the corrected clock, and its nonce is still held.
         let mut cache = NonceCache::default();
         assert!(cache.note_at("a", 7, now, now));
         assert!(!cache.note_at("a", 7, now, now + 70_000 - 60_000), "stepped back: still a replay");
+        // Nor once its nonce is let go, then the clock steps back (by 10 s):
+        // by the clock's highest reading, the request is too old.
+        let mut cache = NonceCache::default();
+        assert!(cache.note_at("a", 42, now, now));
+        assert!(cache.note_at("b", 1, now + 32_000, now + 32_000), "prunes a's");
+        assert!(!cache.note_at("a", 42, now, now + 22_000), "stepped back after expiry: still refused");
+        // A fresh request after the step is fine.
+        assert!(cache.note_at("a", 43, now + 22_000, now + 22_000));
 
         // Full: refused rather than forgetting a fresh one.
         let mut cache = NonceCache::default();

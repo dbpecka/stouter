@@ -59,6 +59,17 @@ check "C, with its stdout closed, takes the cluster's config" wait_for 30 grep -
 cli service add --group web --name cache --port 6379 > /dev/null
 check "and the next change too" wait_for 30 grep -q '"cache"' "$WORK/C.json"
 check "C is still running" kill -0 "${PIDS[-1]}"
+# The README's way to add a node: a service added on it before it ever
+# ran, while the cluster is versions ahead. Started, it catches up and makes
+# the change again on top of the cluster's config, which takes it; nothing
+# is set aside.
+conf D 27804 '"127.0.0.1:27801"'
+"$BIN" --config "$WORK/D.json" service add --group web --name dsvc --port 3900 >> "$WORK/cli.log" 2>&1
+start D "$WORK/D.json"
+check "a service added on a new node before it started reaches the cluster" wait_for 60 grep -q '"dsvc"' "$WORK/A.json"
+check "  on top of what the cluster had" grep -q '"cache"' "$WORK/A.json"
+check "  with nothing set aside" sh -c "! ls '$WORK'/D.json.unapplied* > /dev/null 2>&1"
+
 # A command whose output is cut short (`| head`) ends as Unix tools do,
 # by SIGPIPE, with nothing on stderr; more output than a pipe holds.
 {

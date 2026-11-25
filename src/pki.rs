@@ -552,9 +552,34 @@ pub fn holds_certificates(tls_dir: &str) -> bool {
 /// (some of the files but not a set, a key that isn't its certificate's),
 /// changing nothing. None at all is fine: the daemon makes a new CA.
 pub fn check_dir(tls_dir: &str, node_id: &str) -> Result<()> {
-    if holds_certificates(tls_dir) {
-        load_dir(tls_dir, node_id, DEFAULT_CERT_LIFETIME)?;
+    if !holds_certificates(tls_dir) {
+        return Ok(());
     }
+    let dir = Path::new(tls_dir);
+    // A renewal a crash cut short, which the daemon finishes as it starts
+    // (see `finish_renewal`): finished on a copy, as the daemon would,
+    // without touching the directory (read-only, in deploy.sh's check).
+    let material = if dir.join("node.key.next").exists() || dir.join("node.crt.next").exists() {
+        let copy = std::env::temp_dir().join(format!("stouter_check_{}_{}", std::process::id(), rand::random::<u64>()));
+        let checked = (|| {
+            std::fs::create_dir_all(&copy)?;
+            for name in ["ca.crt", "ca.key", "node.crt", "node.key", "node.key.next", "node.crt.next"] {
+                if dir.join(name).exists() {
+                    std::fs::copy(dir.join(name), copy.join(name)).with_context(|| format!("copy {name}"))?;
+                }
+            }
+            finish_renewal(&copy)?;
+            load_dir(copy.to_str().unwrap_or_default(), node_id, DEFAULT_CERT_LIFETIME)
+        })();
+        let _ = std::fs::remove_dir_all(&copy);
+        checked?
+    } else {
+        load_dir(tls_dir, node_id, DEFAULT_CERT_LIFETIME)?
+    };
+    // And taken as the daemon takes them, which checks the key against its
+    // certificate whatever the key's format (the check above reads only
+    // PKCS#8 keys).
+    crate::tls::TlsContext::new(&material).context("certificate and key")?;
     Ok(())
 }
 
@@ -755,6 +780,68 @@ mod validity_tests {
         let err = check_dir(s, "n1").unwrap_err();
         assert!(format!("{err:#}").contains("not a complete set"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A renewal cut short between its two renames (the new key in place,
+    /// the new certificate still staged), which the daemon finishes as it
+    /// starts: `check --local` takes it too, and changes nothing.
+    #[test]
+    fn check_dir_takes_a_renewal_the_daemon_would_finish() {
+        let dir = temp_dir("check_midrenew");
+        let (ca, node) = (dir.join("ca"), dir.join("node"));
+        load_or_create(ca.to_str().unwrap(), "ca-node").unwrap();
+        issue_cert_to_dir(ca.to_str().unwrap(), "n1", node.to_str().unwrap()).unwrap();
+        // A second issue, as a renewal stages it: the key already moved in.
+        let staged = dir.join("staged");
+        issue_cert_to_dir(ca.to_str().unwrap(), "n1", staged.to_str().unwrap()).unwrap();
+        std::fs::copy(staged.join("node.key"), node.join("node.key")).unwrap();
+        std::fs::copy(staged.join("node.crt"), node.join("node.crt.next")).unwrap();
+        check_dir(node.to_str().unwrap(), "n1").expect("the daemon would start");
+        assert!(node.join("node.crt.next").exists(), "nothing changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node.key in another format (SEC1, here) that isn't node.crt's:
+    /// refused by `check --local`, as the daemon would refuse it.
+    #[test]
+    fn check_dir_refuses_a_mismatched_key_whatever_its_format() {
+        let dir = temp_dir("check_sec1");
+        let (ca, node) = (dir.join("ca"), dir.join("node"));
+        load_or_create(ca.to_str().unwrap(), "ca-node").unwrap();
+        issue_cert_to_dir(ca.to_str().unwrap(), "n1", node.to_str().unwrap()).unwrap();
+        use aws_lc_rs::encoding::AsDer;
+        let other = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        // SEC1 ("EC PRIVATE KEY") form of another key.
+        let pkcs8 = other.serialize_der();
+        let sec1 = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(&aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8)
+            .unwrap()
+            .private_key()
+            .as_der()
+            .unwrap();
+        let pem = format!(
+            "-----BEGIN EC PRIVATE KEY-----\n{}\n-----END EC PRIVATE KEY-----\n",
+            base64_lines(sec1.as_ref())
+        );
+        std::fs::write(node.join("node.key"), pem).unwrap();
+        assert!(check_dir(node.to_str().unwrap(), "n1").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn base64_lines(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out.as_bytes().chunks(64).map(|l| String::from_utf8_lossy(l).into_owned()).collect::<Vec<_>>().join("\n")
     }
 
     #[test]

@@ -473,12 +473,14 @@ impl DynamicConfig {
     /// config to an admin) can't settle the tie by dropping it, whoever made
     /// it: of two configs, the one revoking more wins, on every node.
     ///
-    /// Before all that, a config whose signer's certificate has expired
-    /// loses to one whose signer's hasn't: a running node refuses the first
-    /// (see `crate::signing::admit`), so if it won, the nodes holding the
-    /// other would never take it and the cluster would stay split. Each
-    /// step compares the two configs alone, so the order is total: whatever
-    /// order nodes meet three configs in, they settle on the same one.
+    /// Before all that, an incoming config whose signer's certificate has
+    /// expired never wins a tie: a running node refuses it (see
+    /// `crate::signing::admit`) in any case. Only the incoming one is judged
+    /// so: the config a node holds isn't demoted because its own signer's
+    /// certificate expired since it won, or a member replaying the loser
+    /// could then undo the winner's revocations. Between configs whose
+    /// signers are valid, the order is total, so nodes settle on one
+    /// whatever order they meet them in.
     ///
     /// Without the tie-break, two nodes changing the config at once both
     /// make version N+1, each node keeps whichever arrived first, and the
@@ -496,12 +498,140 @@ impl DynamicConfig {
         if self == current {
             return false;
         }
+        if crate::signing::expired_signer(self).is_some() {
+            return false;
+        }
         let key = |dc: &DynamicConfig| {
             let bytes = serde_json::to_vec(dc).unwrap_or_default();
-            let signer_valid = crate::signing::expired_signer(dc).is_none();
-            (signer_valid, dc.revoked.nodes.len() + dc.revoked.certs.len(), dc.changed_by.clone(), bytes.len(), bytes)
+            (dc.revoked.nodes.len() + dc.revoked.certs.len(), dc.changed_by.clone(), bytes.len(), bytes)
         };
         key(self) > key(current)
+    }
+
+    /// The edit made from `base` to `edited`, made again on top of `self`
+    /// (a newer config, say the cluster's): `None` if `self` changed
+    /// something the edit changed too, differently (or the edit changed
+    /// what this can't tell apart). Compared piece by piece: each service
+    /// instance (group, node, name), each service's routes and policy, and
+    /// each revocation. The result keeps `self`'s version and author; if
+    /// it has the same settings as `self`, the edit is already in it.
+    pub fn rebase_edit(&self, base: &DynamicConfig, edited: &DynamicConfig) -> Option<DynamicConfig> {
+        use std::collections::BTreeMap;
+        // What the merge doesn't look at must be as `base` had it.
+        let rest = |dc: &DynamicConfig| DynamicConfig {
+            service_groups: vec![],
+            routes: vec![],
+            policies: vec![],
+            revoked: Revoked::default(),
+            ..dc.clone()
+        };
+        if !rest(edited).same_settings(&rest(base)) {
+            return None;
+        }
+        // One piece three ways: taken from the edit where the edit changed
+        // it and `self` didn't; `None` (a conflict) where both did, apart.
+        fn merge<K: Ord + Clone, V: PartialEq + Clone>(
+            base: &BTreeMap<K, V>,
+            edited: &BTreeMap<K, V>,
+            onto: &mut BTreeMap<K, V>,
+        ) -> Option<()> {
+            let keys: std::collections::BTreeSet<&K> = base.keys().chain(edited.keys()).collect();
+            for key in keys {
+                let (was, now) = (base.get(key), edited.get(key));
+                if was == now {
+                    continue;
+                }
+                let theirs = onto.get(key);
+                if theirs == now {
+                    continue;
+                }
+                if theirs != was {
+                    return None;
+                }
+                match now {
+                    Some(value) => onto.insert(key.clone(), value.clone()),
+                    None => onto.remove(key),
+                };
+            }
+            Some(())
+        }
+        let instances = |dc: &DynamicConfig| -> BTreeMap<(String, String, String), Service> {
+            dc.service_groups
+                .iter()
+                .flat_map(|g| g.services.iter().map(move |s| ((g.name.clone(), s.node_id.clone(), s.name.clone()), s.clone())))
+                .collect()
+        };
+        let routes = |dc: &DynamicConfig| -> BTreeMap<String, Vec<Route>> {
+            let mut by_service: BTreeMap<String, Vec<Route>> = BTreeMap::new();
+            for route in &dc.routes {
+                by_service.entry(route.service.clone()).or_default().push(route.clone());
+            }
+            by_service
+        };
+        let policies = |dc: &DynamicConfig| -> BTreeMap<String, Policy> {
+            dc.policies.iter().map(|p| (p.service.clone(), p.clone())).collect()
+        };
+        let revoked = |dc: &DynamicConfig| -> BTreeMap<(bool, String), ()> {
+            dc.revoked.nodes.iter().map(|n| ((false, n.clone()), ())).chain(dc.revoked.certs.iter().map(|c| ((true, c.clone()), ()))).collect()
+        };
+
+        let mut merged_instances = instances(self);
+        merge(&instances(base), &instances(edited), &mut merged_instances)?;
+        let mut merged_routes = routes(self);
+        merge(&routes(base), &routes(edited), &mut merged_routes)?;
+        let mut merged_policies = policies(self);
+        merge(&policies(base), &policies(edited), &mut merged_policies)?;
+        let mut merged_revoked = revoked(self);
+        merge(&revoked(base), &revoked(edited), &mut merged_revoked)?;
+
+        // Groups in `self`'s order, then any the edit added; instances in
+        // their group's order where they were already there.
+        let mut out = self.clone();
+        let mut groups: Vec<ServiceGroup> = Vec::new();
+        let order: Vec<String> = self.service_groups.iter().chain(edited.service_groups.iter()).map(|g| g.name.clone()).collect();
+        for name in order {
+            if groups.iter().any(|g| g.name == name) {
+                continue;
+            }
+            let mut services: Vec<Service> = Vec::new();
+            for source in self.service_groups.iter().chain(edited.service_groups.iter()).filter(|g| g.name == name) {
+                for svc in &source.services {
+                    let key = (name.clone(), svc.node_id.clone(), svc.name.clone());
+                    if let Some(kept) = merged_instances.get(&key) {
+                        if !services.iter().any(|s| s.node_id == kept.node_id && s.name == kept.name) {
+                            services.push(kept.clone());
+                        }
+                    }
+                }
+            }
+            // A group the edit emptied (or removed) goes; one `self` has
+            // empty anyway stays.
+            let in_self = self.service_groups.iter().any(|g| g.name == name && g.services.is_empty());
+            if !services.is_empty() || in_self {
+                groups.push(ServiceGroup { name, services });
+            }
+        }
+        out.service_groups = groups;
+        out.routes = merged_routes.into_values().flatten().collect();
+        out.policies = merged_policies.into_values().collect();
+        out.revoked = Revoked {
+            nodes: merged_revoked.keys().filter(|(cert, _)| !cert).map(|(_, n)| n.clone()).collect(),
+            certs: merged_revoked.keys().filter(|(cert, _)| *cert).map(|(_, c)| c.clone()).collect(),
+        };
+        // Lists the edit didn't touch keep `self`'s own order.
+        if out.revoked.nodes.iter().collect::<std::collections::HashSet<_>>() == self.revoked.nodes.iter().collect() {
+            out.revoked.nodes = self.revoked.nodes.clone();
+        }
+        if out.revoked.certs.iter().collect::<std::collections::HashSet<_>>() == self.revoked.certs.iter().collect() {
+            out.revoked.certs = self.revoked.certs.clone();
+        }
+        if routes(&out) == routes(self) {
+            out.routes = self.routes.clone();
+        }
+        if policies(&out) == policies(self) {
+            out.policies = self.policies.clone();
+        }
+        Some(out)
     }
 
     /// Every structural problem with this config, as messages. Empty means
@@ -1137,6 +1267,11 @@ pub struct Config {
     /// Number of idle reverse connections to maintain per relay peer (default 64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse_pool_size: Option<u16>,
+    /// Most tunnels one peer may have open through this node at once
+    /// (default 4096): raise it for a subscriber that holds more open
+    /// connections to this node's services than that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tunnels_per_peer: Option<usize>,
     /// Peer addresses in `"host:port"` form.
     pub known_nodes: Vec<String>,
     pub dynamic_config: DynamicConfig,
@@ -1248,6 +1383,7 @@ impl Default for Config {
             node_id: String::new(),
             outbound_only: false,
             reverse_pool_size: None,
+            max_tunnels_per_peer: None,
             known_nodes: Vec::new(),
             dynamic_config: DynamicConfig::default(),
             subscribe_filter: None,
@@ -1331,6 +1467,9 @@ impl Config {
             tracing.validate().map_err(|e| anyhow!(e))?;
         }
 
+        if self.max_tunnels_per_peer == Some(0) {
+            return Err(anyhow!("maxTunnelsPerPeer must be at least 1"));
+        }
         if usize::from(self.reverse_pool_size.unwrap_or(0)) > crate::node::relay::MAX_IDLE_REVERSE_PER_NODE {
             return Err(anyhow!(
                 "reversePoolSize may be at most {}: relays refuse more idle reverse connections from one node",
@@ -2027,6 +2166,40 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_is_made_again_on_a_newer_config_unless_they_clash() {
+        let base = group_of(vec![instance("api", "n1", &[]), instance("db", "n1", &[])]).dynamic_config;
+        // The edit: web added, db removed, x revoked, a policy for api.
+        let mut edited = base.clone();
+        edited.upsert_service("web", instance("web", "n1", &[])).unwrap();
+        edited.service_groups[0].services.retain(|s| s.name != "db");
+        edited.revoked.nodes.push("x".into());
+        edited.policies.push(Policy { service: "api".into(), allow: vec!["n2".into()] });
+        // The cluster meanwhile: cache added, y revoked.
+        let mut theirs = base.clone();
+        theirs.version = 9;
+        theirs.upsert_service("web", instance("cache", "n2", &[])).unwrap();
+        theirs.revoked.nodes.push("y".into());
+        let merged = theirs.rebase_edit(&base, &edited).expect("no clash");
+        let names: Vec<&str> = merged.service_groups[0].services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["api", "cache", "web"]);
+        assert_eq!(merged.revoked.nodes, ["x", "y"]);
+        assert_eq!(merged.policies.len(), 1);
+        assert_eq!(merged.version, theirs.version);
+        // Already in it: the same settings as theirs.
+        let has_it = merged.clone();
+        assert!(has_it.rebase_edit(&base, &edited).unwrap().same_settings(&has_it));
+        // Both changed api, apart: a clash.
+        let mut edited_api = base.clone();
+        edited_api.service_groups[0].services[0].node_port = 1111;
+        let mut theirs_api = theirs.clone();
+        theirs_api.service_groups[0].services[0].node_port = 2222;
+        assert!(theirs_api.rebase_edit(&base, &edited_api).is_none());
+        // The same change on both sides is no clash.
+        theirs_api.service_groups[0].services[0].node_port = 1111;
+        assert!(theirs_api.rebase_edit(&base, &edited_api).is_some());
+    }
+
+    #[test]
     fn adding_a_service_exactly_as_it_is_changes_nothing() {
         let mut dc = DynamicConfig::default();
         let v = dc.upsert_service("g", instance("api", "n1", &["a.example"])).unwrap();
@@ -2296,16 +2469,21 @@ mod tests {
         // tie (nodes take either, so whichever wins, all settle on it).
         let (earlier, later) = (at(hours(0), true, false), at(hours(3), false, false));
         assert!(earlier.supersedes(&later) && !later.supersedes(&earlier));
-        // Whatever else, one whose signer expired loses (running nodes
-        // refuse it): it may not win where the other can't be replaced.
+        // An incoming one whose signer expired never wins (running nodes
+        // refuse it).
         let (expired, valid) = (at(hours(0), true, true), at(hours(3), false, false));
-        assert!(valid.supersedes(&expired) && !expired.supersedes(&valid));
-        // Three configs at one version settle on one, met in any order.
-        let three = [at(hours(0), false, false), at(hours(1), true, false), at(hours(2), false, true)];
-        for (i, a) in three.iter().enumerate() {
-            let beaten = three.iter().filter(|b| a.supersedes(b)).count();
-            assert_eq!(beaten, [1, 2, 0][i], "config {i}");
-        }
+        assert!(!expired.supersedes(&valid));
+        // Nor is a held one demoted when its own signer expires: the config
+        // revoking more, held, stays, whatever a member replays.
+        assert!(!valid.supersedes(&expired), "the winner's revocation stays");
+        // Three configs at one version (signers valid) settle on one, met in
+        // any order.
+        let three = [at(hours(0), false, false), at(hours(1), true, false), at(hours(2), false, false)];
+        let beaten: Vec<usize> = three.iter().map(|a| three.iter().filter(|b| a.supersedes(b)).count()).collect();
+        let mut sorted = beaten.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2], "a total order: {beaten:?}");
+        assert_eq!(beaten[1], 2, "the one revoking more wins");
     }
 
     #[test]

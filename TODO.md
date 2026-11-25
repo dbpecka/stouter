@@ -347,7 +347,7 @@ reproduced or checked against the code. Numbered on from the lists above.
   When it survived, `change_target` took any failure (a refused
   certificate, a 2 s timeout) for "no daemon" and edited the file behind
   the running daemon.
-  Fixed: SIGPIPE stays ignored, and only a failed print on stdout or stderr ends the CLI by SIGPIPE; the CLI edits the file only when the connection to this host's daemon is refused, anything else is an error.
+  Fixed: SIGPIPE stays ignored, and only a failed print on stdout or stderr ends the CLI by SIGPIPE; the CLI edits the file only when nothing accepts a connection at this host's daemon's address (refused, or not accepted within 3 s: macOS drops some), anything else is an error (`--file-only` edits the file anyway).
 
 - [x] **54. A closed stdout or stderr silently stopped the daemon's loops.**
   The config dump used `println!`, which panics on a closed pipe; a failed
@@ -450,3 +450,60 @@ reproduced or checked against the code. Numbered on from the lists above.
   registrations arriving together all pass at 1023. Fix: check and push
   under one lock (a capped `StreamPool::push`).
   Fixed: the registration is counted again as it goes into the pool, under the pool's lock.
+
+# Fourth review, of the changes db67147..ca25a93
+
+Three independent reviews of what the three batches above changed (data
+plane and authz; gossip, config and signing; CLI, PKI and operations),
+each finding reproduced. Numbered on.
+
+## Medium
+
+- [x] **72. One oversized request through a relay cost a NAT'd node three reverse connections** (a #60 regression):
+  the node drops a reverse connection whose message is over 16 KiB, and
+  the relay, taking that as a dead connection, tried the next two; each
+  drop sent a worker into backoff. About one request a second kept the node
+  unreachable.
+  Fixed: the relay refuses a request over 16 KiB (encoded as it would send it) before taking a connection.
+
+- [x] **73. A member could undo a revocation once the winning config's signer expired** (a #55 regression):
+  the same-version tie-break ranked configs from expired signers last,
+  judged now, so the held winner was demoted and a replayed loser took over.
+  Fixed: only an incoming config from an expired signer is ranked last (it never wins); the held one isn't demoted.
+
+- [x] **74. A small clock step back re-admitted a replayed request** (a #69 regression):
+  a nonce let go 31 s after its request's timestamp, then the clock stepped
+  back, and the request passed the freshness check again.
+  Fixed: the cache keeps the wall clock's highest reading and refuses requests too old by it.
+
+- [x] **75. Changes made while the daemon was stopped (#51) were set aside wrongly, or waited:**
+  - one the CLI had broadcast, which the cluster took and built on, was set aside as `.unapplied` at the next start (likewise the config `keep_pushed` wrote);
+  - the README's way to add a node (`service add` before its first start) never took effect when the cluster was ahead;
+  - a new cluster's first node waited two minutes for it;
+  - a config dropped unchecked (busy check slot) counted as a sync, so an offline signed edit could be taken and lost.
+  Fixed: an edit is compared with the newer config piece by piece (service instances, routes and policy per service, revocations): already in it, nothing is kept; not in it and touching nothing the cluster changed, it is made again on top and taken as the next version (unsigned clusters); only a clash is set aside. A node's first start with no `knownNodes` takes the edit at once. An unchecked config doesn't count as a sync. history.sh checks the add-a-node flow.
+
+## Low
+
+- [x] **76. deploy.sh outside a git checkout uploaded keys in subdirectories** (`host2-tls/`).
+  Fixed: it uploads only what the image is built from.
+- [x] **77. `check --local` missed a mismatched SEC1/PKCS#1 `node.key`, and refused a directory mid-renewal.**
+  Fixed: it builds the TLS context as the daemon does, and finishes a cut-short renewal on a copy.
+- [x] **78. Any other program on the config's `bind` blocked every file change from the CLI,** saying a daemon was running.
+  Fixed: "something is listening", and `--file-only` to change the file anyway.
+- [x] **79. Edge cases of the third batch:**
+  - proxy buffers grew to 64 KiB on the first byte and stayed: now they grow only while reads fill them, and shrink back;
+  - no retry after a timeout cost a NAT'd node with one relay its tunnels: the relay retries again, and reports the timeout if the retry is refused as a replay;
+  - the 4096 cap is now `maxTunnelsPerPeer`, and a refused mux stream is told why;
+  - `keep_pushed` keeps a node's file only if the cluster pushed to knows the node (lists it, remembers it leaving, or has services on it, as the file does: two clusters may share a CA); otherwise it says so;
+  - a `requestTimeoutMs` under 10 ms already in a config is taken as 10;
+  - the "no sync has worked" warning counts syncs peers start, and not a stretch with no peers.
+- [x] **80. Stale docs:** #53 and `change_target`'s comment; two doc comments over the wrong function.
+
+## Older, found on the way
+
+- [ ] **81. A node that missed an unrevoke never converges:** v6 revokes admin
+  X, v7 unrevokes, v8 is signed by X. A node still on v6, offered only v8,
+  refuses it by its own (stale) revocations until another admin signs.
+  Fix: check the signer against the revocations in force up to the incoming
+  config, not only this node's.

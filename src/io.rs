@@ -46,8 +46,8 @@ impl AcceptBackoff {
 /// Buffer size for bidirectional proxy (64 KiB).
 const BUF_SIZE: usize = 65536;
 
-/// Buffer for the first read in each direction, before the full one is
-/// allocated (see `copy_then_shutdown`).
+/// Buffer each direction of a proxied connection starts with (see
+/// `copy_then_shutdown`), and the least it shrinks back to.
 const FIRST_BUF_SIZE: usize = 2048;
 
 /// Close the tunnel if no data flows in either direction for this long.
@@ -176,18 +176,20 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // The full buffer only once data flows: a tunnel can stay open, idle,
-    // for long, and a node holds thousands (see MAX_TUNNELS_PER_PEER).
-    let mut first = [0u8; FIRST_BUF_SIZE];
-    let mut buf = Vec::new();
+    // Only as large as the traffic needs: it starts small, doubles while
+    // reads fill it, and halves again while they come in small. A node
+    // holds thousands of tunnels (see MAX_TUNNELS_PER_PEER), most of them
+    // carrying little most of the time; a few bytes now and then keep a
+    // tunnel's buffer small.
+    let mut buf = vec![0u8; FIRST_BUF_SIZE];
     loop {
-        let n = if buf.is_empty() { reader.read(&mut first).await? } else { reader.read(&mut buf).await? };
+        let n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
         }
         activity.touch();
         // Write piecewise so a slow but progressing reader counts as activity.
-        let mut chunk = if buf.is_empty() { &first[..n] } else { &buf[..n] };
+        let mut chunk = &buf[..n];
         while !chunk.is_empty() {
             let written = writer.write(chunk).await?;
             if written == 0 {
@@ -197,8 +199,12 @@ where
             chunk = &chunk[written..];
         }
         writer.flush().await?;
-        if buf.is_empty() {
-            buf = vec![0u8; BUF_SIZE];
+        let size = buf.len();
+        if n == size && size < BUF_SIZE {
+            buf.resize((size * 2).min(BUF_SIZE), 0);
+        } else if n <= size / 8 && size > FIRST_BUF_SIZE {
+            buf.truncate((size / 2).max(FIRST_BUF_SIZE));
+            buf.shrink_to_fit();
         }
     }
     writer.shutdown().await
@@ -237,6 +243,40 @@ impl Activity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes come through as sent, whatever the mix of small and large
+    /// writes the buffer grows and shrinks for.
+    #[tokio::test]
+    async fn bytes_come_through_as_sent_as_the_buffer_grows_and_shrinks() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut from, to_proxy) = tokio::io::duplex(1 << 20);
+        let (proxy_out, mut to) = tokio::io::duplex(1 << 20);
+        let activity = Activity::new();
+        let copy = async move {
+            let (mut r, mut w) = (to_proxy, proxy_out);
+            copy_then_shutdown(&mut r, &mut w, &activity).await
+        };
+        let send = async move {
+            let mut sent = Vec::new();
+            for round in 0u32..200 {
+                let len = if round % 3 == 0 { 70_000 } else { 1 + (round as usize * 37) % 500 };
+                let data: Vec<u8> = (0..len).map(|i| (i as u32 ^ round) as u8).collect();
+                from.write_all(&data).await.unwrap();
+                sent.extend(data);
+            }
+            from.shutdown().await.unwrap();
+            sent
+        };
+        let receive = async move {
+            let mut got = Vec::new();
+            to.read_to_end(&mut got).await.unwrap();
+            got
+        };
+        let (copied, sent, got) = tokio::join!(copy, send, receive);
+        copied.unwrap();
+        assert_eq!(got.len(), sent.len());
+        assert!(got == sent, "the same bytes, in order");
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

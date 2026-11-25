@@ -39,9 +39,18 @@ struct Cli {
     /// config's `tlsDir` when not set.
     #[arg(long, global = true)]
     cert_dir: Option<String>,
+    /// Change the config file itself, not through this host's daemon, even
+    /// if something listens at its `bind`: for when the daemon is stopped
+    /// and another program uses that port. With the daemon running, the
+    /// change may be undone by one it makes at the same moment.
+    #[arg(long, global = true)]
+    file_only: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
+
+/// `--file-only` (see [`Cli::file_only`]).
+static FILE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[derive(Subcommand)]
 enum Commands {
@@ -439,6 +448,7 @@ enum RouteAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _ = FILE_ONLY.set(cli.file_only);
     init_logging(cli.command.is_none());
     #[cfg(unix)]
     if cli.command.is_some() {
@@ -482,7 +492,16 @@ async fn main() -> Result<()> {
             // Edited while the daemon was stopped: start on what it last
             // ran, and take the edit as the config poll takes any (checked,
             // as a new version), once caught up with the cluster.
-            let edited_offline = edited_while_stopped(&cfg, &history::load(&cli.config));
+            // A node starting for the first time that lists no peers starts
+            // a cluster (or is one alone): no one could have moved on, and a
+            // change the CLI made before it started is taken at once.
+            let first_start_alone =
+                !std::path::Path::new(&format!("{}.state", cli.config)).exists() && cfg.known_nodes.is_empty();
+            let edited_offline = if first_start_alone {
+                None
+            } else {
+                edited_while_stopped(&cfg, &history::load(&cli.config))
+            };
             if let Some(ran) = &edited_offline {
                 tracing::info!(
                     "{}: changed while the daemon was stopped; starting on version {} as it last ran, and taking the \
@@ -676,7 +695,7 @@ async fn main() -> Result<()> {
                     match msg {
                         Message::StatusResponse {
                             mode, node_id, bind, dynamic_config, known_nodes, require_signed_config, cert_expires,
-                            issues_certs,
+                            issues_certs, ..
                         } => {
                             print_status(&mode, &node_id, &bind, &dynamic_config, &known_nodes);
                             if let Some(until) = cert_expires {
@@ -1834,6 +1853,8 @@ async fn connect_daemon(target: &str, tls_ctx: &tls::TlsContext) -> Result<tls::
 struct DaemonConfig {
     dynamic_config: config::DynamicConfig,
     require_signed_config: bool,
+    /// The daemon's node and the nodes it knows: its cluster's members.
+    members: Vec<String>,
 }
 
 /// Time allowed for a daemon to answer a CLI request (an admin change
@@ -1853,8 +1874,9 @@ async fn daemon_request(target: &str, tls_ctx: &tls::TlsContext, request: &Messa
 
 async fn fetch_daemon_config(target: &str, tls_ctx: &tls::TlsContext) -> Result<DaemonConfig> {
     match daemon_request(target, tls_ctx, &Message::StatusRequest).await? {
-        Message::StatusResponse { dynamic_config, require_signed_config, .. } => {
-            Ok(DaemonConfig { dynamic_config, require_signed_config })
+        Message::StatusResponse { dynamic_config, require_signed_config, node_id, known_nodes, departed, .. } => {
+            let members = std::iter::once(node_id).chain(known_nodes.into_iter().map(|n| n.id)).chain(departed).collect();
+            Ok(DaemonConfig { dynamic_config, require_signed_config, members })
         }
         _ => anyhow::bail!("unexpected response from {target}"),
     }
@@ -2066,7 +2088,7 @@ async fn try_admin_rpc(
         match send_admin(target, &tls_ctx, push).await? {
             Err((AdminErrCode::Conflict, _)) if attempt < PUSH_ATTEMPTS => continue,
             Ok(version) => {
-                keep_pushed(config_path, &pushed, &material);
+                keep_pushed(config_path, &pushed, &material, &daemon.members);
                 return Ok(Ok(version));
             }
             result => return Ok(result),
@@ -2086,9 +2108,23 @@ async fn try_admin_rpc(
 /// Only over a config of the same cluster, as an admin signed it with no
 /// edits made around it, and older: never over edits not yet pushed (say
 /// so, if they keep a revocation out of the file), or another cluster's
-/// config (`service move`).
-fn keep_pushed(config_path: &str, pushed: &config::DynamicConfig, material: &pki::PkiMaterial) {
+/// config (`service move`). A node's config file (it has a `tlsDir`) is
+/// the same cluster's only if that cluster knows the node: lists it among
+/// its `members`, or (the node stopped, and left) has services on it, as
+/// the file does. Two clusters can share a CA and admin certificates, and
+/// the signature alone can't tell them apart.
+fn keep_pushed(config_path: &str, pushed: &config::DynamicConfig, material: &pki::PkiMaterial, members: &[String]) {
     let Ok(mut file) = Config::load(config_path) else { return };
+    let hosts = |dc: &config::DynamicConfig, node: &str| dc.service_groups.iter().flat_map(|g| &g.services).any(|s| s.node_id == node);
+    let known = members.contains(&file.node_id) || (hosts(&file.dynamic_config, &file.node_id) && hosts(pushed, &file.node_id));
+    if file.tls_dir.is_some() && !file.node_id.is_empty() && !known {
+        eprintln!(
+            "note: not updating {config_path}: the cluster the change went to doesn't know node '{}'; if it is that \
+             node's cluster, `stouter config pull` its config",
+            file.node_id
+        );
+        return;
+    }
     let held = &file.dynamic_config;
     if held.version >= pushed.version {
         return;
@@ -2112,9 +2148,6 @@ fn keep_pushed(config_path: &str, pushed: &config::DynamicConfig, material: &pki
     }
 }
 
-/// Like `try_admin_rpc`, but on `AdminResult::Err` exits the process with a
-/// code derived from `AdminErrCode` so single-step callers don't need to
-/// handle it.
 /// Exit, saying why, as for a change a daemon refused (see
 /// [`run_admin_rpc`]): the same status whether the change was to be made
 /// through a daemon or in the file.
@@ -2132,6 +2165,9 @@ fn exit_code_for(code: AdminErrCode) -> i32 {
     }
 }
 
+/// Like `try_admin_rpc`, but on `AdminResult::Err` exits the process with a
+/// code derived from `AdminErrCode` so single-step callers don't need to
+/// handle it.
 async fn run_admin_rpc(
     target: &str,
     op: AdminOp,
@@ -2277,12 +2313,17 @@ async fn fetch_trusted_config(target: &str, cfg: &Config, cert_dir: Option<&str>
 /// makes at the same time could undo it); else, with no daemon listening,
 /// `None`: edit the file.
 ///
-/// Only a refused connection means no daemon. One that is listening but
-/// won't take this CLI's request (its certificate refused, say, or expired)
-/// or doesn't answer is an error, never a reason to edit the file anyway.
+/// No daemon means a refused connection, or one nothing accepts in time.
+/// Something that is listening but won't take this CLI's request (a daemon
+/// refusing its certificate, say, or another program on that port) or
+/// doesn't answer is an error, never a reason to edit the file anyway;
+/// `--file-only` says to edit it all the same.
 async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Option<&str>) -> Result<Option<String>> {
     if remote.is_some() {
         return Ok(remote);
+    }
+    if FILE_ONLY.get().copied().unwrap_or(false) {
+        return Ok(None);
     }
     let cfg = Config::load_or_default(config_path)?;
     // A daemon with no listener (outboundOnly) can't be asked.
@@ -2306,7 +2347,13 @@ async fn change_target(remote: Option<String>, config_path: &str, cert_dir: Opti
             return Ok(None);
         }
     }
-    let not_made = || format!("a daemon is running at {target} (the bind in {config_path}); the change was not made");
+    let not_made = || {
+        format!(
+            "something is listening at {target} (the bind in {config_path}) and didn't take the change, so it was not \
+             made. If that is this host's daemon, see why below; if the daemon is stopped and another program uses \
+             that port, pass --file-only to change {config_path} itself"
+        )
+    };
     let tls_ctx = build_cli_tls(&cfg, cert_dir).with_context(not_made)?;
     let asked = tokio::time::timeout(LOCAL_DAEMON_STATUS_TIMEOUT, daemon_request(&target, &tls_ctx, &Message::StatusRequest))
         .await
@@ -2750,7 +2797,7 @@ mod tests {
         let v10 = signing::sign(&v10, &alice).unwrap();
         let cfg = Config { admin_cns: vec!["alice".into()], dynamic_config: v10, ..Config::default() };
         let tls_ctx = cli_tls_context(&cfg, &certs["alice"]).unwrap();
-        let says_unsigned = |dc: config::DynamicConfig| DaemonConfig { dynamic_config: dc, require_signed_config: false };
+        let says_unsigned = |dc: config::DynamicConfig| DaemonConfig { dynamic_config: dc, require_signed_config: false, members: vec![] };
         let pull = |served| config_to_pull(says_unsigned(served), "m", &cfg, "f.json", &certs["alice"], &tls_ctx, false);
 
         // Unsigned, dropping the revocation: refused.
@@ -2948,6 +2995,7 @@ mod tests {
                             require_signed_config: false,
                             cert_expires: None,
                             issues_certs: false,
+                            departed: vec![],
                         };
                         let _ = gossip::send_message(&mut stream, &reply).await;
                     }
@@ -3056,6 +3104,7 @@ mod tests {
                             require_signed_config: true,
                             cert_expires: None,
                             issues_certs: false,
+                            departed: vec![],
                         },
                         Ok(Message::AdminRequest { op: AdminOp::ConfigPush { config, .. } }) => {
                             let new_version = config.version;
@@ -3165,22 +3214,51 @@ mod tests {
         // Another cluster's config (`service move` to it): not kept.
         save(&v10);
         let theirs = signing::sign(&v11, &signing::Signer::from_material(&other_certs["alice"]).unwrap()).unwrap();
-        keep_pushed(path, &theirs, &other_certs["alice"]);
+        keep_pushed(path, &theirs, &other_certs["alice"], &[]);
         assert_eq!(held(), v10);
         // Edits not yet pushed, around the signature: not written over.
         let mut edited = v10.clone();
         edited.service_groups[0].services[0].node_port = 4000;
         save(&edited);
-        keep_pushed(path, &v11, &certs["alice"]);
+        keep_pushed(path, &v11, &certs["alice"], &[]);
         assert_eq!(held(), edited);
         // A newer config: kept.
         save(&v11);
-        keep_pushed(path, &v10, &certs["alice"]);
+        keep_pushed(path, &v10, &certs["alice"], &[]);
         assert_eq!(held(), v11);
         // An older unedited one of its cluster: replaced.
         save(&v10);
-        keep_pushed(path, &v11, &certs["alice"]);
+        keep_pushed(path, &v11, &certs["alice"], &[]);
         assert_eq!(held(), v11);
+        // A node's file (it has a tlsDir): only if the cluster pushed to
+        // lists that node (another cluster may share the CA and admins).
+        let node_file = |dc: &config::DynamicConfig, node: &str| {
+            let admins = vec!["alice".to_string()];
+            Config {
+                node_id: node.into(),
+                tls_dir: Some(dir.join("alice").to_str().unwrap().into()),
+                require_signed_config: true,
+                admin_cns: admins,
+                dynamic_config: dc.clone(),
+                ..Config::default()
+            }
+            .save(path)
+            .unwrap();
+        };
+        node_file(&v10, "n9");
+        keep_pushed(path, &v11, &certs["alice"], &["m".to_string()]);
+        assert_eq!(held(), v10, "not a member of the cluster pushed to");
+        keep_pushed(path, &v11, &certs["alice"], &["m".to_string(), "n9".to_string()]);
+        assert_eq!(held(), v11, "a member");
+        // Not listed (stopped, it left), but its services are there.
+        let on_n1 = |version: u64| {
+            let mut dc = config::DynamicConfig { version, ..api_on_port(3000) };
+            dc.service_groups[0].services[0].node_id = "n1".into();
+            signing::sign(&dc, &alice).unwrap()
+        };
+        node_file(&on_n1(10), "n1");
+        keep_pushed(path, &on_n1(11), &certs["alice"], &["m".to_string()]);
+        assert_eq!(held().version, 11, "its services are in the pushed config: its cluster");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);
     }
@@ -3282,7 +3360,7 @@ mod tests {
         config_for(&addr);
         let other = other_dir.join("s1");
         let err = change_target(None, path, other.to_str()).await.expect_err("refused");
-        assert!(format!("{err:#}").contains("the change was not made"), "{err:#}");
+        assert!(format!("{err:#}").contains("didn't take the change"), "{err:#}");
 
         // Something else at this config's address: not this daemon's.
         let addr = status_answerer(&certs["s1"], "s2", "node").await;
@@ -3301,7 +3379,7 @@ mod tests {
         });
         tokio::time::pause();
         let err = change_target(None, path, None).await.expect_err("no answer");
-        assert!(format!("{err:#}").contains("the change was not made"), "{err:#}");
+        assert!(format!("{err:#}").contains("didn't take the change"), "{err:#}");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);

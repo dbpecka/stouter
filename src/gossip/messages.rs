@@ -78,6 +78,10 @@ pub enum Message {
         cert_expires: Option<i64>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         issues_certs: bool,
+        /// Nodes that left the cluster lately (still remembered): with
+        /// `known_nodes`, the cluster's members as far as it knows.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        departed: Vec<String>,
     },
     /// Ask a daemon for its config history (see `crate::history`): every
     /// version it recorded, without the configs; or one, with its config.
@@ -625,6 +629,7 @@ mod tests {
         let msg = Message::StatusResponse {
             cert_expires: None,
             issues_certs: false,
+            departed: vec![],
             mode: "node".into(),
             node_id: "host1".into(),
             bind: "0.0.0.0:8080".into(),
