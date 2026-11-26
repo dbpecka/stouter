@@ -614,3 +614,120 @@ Unconfirmed (code reading): a partial length prefix holds a connection slot
 services they're denied; `revocation_lifted_by` and the self-revocation
 check compare fingerprints unnormalised; `keep_pushed` with no `tlsDir`;
 shutdown may outlast `docker stop -t 30` with slow peers.
+
+# Sixth review, of main at f7eda1e
+
+Four independent reviews (data plane; cluster state; identity and
+security; CLI, operations and docs). Each finding was reproduced by a
+failing test or script, and every repro was run again here. Numbered on.
+
+## High
+
+- [ ] **94. A 513th tunnel on one mux session resets the 512 already open on it.**
+  `src/mux.rs` keeps yamux's default `max_num_streams` (512), and
+  `MuxPool::open_stream` doesn't count streams. A subscriber sends every
+  tunnel to a node over one session (TCP connections and pooled HTTP
+  keep-alives, which have no per-host cap). yamux answers the 513th with
+  `TooManyStreams` and drops every stream on the connection. A test: 512 of
+  512 open tunnels broke. Fix: count open streams per session and fall back
+  to a pooled or cold connection (or another session) well below the limit.
+- [ ] **95. An offline edit is lost without a trace if its first sync is with a peer behind the cluster.**
+  `caught_up` (state.rs) is any merged sync (#56 left this). The edit is
+  rebased onto the lagging peer's config and taken as the next version. The
+  cluster's newer config then replaces it outright, and `persist_to_file`
+  writes over the file with no `.unapplied` copy and no warning. The same
+  happens to any change made on a node that is behind (admin RPC, poll).
+  A test: the edit's service vanished from memory and file. Fix: when a
+  newer config drops a change this node made, rebase that change onto it (or
+  set it aside as `.unapplied`); don't count a sync with a peer below the
+  highest version seen as caught up.
+
+## Medium
+
+- [ ] **96. `service add --remote` signs instance fields a lying daemon put around the signature.**
+  #87 reads the existing instance from the daemon's unverified status
+  (`fetch_remote_dynamic_config`) and pushes the whole `Service` to be
+  signed on the verified config. A compromised node can add a domain or
+  `localPort` to an instance; an admin's harmless `--weight` through it signs
+  them cluster-wide. Fix: build the instance from the verified config (or an
+  admin op that carries only the flags given).
+- [ ] **97. `config push` undoes a concurrent cluster change when a CLI edit raised the file's version.**
+  `stale_push` refuses only a cluster version above the file's, and the push
+  sends `base_version = reported.version`. A file pulled at v2, edited by the
+  CLI to v3, pushed after another admin made v3: pushed as v4, the other
+  change gone, exit 0. Fix: keep the version a file's edits are based on and
+  refuse (or Conflict) when the cluster's config differs from it.
+- [ ] **98. A policy deny that lands while a tunnel is being set up never closes it.**
+  #85's `close_refused_tunnels` sees only registered tunnels; a tunnel is
+  registered after authorization, the local connect (up to 5 s) and the
+  success byte (node/tunnel.rs, mux.rs). Nothing checks again at
+  registration. A test: denied mid-setup, the tunnel still reaches the
+  service (4 of 4 runs). Fix: register before authorizing, or check the
+  policy again once registered.
+- [ ] **99. `keep_pushed` writes another cluster's config into a CLI file without `tlsDir`** (`service move`).
+  The same-cluster check runs only for files with a `tlsDir`; an admin
+  workstation config uses `--cert-dir`. After a move between clusters that
+  share a CA and admin, the source cluster's file holds the destination's
+  config, and every later change to the source is refused as older. Fix: don't
+  update the file for the other cluster in `service move`, or check the
+  cluster another way without a `tlsDir`.
+- [ ] **100. Renewal asks only 5 random peers, so the CA node may never be asked.**
+  `renew.rs` asks `MAX_ASKED` = 5 shuffled peers; nodes don't know which one
+  holds `ca.key`; a failed attempt waits a full check interval. With a 12-24h
+  `certLifetime` and a dozen or more nodes, a node can miss the CA on every
+  attempt and cut itself off. A test: the CA node wasn't asked in 10 of 20
+  attempts (12 nodes). Fix: gossip which nodes issue (or remember the last
+  issuer) and ask them first; retry a failure on a short backoff.
+- [ ] **101. A replacement certificate copied into `tlsDir` is ignored if it expires earlier than the one in use.**
+  `take_up_copied_cert` switches only to a later `not_after`. The README's
+  leaked-key recovery (revoke, issue, copy in) fails silently when the new
+  certificate has a shorter `certLifetime`: the node keeps its revoked one
+  until restarted. Fix: take any valid certificate that differs, tell old
+  from new by `not_before`, always leave a revoked one, warn when skipping.
+- [ ] **102. Every sync and sync reply deep-clones and hashes the whole config, even when it isn't sent.**
+  `build_compact_sync` / `build_sync_reply` clone a config of up to 2 MiB
+  under its read lock, then serialize it to hash it 1-3 times. Release: 9 ms
+  per sync pair with a 1.8 MB config (about 0.5 s of CPU per round at 50
+  peers). Fix: hash once at `index_config`, build from `config_now`, clone
+  only to send.
+
+## Low
+
+- [ ] **103. Shutdown can take 35-40 s, past the `docker stop -t 30` the scripts and README use:**
+  leave broadcast (up to 5 s), then the 30 s drain, then the span flush (up
+  to 5 s), in a row. A test: 35 s. Fix: one deadline under the stop timeout.
+- [ ] **104. Subscribers keep warm connections and a mux session to nodes hosting only services they're denied:**
+  `proxied_nodes` applies `subscribeFilter` but not the policy.
+- [ ] **105. Each request and TCP connection scans the whole service index and deep-clones every instance's `NodeInfo`:**
+  37 us per request in release with 2000 index entries. Fix: a per-service
+  index of `Arc`s; `retain_nodes` with a set.
+- [ ] **106. A merged sync that changes nothing still copies the known-nodes map** (O(N^2) per round): store only when changed.
+- [ ] **107. With `requireSignedConfig`, every config poll verifies the signed file under the config write lock on an async worker:**
+  8 ms (release, 1.8 MB) each 10 s that every reader waits behind. Fix:
+  skip an unchanged file; verify outside the lock.
+- [ ] **108. #91's fallback is undone by `edited_while_stopped`:** with history
+  [v3 signed, v4 unsigned], `startup_config` picks v3, then
+  `edited_while_stopped` starts the daemon on unverified v4. Fix: use the
+  newest entry that verifies there too.
+- [ ] **109. Fingerprints compared as written:** `signing::verify`'s
+  revokes-its-own-signer check, `revocation_lifted_by` (asks peers for
+  history for nothing), and `revoke`/`unrevoke` (a colon or uppercase entry
+  can't be lifted; revoke adds a duplicate). No evasion: `Revocations::set`
+  normalises. Fix: normalise `revoked.certs` on decode, or compare normalised.
+- [ ] **110. A refused change exits 1 in the file but 2 (or 3) through the daemon,** against #70:
+  `save_local_change` bails with anyhow instead of `refused_change`.
+- [ ] **111. README says CLI changes with no daemon running are recorded in the history:** since #51 they
+  aren't (nor can `config rollback --to` reach them); the History help text likewise.
+
+Refuted: a partial length prefix holds only the peer's bounded idle slot;
+half-close over a mesh tunnel works.
+
+Unconfirmed (code reading): an idempotent request isn't retried after a
+keep-alive reset (502); a status retry holds the earlier node's slot; the
+HTTP ports have no header-read timeout or connection cap; `init` with a
+wildcard bind announces `0.0.0.0` in `NodeJoin`; deploy scripts match
+`tlsDir` textually (`config/../tls`); Dockerfile builds without `--locked`
+and runs as root; every cluster shares the `stouter:latest` tag;
+`--label`/`--meta` replace the whole map; `keep_pushed` treats `tlsDir: ""`
+as set; a read-only config directory makes every start "first start
+alone"; history catch-up is triggered by an unverified config (bounded).
