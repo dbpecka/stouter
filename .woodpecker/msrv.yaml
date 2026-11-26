@@ -4,6 +4,10 @@ when:
     branch: main
   - event: [pull_request, manual]
 
+# Only on agents set aside for tests (WOODPECKER_AGENT_LABELS=test-runner=true).
+labels:
+  test-runner: "true"
+
 steps:
   - name: builds-with-rust-1.88
     image: rust:1.88-bookworm
