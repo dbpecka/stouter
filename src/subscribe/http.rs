@@ -317,6 +317,14 @@ impl HttpProxy {
         subset: Option<&BTreeMap<String, String>>,
         log: &mut AttemptLog,
     ) -> Outcome {
+        // One this node may not reach (see `crate::authz`) is refused here,
+        // at once: every hosting node would refuse it, each charged a
+        // tunnel failure (and ejected) for it. The shared listener
+        // (`httpListen`) has a proxy for every http service, and a
+        // service's own port keeps serving until the next reconcile.
+        if !crate::authz::may_reach(&self.state, &self.service_name, &self.state.config.node_id) {
+            return Outcome::Error(StatusCode::FORBIDDEN, "denied_by_policy");
+        }
         let all = service_backends(&self.service_name, &self.state);
         self.balancer.retain_nodes(&all);
         // A matched route narrows the candidates to its label subset; health
@@ -1157,6 +1165,52 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(answered, 0, "requests from a denied subscriber still reach the service on its pooled tunnel");
+    }
+
+    /// A request for a service this subscriber's policy keeps it from (as
+    /// through `httpListen`, which proxies every http service) is refused
+    /// at once, with no node asked: before, each of up to 3 hosting nodes
+    /// refused it, was charged a tunnel failure, and the client got 502.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_the_policy_denies_is_refused_without_asking_a_node() {
+        let dir = std::env::temp_dir().join(format!("stouter_policy_local_{}_{}", std::process::id(), rand::random::<u64>()));
+        // Three hosting "nodes", counting the connections they get.
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut services = Vec::new();
+        let mut nodes = Vec::new();
+        for id in ["n1", "n2", "n3"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(tcp);
+                }
+            });
+            services.push(serde_json::json!({"name": "api", "nodeId": id, "nodePort": 1, "protocol": "http"}));
+            nodes.push((id, addr));
+        }
+        let dc: crate::config::DynamicConfig = serde_json::from_value(serde_json::json!({
+            "version": 1, "serviceGroups": [{"name": "g", "services": services}],
+            "policies": [{"service": "api", "allow": ["someone-else"]}],
+        }))
+        .unwrap();
+        let sub = crate::state::test_support::tls_state_with(
+            &dir,
+            crate::config::Config { node_id: "sub".into(), mode: crate::config::Mode::Subscribe, dynamic_config: dc, ..Default::default() },
+            String::new(),
+        );
+        sub.update_known_nodes(|kn| {
+            for (id, addr) in &nodes {
+                kn.insert((*id).into(), crate::config::NodeInfo { id: (*id).into(), addr: addr.clone(), last_seen: Some(Instant::now()), ..Default::default() });
+            }
+        })
+        .await;
+        let proxy = HttpProxy::new("api".into(), sub.clone(), Arc::new(Balancer::new()));
+        assert_eq!(get_through(proxy).await, 403);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0, "no hosting node asked (nor charged)");
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

@@ -582,14 +582,16 @@ is fixed with #85.
 
 ## Low
 
-- [ ] **89. `httpListen` doesn't check the subscriber's own policy:** a request for
+- [x] **89. `httpListen` doesn't check the subscriber's own policy:** a request for
   a service this node may not reach goes to up to 3 hosting nodes, each
   refusing it and each charged a tunnel failure (ejected on this
   subscriber); the client gets 502, not the README's refusal at once.
-- [ ] **90. A missed unrevoke is caught up from the next peer only after 10 minutes:**
+  Fixed: the HTTP proxy (behind `httpListen` and each service's port) answers `403 denied_by_policy` before choosing a node, and a TCP proxy whose policy changed refuses the connection before its next reconcile; no hosting node is asked or charged. A test: 403 with none of 3 nodes contacted (502 before).
+- [x] **90. A missed unrevoke is caught up from the next peer only after 10 minutes:**
   the refused-config cache answers re-offers before the catch-up check, so a
   first peer that can't help (history starting later, unreachable) blocks the
   others until the entry expires. The README says once a minute per peer.
+  Fixed: the catch-up check runs before the signature check and its cache, so each peer offering such a config is asked (at most once a minute). The unrevoke test now has an unreachable first peer; it timed out before.
 - [x] **91. With `requireSignedConfig`, the daemon starts on an unsigned hand edit**
   (`startup_config` falls back to the file as is), though the README says a
   hand edit isn't taken. Fix: start on the history's signed entry when the

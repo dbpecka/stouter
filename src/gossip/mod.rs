@@ -1524,14 +1524,18 @@ async fn adopt_from_peer(
         return Adoption::NotAdopted;
     }
     let version = incoming.version;
-    let lifted = revocation_lifted_by(state, &incoming);
+    // Its signer's revocation was lifted in a version missed here: ask this
+    // peer for it, whether or not this config is checked now. One refused
+    // lately isn't (the refused-config cache answers), and a first peer
+    // that couldn't help must not keep the next from being asked (each is
+    // asked at most once a minute).
+    if let (true, Some(peer)) = (revocation_lifted_by(state, &incoming), peer) {
+        start_catch_up_from_history(state, peer, version);
+    }
     let verified = match verify_unlocked(state, incoming, peer).await {
         Some(Ok(config)) => config,
         Some(Err(e)) => {
             crate::signing::log_refusal(state, version, &e);
-            if let (true, Some(peer)) = (lifted, peer) {
-                start_catch_up_from_history(state, peer, version);
-            }
             return Adoption::NotAdopted;
         }
         None => return Adoption::Unchecked,
@@ -3061,7 +3065,10 @@ mod tests {
     /// v6 revokes admin rob; v7 lifts that; v8 is rob's. A node still on v6,
     /// offered only v8, refused it for good (rob is revoked here). Now it
     /// asks the peer for what it missed, takes v7 from its history (signed
-    /// by an admin it trusts), and then v8.
+    /// by an admin it trusts), and then v8. A first peer that can't help
+    /// (here: unreachable) doesn't hold up asking the next: its offer of v8
+    /// went into the refused-config cache, which answered n2's offer of the
+    /// same v8 for 10 minutes before any catch-up from n2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_node_that_missed_an_unrevoke_catches_up_from_a_peers_history() {
         let dir = std::env::temp_dir().join(format!("stouter_unrevoke_{}_{}", std::process::id(), rand::random::<u64>()));
@@ -3102,10 +3109,16 @@ mod tests {
                 });
             }
         });
+        let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gone_addr = gone.local_addr().unwrap().to_string();
+        drop(gone);
         let mut known = std::collections::HashMap::new();
+        known.insert("n0".to_string(), NodeInfo { id: "n0".into(), addr: gone_addr, ..Default::default() });
         known.insert("n2".to_string(), NodeInfo { id: "n2".into(), addr: addr.clone(), ..Default::default() });
         n1.known_nodes.store(Arc::new(known));
 
+        apply_message(&n1, Message::ConfigUpdate { config: v8.clone() }, Some("n0")).await;
+        assert_eq!(n1.dynamic_config.read().await.version, 6, "n0 can't help");
         apply_message(&n1, Message::ConfigUpdate { config: v8.clone() }, Some("n2")).await;
         let caught_up = async {
             while n1.dynamic_config.read().await.version < 7 {

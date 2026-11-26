@@ -109,6 +109,14 @@ async fn serve_client(
     state: Arc<SharedState>,
     balancer: Arc<Balancer>,
 ) {
+    // Its policy changed since the proxy started (it stops at the next
+    // reconcile): refused here, not by each hosting node, each charged a
+    // tunnel failure for it.
+    if !crate::authz::may_reach(&state, &service_name, &state.config.node_id) {
+        metrics::counter!("stouter_tunnel_errors_total", "service" => service_name.clone(), "reason" => "denied_by_policy").increment(1);
+        tracing::debug!("refusing a connection to {service_name}: its policy doesn't let this node reach it");
+        return;
+    }
     let all = service_backends(&service_name, &state);
     balancer.retain_nodes(&all);
     let backends = prefer_healthy(all, &service_name, &state);

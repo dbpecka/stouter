@@ -1091,6 +1091,8 @@ curl http://stock.example.com/items/42  # → the service whose domains include 
   a `tcp` service gets `501 service_not_http`. Use those services' own (or
   fixed `localPort`) addresses. Rejections are counted in
   `stouter_http_listener_rejected_total{reason}`.
+- A service this node's policy keeps it from gets `403 denied_by_policy`
+  at once, without asking the nodes hosting it.
 - Requests use the same per-service proxy as the service's local port: one
   balancer, so `maxConnections`, ejection, routes, retries and tracing apply
   across both. Services on the same node (in `nodeSubscribe`) are reachable
